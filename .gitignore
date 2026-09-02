@@ -15,3 +15,11 @@ hand_histories/
 
 # Strategy files (large generated data)
 *.json
+
+# Sword of Fargoal remake (web) — re-include its JSON config, ignore build output
+!fargoal/package.json
+!fargoal/package-lock.json
+!fargoal/**/*.json
+fargoal/node_modules/
+fargoal/dist/
+fargoal/shots/
