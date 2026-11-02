@@ -1,12 +1,23 @@
 """
-Python port of pine/double_top_bottom_2entry.pine.
+Python port of pine/double_top_bottom_2entry.pine, with strategy toggles.
 
-Same pattern detection, same two-stage entry plan, same conservative bar-by-bar
-trade simulation, so the numbers should match the TradingView table for the same
-data and settings.
+Same pattern detection and the same conservative bar-by-bar trade simulation as
+the TradingView indicator, so numbers should match for the same data/settings.
 
-Usage:
-    python dtdb_backtest.py SPY BTC-USD --interval 1d --range max
+Toggles (see Params):
+  use_entry1     Entry 1 = market entry at the close of the breakout bar.
+  entry2_mode    "off"            no second entry
+                 "midpoint"       limit halfway between neckline and pattern extreme (original idea)
+                 "retest"         limit at the neckline (retest of the breakout point)
+                 "retest_confirm" a bar touches the neckline and CLOSES back on the breakout side; enter at that close
+  rr             reward : risk for the targets
+  tgt_mode       "per_entry" (each entry its own RR target) or "blended" (one target off the average entry)
+  trend_filter   "off" or "sma" (longs only above the N-period SMA, shorts only below)
+  trade_longs / trade_shorts
+
+Examples:
+    python dtdb_backtest.py SPY BTC-USD
+    python dtdb_backtest.py SPY --no-entry1 --entry2 retest --rr 3 --trend sma
 """
 from __future__ import annotations
 
@@ -26,18 +37,38 @@ import requests
 # ───────────────────────────── Settings ─────────────────────────────
 @dataclass
 class Params:
+    # pattern detection
     piv_len: int = 5
     tol_pct: float = 0.5
     min_sep: int = 10
     max_sep: int = 100
     min_depth: float = 1.0
     max_wait: int = 30
+    # trade plan toggles
     trade_longs: bool = True
     trade_shorts: bool = True
+    use_entry1: bool = True
+    entry2_mode: str = "midpoint"      # off | midpoint | retest | retest_confirm
     rr: float = 2.0
-    tgt_mode: str = "per_entry"        # or "blended"
+    tgt_mode: str = "per_entry"        # per_entry | blended
     stop_buf_pct: float = 0.0
     e2_expiry: int = 50                # 0 = never
+    trend_filter: str = "off"          # off | sma
+    trend_len: int = 200
+
+    def label(self) -> str:
+        parts = []
+        parts.append("Breakout" if self.use_entry1 else "")
+        e2 = {"off": "", "midpoint": "Midpoint", "retest": "Retest", "retest_confirm": "Retest+Confirm"}[self.entry2_mode]
+        parts.append(e2)
+        name = " + ".join(x for x in parts if x) or "NONE"
+        if self.trend_filter == "sma":
+            name += f" | SMA{self.trend_len}"
+        if not self.trade_shorts:
+            name += " | longs only"
+        if not self.trade_longs:
+            name += " | shorts only"
+        return f"{name} | {self.rr:g}:1"
 
 
 # ───────────────────────────── Data ─────────────────────────────
@@ -49,11 +80,12 @@ def fetch_yahoo(symbol: str, interval: str = "1d", rng: str = "max", cache_dir: 
         if os.path.exists(cache):
             return pd.read_csv(cache, index_col=0, parse_dates=True)
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+    if rng == "max":   # "range=max" makes Yahoo silently downsample; ask for explicit dates instead
+        params = {"period1": 0, "period2": int(time.time()), "interval": interval}
+    else:
+        params = {"range": rng, "interval": interval}
+    r = None
     for attempt in range(4):
-        if rng == "max":   # "range=max" makes Yahoo silently downsample; ask for explicit dates instead
-            params = {"period1": 0, "period2": int(time.time()), "interval": interval}
-        else:
-            params = {"range": rng, "interval": interval}
         r = requests.get(url, params={**params, "includePrePost": "false"},
                          headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         if r.status_code == 200:
@@ -65,6 +97,7 @@ def fetch_yahoo(symbol: str, interval: str = "1d", rng: str = "max", cache_dir: 
     df = pd.DataFrame({k: q[k] for k in ("open", "high", "low", "close")},
                       index=pd.to_datetime(res["timestamp"], unit="s"))
     df = df.dropna()
+    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
     if cache:
         df.to_csv(cache)
     return df
@@ -73,6 +106,7 @@ def fetch_yahoo(symbol: str, interval: str = "1d", rng: str = "max", cache_dir: 
 # ───────────────────────────── Backtest ─────────────────────────────
 @dataclass
 class Trade:
+    symbol: str
     direction: int          # 1 long, -1 short
     entry: int              # 0 = Entry 1, 1 = Entry 2
     signal_time: object
@@ -95,37 +129,44 @@ class Result:
 
 
 def pivots(h: np.ndarray, l: np.ndarray, L: int):
-    """Pine-style pivots, confirmed L bars after the pivot bar. Returns arrays indexed by confirmation bar."""
+    """Pine-style pivots, confirmed L bars after the pivot bar. Arrays are indexed by confirmation bar."""
     n = len(h)
     ph = np.full(n, np.nan)
     pl = np.full(n, np.nan)
-    for i in range(2 * L, n):
-        c = i - L
-        left_h, right_h = h[c - L:c], h[c + 1:i + 1]
-        if h[c] > left_h.max() and h[c] >= right_h.max():
-            ph[i] = h[c]
-        left_l, right_l = l[c - L:c], l[c + 1:i + 1]
-        if l[c] < left_l.min() and l[c] <= right_l.min():
-            pl[i] = l[c]
+    if n <= 2 * L:
+        return ph, pl
+    win = np.lib.stride_tricks.sliding_window_view
+    hw, lw = win(h, 2 * L + 1), win(l, 2 * L + 1)     # row k covers bars k .. k+2L, centre k+L
+    cen_h, cen_l = hw[:, L], lw[:, L]
+    is_ph = (cen_h > hw[:, :L].max(axis=1)) & (cen_h >= hw[:, L + 1:].max(axis=1))
+    is_pl = (cen_l < lw[:, :L].min(axis=1)) & (cen_l <= lw[:, L + 1:].min(axis=1))
+    idx = np.arange(2 * L, n)
+    ph[idx[is_ph]] = cen_h[is_ph]
+    pl[idx[is_pl]] = cen_l[is_pl]
     return ph, pl
 
 
-def backtest(df: pd.DataFrame, p: Params) -> Result:
+def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
+    if not p.use_entry1 and p.entry2_mode == "off":
+        raise ValueError("At least one entry must be enabled")
     o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
     t = df.index
     n = len(df)
     L = p.piv_len
     ph, pl = pivots(h, l, L)
+    sma = pd.Series(c).rolling(p.trend_len).mean().to_numpy() if p.trend_filter == "sma" else None
     res = Result()
+    use_e2 = p.entry2_mode != "off"
+    confirm = p.entry2_mode == "retest_confirm"
+    retest_like = p.entry2_mode in ("retest", "retest_confirm")
 
     last_ph = last_ph_bar = None
     last_pl = last_pl_bar = None
-    dt = None  # pending double top: dict(top, neck, set_bar)
-    db = None
+    dt = None  # pending double top
+    db = None  # pending double bottom
 
-    # trade state
     t_dir = 0
-    tE1 = tE2 = tE2fill = tStop = tT1 = tT2 = math.nan
+    tE1 = tE2 = tE2fill = tStop = tT1 = tT2 = tT2plan = math.nan
     e1_open = e2_open = e2_pend = False
     sig_bar = -1
 
@@ -133,7 +174,17 @@ def backtest(df: pd.DataFrame, p: Params) -> Result:
         risk = abs(entry_px - stop_px)
         r = direction * (exit_px - entry_px) / risk if risk > 0 else 0.0
         pct = direction * (exit_px - entry_px) / entry_px * 100.0
-        res.trades.append(Trade(direction, entry, t[sig_bar], t[i], entry_px, exit_px, stop_px, r, pct, reason))
+        res.trades.append(Trade(symbol, direction, entry, t[sig_bar], t[i], entry_px, exit_px, stop_px, r, pct, reason))
+
+    def tgt(direction, entry_px, stop_px):
+        return entry_px + direction * p.rr * abs(entry_px - stop_px)
+
+    def trend_ok(direction, i):
+        if sma is None:
+            return True
+        if math.isnan(sma[i]):
+            return False
+        return c[i] > sma[i] if direction == 1 else c[i] < sma[i]
 
     for i in range(n):
         # ── Double top detection
@@ -176,59 +227,82 @@ def backtest(df: pd.DataFrame, p: Params) -> Result:
 
         # ── Simulate open trade
         if t_dir != 0 and i > sig_bar:
+            d = t_dir
             e2_just = False
-            if e2_pend and ((t_dir == -1 and h[i] >= tE2) or (t_dir == 1 and l[i] <= tE2)):
-                tE2fill = max(o[i], tE2) if t_dir == -1 else min(o[i], tE2)
-                e2_pend, e2_open, e2_just = False, True, True
-                res.e2_fills += 1
-            stop_hit = h[i] >= tStop if t_dir == -1 else l[i] <= tStop
-            stop_px = max(o[i], tStop) if t_dir == -1 else min(o[i], tStop)
+            if e2_pend:
+                touched = h[i] >= tE2 if d == -1 else l[i] <= tE2
+                if confirm:
+                    filled = touched and (c[i] < tE2 if d == -1 else c[i] > tE2)
+                    fill_px = c[i]
+                else:
+                    filled = touched
+                    fill_px = max(o[i], tE2) if d == -1 else min(o[i], tE2)
+                # never fill beyond the stop (gap through the whole pattern)
+                if filled and (fill_px < tStop if d == -1 else fill_px > tStop):
+                    tE2fill = fill_px
+                    if p.tgt_mode == "per_entry" or not p.use_entry1:
+                        tT2 = tgt(d, tE2fill, tStop)
+                    e2_pend, e2_open, e2_just = False, True, True
+                    res.e2_fills += 1
+            stop_hit = h[i] >= tStop if d == -1 else l[i] <= tStop
+            stop_px = max(o[i], tStop) if d == -1 else min(o[i], tStop)
             if e1_open:
-                tp = l[i] <= tT1 if t_dir == -1 else h[i] >= tT1
+                tp = l[i] <= tT1 if d == -1 else h[i] >= tT1
                 if stop_hit:
-                    record(t_dir, 0, tE1, stop_px, tStop, i, "SL"); e1_open = False
+                    record(d, 0, tE1, stop_px, tStop, i, "SL"); e1_open = False
                 elif tp:
-                    px = min(o[i], tT1) if t_dir == -1 else max(o[i], tT1)
-                    record(t_dir, 0, tE1, px, tStop, i, "TP"); e1_open = False
+                    px = min(o[i], tT1) if d == -1 else max(o[i], tT1)
+                    record(d, 0, tE1, px, tStop, i, "TP"); e1_open = False
             if e2_open:
-                tp = (not e2_just) and (l[i] <= tT2 if t_dir == -1 else h[i] >= tT2)
-                if stop_hit:
-                    record(t_dir, 1, tE2fill, stop_px, tStop, i, "SL"); e2_open = False
+                # limit fills: stop can still hit on the fill bar; confirm fills enter at the close -> nothing on that bar
+                sh = stop_hit and not (e2_just and confirm)
+                tp = (not e2_just) and (l[i] <= tT2 if d == -1 else h[i] >= tT2)
+                if sh:
+                    record(d, 1, tE2fill, stop_px, tStop, i, "SL"); e2_open = False
                 elif tp:
-                    px = min(o[i], tT2) if t_dir == -1 else max(o[i], tT2)
-                    record(t_dir, 1, tE2fill, px, tStop, i, "TP"); e2_open = False
-            if e2_pend and (not e1_open or (p.e2_expiry > 0 and i - sig_bar >= p.e2_expiry)):
-                e2_pend = False
+                    px = min(o[i], tT2) if d == -1 else max(o[i], tT2)
+                    record(d, 1, tE2fill, px, tStop, i, "TP"); e2_open = False
+            if e2_pend:
+                cancel = p.use_entry1 and not e1_open                       # entry 1 finished
+                cancel |= p.e2_expiry > 0 and i - sig_bar >= p.e2_expiry    # expired
+                if retest_like:                                             # ran to target / stop without a retest
+                    cancel |= (l[i] <= tT2plan) if d == -1 else (h[i] >= tT2plan)
+                    cancel |= (h[i] >= tStop) if d == -1 else (l[i] <= tStop)
+                if cancel:
+                    e2_pend = False
             if not (e1_open or e2_open or e2_pend):
                 t_dir = 0
 
         # ── New entries
-        if dt and t_dir == 0 and c[i] < dt["neck"]:
-            H = dt["top"] - dt["neck"]
-            tStop = dt["top"] + H * p.stop_buf_pct / 100
-            tE1, tE2 = c[i], dt["neck"] + H / 2
-            avg = (tE1 + tE2) / 2
-            if p.tgt_mode == "per_entry":
-                tT1 = tE1 - p.rr * (tStop - tE1)
-                tT2 = tE2 - p.rr * (tStop - tE2)
+        def open_trade(d, extreme, neck):
+            nonlocal t_dir, tE1, tE2, tStop, tT1, tT2, tT2plan, e1_open, e2_open, e2_pend, sig_bar
+            H = abs(extreme - neck)
+            tStop = extreme - d * H * p.stop_buf_pct / 100
+            tE1 = c[i]
+            if p.entry2_mode == "midpoint":
+                tE2 = neck - d * H / 2
             else:
-                tT1 = tT2 = avg - p.rr * (tStop - avg)
-            t_dir, e1_open, e2_open, e2_pend, sig_bar = -1, True, False, True, i
-            res.signals_short += 1
+                tE2 = neck
+            if p.tgt_mode == "blended" and p.use_entry1 and use_e2:
+                avg = (tE1 + tE2) / 2
+                tT1 = tT2 = tgt(d, avg, tStop)
+            else:
+                tT1 = tgt(d, tE1, tStop)
+                tT2 = tgt(d, tE2, tStop)
+            tT2plan = tT2
+            t_dir, sig_bar = d, i
+            e1_open, e2_open, e2_pend = p.use_entry1, False, use_e2
+
+        if dt and t_dir == 0 and c[i] < dt["neck"]:
+            if trend_ok(-1, i):
+                open_trade(-1, dt["top"], dt["neck"])
+                res.signals_short += 1
             dt = db = None
 
         if db and t_dir == 0 and c[i] > db["neck"]:
-            H = db["neck"] - db["bot"]
-            tStop = db["bot"] - H * p.stop_buf_pct / 100
-            tE1, tE2 = c[i], db["neck"] - H / 2
-            avg = (tE1 + tE2) / 2
-            if p.tgt_mode == "per_entry":
-                tT1 = tE1 + p.rr * (tE1 - tStop)
-                tT2 = tE2 + p.rr * (tE2 - tStop)
-            else:
-                tT1 = tT2 = avg + p.rr * (avg - tStop)
-            t_dir, e1_open, e2_open, e2_pend, sig_bar = 1, True, False, True, i
-            res.signals_long += 1
+            if trend_ok(1, i):
+                open_trade(1, db["bot"], db["neck"])
+                res.signals_long += 1
             db = dt = None
 
     if t_dir != 0:
@@ -259,7 +333,7 @@ def max_dd_r(trades: list[Trade]) -> float:
 def summarize(symbol: str, df: pd.DataFrame, res: Result) -> dict:
     tr = res.trades
     sig = res.signals_long + res.signals_short
-    out = dict(
+    return dict(
         symbol=symbol, bars=len(df), start=str(df.index[0].date()), end=str(df.index[-1].date()),
         signals=sig, signals_long=res.signals_long, signals_short=res.signals_short,
         e2_fill_rate=res.e2_fills / sig * 100 if sig else float("nan"),
@@ -270,34 +344,50 @@ def summarize(symbol: str, df: pd.DataFrame, res: Result) -> dict:
         short=stats([x for x in tr if x.direction == -1]),
         max_dd_r=max_dd_r(tr), open_trade=res.open_trade,
     )
-    return out
+
+
+def _f(v, fmt="{:.2f}"):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "–"
+    return "∞" if v == float("inf") else fmt.format(v)
 
 
 def print_summary(s: dict) -> None:
-    def f(v, fmt="{:.2f}"):
-        return "–" if v is None or (isinstance(v, float) and math.isnan(v)) else ("∞" if v == float("inf") else fmt.format(v))
     print(f"\n=== {s['symbol']}  ({s['start']} → {s['end']}, {s['bars']} bars) ===")
     print(f"Signals: {s['signals']} (long {s['signals_long']} / short {s['signals_short']})   "
-          f"Entry-2 fill rate: {f(s['e2_fill_rate'], '{:.1f}%')}   Max DD: {s['max_dd_r']:.2f}R   Now: {s['open_trade']}")
+          f"Entry-2 fill rate: {_f(s['e2_fill_rate'], '{:.1f}%')}   Max DD: {s['max_dd_r']:.2f}R   Now: {s['open_trade']}")
     print(f"{'':16}{'Entry 1':>12}{'Entry 2':>12}{'Total':>12}{'Longs':>12}{'Shorts':>12}")
     cols = [s["e1"], s["e2"], s["total"], s["long"], s["short"]]
     rows = [("Closed trades", "n", "{:.0f}"), ("Win rate", "win_rate", "{:.1f}%"), ("Net R", "net_r", "{:+.2f}"),
             ("Avg R/trade", "avg_r", "{:+.3f}"), ("Profit factor", "pf", "{:.2f}"), ("Net % (sum)", "net_pct", "{:+.1f}%")]
     for name, key, fmt in rows:
-        print(f"{name:16}" + "".join(f"{f(cl[key], fmt):>12}" for cl in cols))
+        print(f"{name:16}" + "".join(f"{_f(cl[key], fmt):>12}" for cl in cols))
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser()
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("symbols", nargs="+")
     ap.add_argument("--interval", default="1d")
     ap.add_argument("--range", default="max")
     ap.add_argument("--rr", type=float, default=2.0)
-    ap.add_argument("--blended", action="store_true")
+    ap.add_argument("--blended", action="store_true", help="shared target off the average entry")
+    ap.add_argument("--no-entry1", action="store_true", help="disable the breakout entry")
+    ap.add_argument("--entry2", default="midpoint", choices=["off", "midpoint", "retest", "retest_confirm"])
+    ap.add_argument("--trend", default="off", choices=["off", "sma"])
+    ap.add_argument("--trend-len", type=int, default=200)
+    ap.add_argument("--longs-only", action="store_true")
+    ap.add_argument("--shorts-only", action="store_true")
     ap.add_argument("--cache", default=None)
     ap.add_argument("--json", default=None, help="write summaries to this JSON file")
-    a = ap.parse_args(argv)
-    p = Params(rr=a.rr, tgt_mode="blended" if a.blended else "per_entry")
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    p = Params(rr=a.rr, tgt_mode="blended" if a.blended else "per_entry", use_entry1=not a.no_entry1,
+               entry2_mode=a.entry2, trend_filter=a.trend, trend_len=a.trend_len,
+               trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
+    print(f"Config: {p.label()}")
     summaries = []
     for sym in a.symbols:
         try:
@@ -305,7 +395,7 @@ def main(argv=None):
         except Exception as e:  # noqa: BLE001
             print(f"{sym}: data error {e}", file=sys.stderr)
             continue
-        s = summarize(sym, df, backtest(df, p))
+        s = summarize(sym, df, backtest(df, p, sym))
         print_summary(s)
         summaries.append(s)
     if a.json:

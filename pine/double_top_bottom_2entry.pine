@@ -2,15 +2,17 @@
 // Double Top / Double Bottom indicator with a two-stage entry plan and a built-in
 // historical performance tracker (no strategy engine — trades are simulated bar by bar).
 //
-//  • Entry 1: on the bar that CLOSES through the neckline (breakout), at that close.
-//  • Entry 2: limit at the midpoint between the neckline and the pattern extreme
-//             (top of a double top / bottom of a double bottom).
+//  • Entry 1 (toggle): on the bar that CLOSES through the neckline (breakout), at that close.
+//  • Entry 2 (mode):   Off | Midpoint between neckline and pattern extreme | Retest of the neckline |
+//                      Retest + confirm (touch neckline, close back on the breakout side).
+//  • Optional SMA trend filter (longs above, shorts below).
 //  • Stop:    just beyond the pattern extreme (optional buffer).
 //  • Target:  Reward:Risk (default 2:1), per entry or on the blended average entry.
 //
 // Simulation rules (conservative):
 //  • If the stop and target are both touched in the same bar, the stop is assumed hit first.
-//  • On the bar Entry 2 fills, only its stop is checked (no same-bar target).
+//  • On the bar a limit Entry 2 fills, only its stop is checked (no same-bar target).
+//  • Entry 2's per-entry target is measured from its actual fill price.
 //  • Gaps through a stop/target/limit fill at the bar's open.
 //  • Only one pattern trade is tracked at a time; new signals are ignored while a trade is live.
 indicator("Double Top / Bottom – 2-Stage Entry", shorttitle = "DT/DB 2-Entry", overlay = true,
@@ -33,6 +35,13 @@ tgtMode     = input.string("Per entry", "Target mode", options = ["Per entry", "
      tooltip = "Per entry: each entry gets its own RR target measured from its own entry price to the stop.\nBlended: both entries share one target, RR measured from the average of the two entry prices.")
 stopBufPct  = input.float(0.0,  "Stop buffer beyond extreme (% of pattern height)", minval = 0.0, step = 5.0, group = grpT)
 e2Expiry    = input.int(50,     "Cancel unfilled 2nd entry after N bars (0 = never)", minval = 0, group = grpT)
+
+grpE = "Strategy toggles"
+useE1    = input.bool(true, "Entry 1: enter at breakout close", group = grpE)
+e2Mode   = input.string("Midpoint", "Entry 2 mode", options = ["Off", "Midpoint", "Retest", "Retest + confirm"], group = grpE,
+     tooltip = "Off: no second entry.\nMidpoint: limit halfway between neckline and pattern top/bottom.\nRetest: limit at the neckline (retest of the breakout point).\nRetest + confirm: a bar touches the neckline and closes back on the breakout side; enter at that close.\nRetest modes are cancelled if price reaches the target or the stop level first.")
+trendOn  = input.bool(false, "Trend filter (longs above SMA, shorts below)", group = grpE)
+trendLen = input.int(200, "Trend SMA length", minval = 2, group = grpE)
 
 grpV = "Visuals"
 showLevels = input.bool(true, "Draw pattern & trade levels", group = grpV)
@@ -208,25 +217,37 @@ if dbPend and (close < dbBot or bar_index - dbSetBar > maxWait)
 // ───────────────────── Simulated trade state ─────────────────────
 var int   tDir    = 0        // 1 long, -1 short, 0 flat
 var float tE1     = na       // entry 1 price
-var float tE2     = na       // entry 2 limit level
+var float tE2     = na       // entry 2 level (midpoint or neckline)
 var float tE2Fill = na       // entry 2 actual fill price
 var float tStop   = na
 var float tT1     = na
 var float tT2     = na
+var float tT2Plan = na       // entry 2 target computed from the planned level (used to cancel un-retested setups)
 var bool  e1Open  = false
 var bool  e2Open  = false
 var bool  e2Pend  = false
 var int   sigBar  = na
 
+bool useE2      = e2Mode != "Off"
+bool e2Confirm  = e2Mode == "Retest + confirm"
+bool e2Retest   = e2Mode == "Retest" or e2Confirm
+bool perEntry   = tgtMode == "Per entry" or not useE1 or not useE2
+smaV            = ta.sma(close, trendLen)
+
 if tDir != 0 and bar_index > sigBar
     string side = tDir == 1 ? "Long" : "Short"
 
-    // 1) Entry 2 limit fill
+    // 1) Entry 2 fill
     bool e2JustFilled = false
     if e2Pend
-        bool hitE2 = tDir == -1 ? high >= tE2 : low <= tE2
-        if hitE2
-            tE2Fill      := tDir == -1 ? math.max(open, tE2) : math.min(open, tE2)
+        bool  touched = tDir == -1 ? high >= tE2 : low <= tE2
+        bool  filled  = e2Confirm ? touched and (tDir == -1 ? close < tE2 : close > tE2) : touched
+        float fillPx  = e2Confirm ? close : tDir == -1 ? math.max(open, tE2) : math.min(open, tE2)
+        bool  sane    = tDir == -1 ? fillPx < tStop : fillPx > tStop     // never fill beyond the stop
+        if filled and sane
+            tE2Fill      := fillPx
+            if perEntry
+                tT2 := tE2Fill + tDir * rr * math.abs(tE2Fill - tStop)
             e2Pend       := false
             e2Open       := true
             e2JustFilled := true
@@ -251,8 +272,10 @@ if tDir != 0 and bar_index > sigBar
             e1Open := false
 
     if e2Open
+        // confirm-mode fills happen at the close, so nothing else can happen to them on that bar
+        bool sl2Hit = stopHit and not (e2JustFilled and e2Confirm)
         bool tp2Hit = not e2JustFilled and (tDir == -1 ? low <= tT2 : high >= tT2)
-        if stopHit
+        if sl2Hit
             float r = recordExit(tDir, 1, tE2Fill, stopPx, tStop)
             exitLabel(stopPx, tDir, "SL2", r)
             e2Open := false
@@ -262,89 +285,72 @@ if tDir != 0 and bar_index > sigBar
             exitLabel(px, tDir, "TP2", r)
             e2Open := false
 
-    // 3) Cancel an unfilled Entry 2 once Entry 1 is done, or on expiry
-    if e2Pend and (not e1Open or (e2Expiry > 0 and bar_index - sigBar >= e2Expiry))
-        e2Pend := false
+    // 3) Cancel an unfilled Entry 2
+    if e2Pend
+        bool cancel = (useE1 and not e1Open) or (e2Expiry > 0 and bar_index - sigBar >= e2Expiry)
+        if e2Retest
+            cancel := cancel or (tDir == -1 ? low <= tT2Plan : high >= tT2Plan) or (tDir == -1 ? high >= tStop : low <= tStop)
+        if cancel
+            e2Pend := false
 
     // 4) Trade finished?
     if not e1Open and not e2Open and not e2Pend
         tDir := 0
 
-bool canEnter = tDir == 0
+// ───────────────────── New signals (breakout close through neckline) ─────────────────────
+bool shortSig = dtPend and tDir == 0 and close < dtNeck
+bool longSig  = not shortSig and dbPend and tDir == 0 and close > dbNeck
 
-// ───────────────────── Short: double top breakout ─────────────────────
-if dtPend and canEnter and close < dtNeck
-    float H     = dtTop - dtNeck
-    float stopL = dtTop + H * stopBufPct / 100.0
-    float e1    = close
-    float e2    = dtNeck + H / 2.0          // halfway between neckline and top
-    float avgE  = (e1 + e2) / 2.0
-    float t1    = tgtMode == "Per entry" ? e1 - rr * (stopL - e1) : avgE - rr * (stopL - avgE)
-    float t2    = tgtMode == "Per entry" ? e2 - rr * (stopL - e2) : t1
-
-    tDir   := -1
-    tE1    := e1
-    tE2    := e2
-    tStop  := stopL
-    tT1    := t1
-    tT2    := t2
-    e1Open := true
-    e2Open := false
-    e2Pend := true
-    sigBar := bar_index
-    array.set(aSig, 1, array.get(aSig, 1) + 1)
+if shortSig or longSig
+    int   d     = shortSig ? -1 : 1
+    float ext   = shortSig ? dtTop  : dbBot
+    float neck  = shortSig ? dtNeck : dbNeck
+    int   pB1   = shortSig ? dtB1 : dbB1
+    float pP1   = shortSig ? dtP1 : dbP1
+    int   pNB   = shortSig ? dtNeckB : dbNeckB
+    int   pB2   = shortSig ? dtB2 : dbB2
+    float pP2   = shortSig ? dtP2 : dbP2
     dtPend := false
     dbPend := false
 
-    if showLevels
-        drawPattern(dtB1, dtP1, dtNeckB, dtNeck, dtB2, dtP2, close, color.red, "DT")
-        drawLevel(e2,    color.orange, "Entry 2")
-        drawLevel(stopL, color.red,    "Stop")
-        drawLevel(t1,    color.green,  tgtMode == "Per entry" ? "TP 1" : "TP")
-        if tgtMode == "Per entry"
-            drawLevel(t2, color.teal, "TP 2")
+    bool trendPass = not trendOn or (not na(smaV) and (d == 1 ? close > smaV : close < smaV))
+    if trendPass
+        float H     = math.abs(ext - neck)
+        float stopL = ext - d * H * stopBufPct / 100.0
+        float e1    = close
+        float e2    = e2Mode == "Midpoint" ? neck - d * H / 2.0 : neck
+        float avgE  = (e1 + e2) / 2.0
+        float t1    = perEntry ? e1 + d * rr * math.abs(e1 - stopL) : avgE + d * rr * math.abs(avgE - stopL)
+        float t2    = perEntry ? e2 + d * rr * math.abs(e2 - stopL) : t1
 
-    alert("Double TOP breakout SHORT on " + syminfo.ticker + " | E1 " + str.tostring(e1, format.mintick) +
-         " | E2 limit " + str.tostring(e2, format.mintick) + " | Stop " + str.tostring(stopL, format.mintick) +
-         " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick),
-         alert.freq_once_per_bar_close)
+        tDir    := d
+        tE1     := e1
+        tE2     := e2
+        tStop   := stopL
+        tT1     := t1
+        tT2     := t2
+        tT2Plan := t2
+        e1Open  := useE1
+        e2Open  := false
+        e2Pend  := useE2
+        sigBar  := bar_index
+        int si = d == 1 ? 0 : 1
+        array.set(aSig, si, array.get(aSig, si) + 1)
 
-// ───────────────────── Long: double bottom breakout ─────────────────────
-if dbPend and tDir == 0 and close > dbNeck
-    float H     = dbNeck - dbBot
-    float stopL = dbBot - H * stopBufPct / 100.0
-    float e1    = close
-    float e2    = dbNeck - H / 2.0          // halfway between neckline and bottom
-    float avgE  = (e1 + e2) / 2.0
-    float t1    = tgtMode == "Per entry" ? e1 + rr * (e1 - stopL) : avgE + rr * (avgE - stopL)
-    float t2    = tgtMode == "Per entry" ? e2 + rr * (e2 - stopL) : t1
+        if showLevels
+            drawPattern(pB1, pP1, pNB, neck, pB2, pP2, close, d == 1 ? color.green : color.red, d == 1 ? "DB" : "DT")
+            if useE2
+                drawLevel(e2, color.orange, e2Retest ? "Retest entry" : "Entry 2")
+            drawLevel(stopL, color.red, "Stop")
+            if useE1
+                drawLevel(t1, color.green, perEntry ? "TP 1" : "TP")
+            if useE2 and perEntry
+                drawLevel(t2, color.teal, "TP 2")
 
-    tDir   := 1
-    tE1    := e1
-    tE2    := e2
-    tStop  := stopL
-    tT1    := t1
-    tT2    := t2
-    e1Open := true
-    e2Open := false
-    e2Pend := true
-    sigBar := bar_index
-    array.set(aSig, 0, array.get(aSig, 0) + 1)
-    dbPend := false
-    dtPend := false
-
-    if showLevels
-        drawPattern(dbB1, dbP1, dbNeckB, dbNeck, dbB2, dbP2, close, color.green, "DB")
-        drawLevel(e2,    color.orange, "Entry 2")
-        drawLevel(stopL, color.red,    "Stop")
-        drawLevel(t1,    color.green,  tgtMode == "Per entry" ? "TP 1" : "TP")
-        if tgtMode == "Per entry"
-            drawLevel(t2, color.teal, "TP 2")
-
-    alert("Double BOTTOM breakout LONG on " + syminfo.ticker + " | E1 " + str.tostring(e1, format.mintick) +
-         " | E2 limit " + str.tostring(e2, format.mintick) + " | Stop " + str.tostring(stopL, format.mintick) +
-         " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick),
-         alert.freq_once_per_bar_close)
+        alert((d == 1 ? "Double BOTTOM breakout LONG on " : "Double TOP breakout SHORT on ") + syminfo.ticker +
+             (useE1 ? " | E1 " + str.tostring(e1, format.mintick) + " TP1 " + str.tostring(t1, format.mintick) : "") +
+             (useE2 ? " | E2 (" + e2Mode + ") " + str.tostring(e2, format.mintick) + " TP2 " + str.tostring(t2, format.mintick) : "") +
+             " | Stop " + str.tostring(stopL, format.mintick), alert.freq_once_per_bar_close)
 
 // Live necklines of pending (not yet broken) patterns
 plot(dtPend ? dtNeck : na, "Pending DT neckline", color.new(color.red, 30),   2, plot.style_linebr)
@@ -424,7 +430,9 @@ if barstate.isfirst
 
 if barstate.islast
     hdrBg = color.new(color.blue, 40)
-    cellTxt(0, 0, "DT/DB 2-Stage — Historical Performance  (" + str.tostring(rr, "#.#") + ":1)", color.white, hdrBg)
+    string cfg = (useE1 ? "Breakout" : "") + (useE1 and useE2 ? " + " : "") + (useE2 ? e2Mode : "") +
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "") + " | " + str.tostring(rr, "#.#") + ":1"
+    cellTxt(0, 0, "DT/DB — Historical Performance  (" + cfg + ")", color.white, hdrBg)
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Entry 1", color.silver)
     cellTxt(2, 1, "Entry 2", color.silver)
@@ -465,7 +473,7 @@ if barstate.islast
 
     string openTxt = "Flat"
     if tDir != 0
-        openTxt := (tDir == 1 ? "LONG" : "SHORT") + " | E1 " + (e1Open ? "open" : "closed") +
+        openTxt := (tDir == 1 ? "LONG" : "SHORT") + " | E1 " + (not useE1 ? "off" : e1Open ? "open" : "closed") +
              " | E2 " + (e2Open ? "open" : e2Pend ? "pending @ " + str.tostring(tE2, format.mintick) : "closed/none")
     cellTxt(0, 16, "Current trade")
     cellTxt(1, 16, openTxt, tDir == 1 ? color.lime : tDir == -1 ? color.red : color.white)
