@@ -12,7 +12,7 @@
 // Simulation rules (conservative):
 //  • If the stop and target are both touched in the same bar, the stop is assumed hit first.
 //  • On the bar a limit Entry 2 fills, only its stop is checked (no same-bar target).
-//  • Entry 2's per-entry target is measured from its actual fill price.
+//  • Limit entries keep their planned target/risk on gap fills; confirm entries use the actual close.
 //  • Gaps through a stop/target/limit fill at the bar's open.
 //  • Only one pattern trade is tracked at a time; new signals are ignored while a trade is live.
 indicator("Double Top / Bottom – 2-Stage Entry", shorttitle = "DT/DB 2-Entry", overlay = true,
@@ -77,8 +77,9 @@ var array<float> aSig  = array.new<float>(2, 0.0)   // signals  [long, short]
 var array<float> aFill = array.new<float>(2, 0.0)   // entry-2 fills [long, short]
 var array<float> eq    = array.new<float>(3, 0.0)   // [cumulative R, peak R, max drawdown R]
 
-recordExit(int dir, int entry, float entryPx, float exitPx, float stopPx) =>
-    float risk = math.abs(entryPx - stopPx)
+recordExit(int dir, int entry, float entryPx, float exitPx, float stopPx, float riskRef = na) =>
+    // riskRef = planned limit price, so a gap fill right next to the stop can't create a tiny-risk outlier
+    float risk = math.abs((na(riskRef) ? entryPx : riskRef) - stopPx)
     float r    = risk > 0 ? dir * (exitPx - entryPx) / risk : 0.0
     float pct  = dir * (exitPx - entryPx) / entryPx * 100.0
     int   idx  = (dir == 1 ? 0 : 2) + entry
@@ -246,7 +247,7 @@ if tDir != 0 and bar_index > sigBar
         bool  sane    = tDir == -1 ? fillPx < tStop : fillPx > tStop     // never fill beyond the stop
         if filled and sane
             tE2Fill      := fillPx
-            if perEntry
+            if perEntry and e2Confirm     // limit fills keep the planned target
                 tT2 := tE2Fill + tDir * rr * math.abs(tE2Fill - tStop)
             e2Pend       := false
             e2Open       := true
@@ -276,12 +277,12 @@ if tDir != 0 and bar_index > sigBar
         bool sl2Hit = stopHit and not (e2JustFilled and e2Confirm)
         bool tp2Hit = not e2JustFilled and (tDir == -1 ? low <= tT2 : high >= tT2)
         if sl2Hit
-            float r = recordExit(tDir, 1, tE2Fill, stopPx, tStop)
+            float r = recordExit(tDir, 1, tE2Fill, stopPx, tStop, e2Confirm ? na : tE2)
             exitLabel(stopPx, tDir, "SL2", r)
             e2Open := false
         else if tp2Hit
             float px = tDir == -1 ? math.min(open, tT2) : math.max(open, tT2)
-            float r  = recordExit(tDir, 1, tE2Fill, px, tStop)
+            float r  = recordExit(tDir, 1, tE2Fill, px, tStop, e2Confirm ? na : tE2)
             exitLabel(px, tDir, "TP2", r)
             e2Open := false
 

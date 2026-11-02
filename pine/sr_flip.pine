@@ -1,0 +1,389 @@
+//@version=6
+// S/R Flip (break & retest / liquidity sweep) indicator with a built-in performance tracker.
+// Python twin: python/srflip_backtest.py (same rules, so the numbers should match).
+//
+//  1. Resistance = an unbroken swing high at least "min age" bars old (support = swing low).
+//  2. Breakout   = a bar CLOSES beyond the level by at least X × ATR → the level has "flipped".
+//  3. Retest     = within the retest window price comes back to the level. Entry modes:
+//                  Touch           limit order in a small zone on the breakout side of the level
+//                  Rejection close bar trades into the zone and CLOSES back on the breakout side → enter at close
+//                  Sweep reclaim   bar wicks THROUGH the level (stop hunt) and CLOSES back → enter at close
+//  4. Stop = level ∓ X × ATR (sweep: also beyond the sweep wick). Target = R:R × risk.
+//  5. Multiple tries: after a stop-out the level stays live (up to "max tries") unless a bar CLOSES
+//     beyond the stop level, the window expires, or a target is hit.
+//
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill
+// only checks its stop on the fill bar; gaps fill at the open; one trade at a time.
+indicator("S/R Flip – Break & Retest", shorttitle = "SR Flip", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpL = "Levels & breakout"
+pivLen   = input.int(5,     "Swing strength (bars each side)", minval = 1, group = grpL)
+minAge   = input.int(10,    "Min level age at breakout (bars)", minval = 0, group = grpL)
+maxAge   = input.int(250,   "Max level age (bars)", minval = 10, group = grpL)
+atrLen   = input.int(14,    "ATR length", minval = 1, group = grpL)
+brkAtr   = input.float(0.2, "Breakout close must clear level by (× ATR)", minval = 0.0, step = 0.05, group = grpL)
+
+grpE = "Retest entry"
+entryMode   = input.string("Touch", "Entry mode", options = ["Touch", "Rejection close", "Sweep reclaim"], group = grpE)
+window      = input.int(30,    "Retest window (bars after breakout)", minval = 1, group = grpE)
+minAfter    = input.int(1,     "Earliest retest (bars after breakout)", minval = 1, group = grpE)
+zoneAtr     = input.float(0.1, "Entry zone beyond level (× ATR)", minval = 0.0, step = 0.05, group = grpE)
+sweepAtr    = input.float(0.1, "Sweep: wick must pierce level by (× ATR)", minval = 0.0, step = 0.05, group = grpE)
+stopAtr     = input.float(0.5, "Stop beyond level (× ATR)", minval = 0.05, step = 0.05, group = grpE)
+maxTries    = input.int(3,     "Max tries per level", minval = 1, maxval = 10, group = grpE)
+rr          = input.float(2.0, "Reward : Risk", minval = 0.1, step = 0.1, group = grpE)
+
+grpF = "Filters"
+tradeLongs  = input.bool(true,  "Longs (resistance → support)", group = grpF)
+tradeShorts = input.bool(true,  "Shorts (support → resistance)", group = grpF)
+trendOn     = input.bool(false, "Trend filter (longs above SMA, shorts below)", group = grpF)
+trendLen    = input.int(200, "Trend SMA length", minval = 2, group = grpF)
+
+grpV = "Visuals"
+showLevels = input.bool(true, "Show unbroken swing levels", group = grpV)
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+atrV = ta.atr(atrLen)
+smaV = ta.sma(close, trendLen)
+
+// ─────────────────────── Performance storage ───────────────────────
+// index = (long ? 0 : 3) + try   (try 0, 1, 2 = 3rd or later)
+var array<float> aWins = array.new<float>(6, 0.0)
+var array<float> aLoss = array.new<float>(6, 0.0)
+var array<float> aSumR = array.new<float>(6, 0.0)
+var array<float> aGW   = array.new<float>(6, 0.0)
+var array<float> aGL   = array.new<float>(6, 0.0)
+var array<float> aBrk  = array.new<float>(2, 0.0)   // breakouts armed [long, short]
+var array<float> aLvl  = array.new<float>(2, 0.0)   // [levels traded, levels that paid]
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+
+recordExit(int dir, int tryIdx, float entryPx, float exitPx, float risk) =>
+    float r   = risk > 0 ? dir * (exitPx - entryPx) / risk : 0.0
+    int   idx = (dir == 1 ? 0 : 3) + tryIdx
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── Swing levels ─────────────────────────────
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+var array<float> resP = array.new<float>()
+var array<int>   resB = array.new<int>()
+var array<float> supP = array.new<float>()
+var array<int>   supB = array.new<int>()
+
+if not na(ph)
+    array.push(resP, ph)
+    array.push(resB, bar_index - pivLen)
+if not na(pl)
+    array.push(supP, pl)
+    array.push(supB, bar_index - pivLen)
+
+// prune old levels
+if array.size(resB) > 0
+    for k = array.size(resB) - 1 to 0
+        if bar_index - array.get(resB, k) > maxAge
+            array.remove(resP, k)
+            array.remove(resB, k)
+if array.size(supB) > 0
+    for k = array.size(supB) - 1 to 0
+        if bar_index - array.get(supB, k) > maxAge
+            array.remove(supP, k)
+            array.remove(supB, k)
+
+// ───────────────────────────── State ─────────────────────────────
+var bool  actOn    = false   // a flipped level is live
+var int   actDir   = 0
+var float actLvl   = na
+var int   actBrk   = na
+var float actAtr   = na
+var int   actTries = 0
+var bool  actPaid  = false
+var bool  actTraded = false
+
+var bool  inTr   = false
+var int   trD    = 0
+var float trE    = na
+var float trS    = na
+var float trT    = na
+var float trRisk = na
+var int   trBar  = na
+var int   trTry  = 0
+
+// 1) Manage open trade
+bool exited = false
+if inTr and bar_index > trBar
+    bool stopHit = trD == 1 ? low <= trS : high >= trS
+    bool tpHit   = trD == 1 ? high >= trT : low <= trT
+    if stopHit
+        float px = trD == 1 ? math.min(open, trS) : math.max(open, trS)
+        float r  = recordExit(trD, trTry, trE, px, trRisk)
+        exitLabel(px, "SL", r)
+        inTr     := false
+        exited   := true
+        actTries += 1
+        if actTries >= maxTries
+            actOn := false
+    else if tpHit
+        float px = trD == 1 ? math.max(open, trT) : math.min(open, trT)
+        float r  = recordExit(trD, trTry, trE, px, trRisk)
+        exitLabel(px, "TP", r)
+        inTr    := false
+        exited  := true
+        actOn   := false
+        if not actPaid
+            actPaid := true
+            array.set(aLvl, 1, array.get(aLvl, 1) + 1)
+
+// 2) Entry on a retest of the flipped level
+if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
+    int   d        = actDir
+    float zone     = actLvl + d * zoneAtr * actAtr
+    float baseStop = actLvl - d * stopAtr * actAtr
+    bool  inZone   = d == 1 ? low <= zone : high >= zone
+    float entry    = na
+    float plan     = na
+    float stp      = baseStop
+    bool  sameBar  = false
+    if entryMode == "Touch"
+        if inZone
+            entry   := d == 1 ? math.min(open, zone) : math.max(open, zone)
+            plan    := zone
+            sameBar := true
+    else if entryMode == "Rejection close"
+        if inZone and (d == 1 ? close > actLvl : close < actLvl)
+            entry := close
+    else
+        bool pierced = d == 1 ? low <= actLvl - sweepAtr * actAtr : high >= actLvl + sweepAtr * actAtr
+        if pierced and (d == 1 ? close > actLvl : close < actLvl)
+            entry := close
+            float wick = d == 1 ? low - 0.1 * actAtr : high + 0.1 * actAtr
+            stp := d == 1 ? math.min(baseStop, wick) : math.max(baseStop, wick)
+    if not na(entry) and (d == 1 ? entry > stp : entry < stp)
+        float ref = na(plan) ? entry : plan
+        inTr   := true
+        trD    := d
+        trE    := entry
+        trS    := stp
+        trBar  := bar_index
+        trTry  := math.min(actTries, 2)
+        trRisk := math.abs(ref - stp)
+        trT    := ref + d * rr * trRisk
+        if not actTraded
+            actTraded := true
+            array.set(aLvl, 0, array.get(aLvl, 0) + 1)
+        if showTrades
+            label.new(bar_index, entry, "Try " + str.tostring(actTries + 1),
+                 style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.blue, 10), textcolor = color.white, size = size.tiny, yloc = yloc.price)
+        alert((d == 1 ? "SR flip LONG" : "SR flip SHORT") + " try " + str.tostring(actTries + 1) + " on " + syminfo.ticker +
+             " | entry " + str.tostring(entry, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+             " | target " + str.tostring(trT, format.mintick), alert.freq_once_per_bar)
+        if sameBar and (d == 1 ? low <= stp : high >= stp)
+            float r = recordExit(trD, trTry, trE, stp, trRisk)
+            exitLabel(stp, "SL", r)
+            inTr     := false
+            actTries += 1
+            if actTries >= maxTries
+                actOn := false
+
+// 3) Invalidation / expiry of the flipped level (only while flat)
+if actOn and not inTr
+    float inval = actLvl - actDir * stopAtr * actAtr
+    if (actDir == 1 ? close < inval : close > inval) or bar_index - actBrk > window
+        actOn := false
+
+// 4) Breakouts
+int   newDir = 0
+float newLvl = na
+int   newPB  = na
+if not na(atrV)
+    float bestRes  = na
+    int   bestResB = na
+    if array.size(resP) > 0
+        for k = array.size(resP) - 1 to 0
+            float lv = array.get(resP, k)
+            if close > lv
+                int pb = array.get(resB, k)
+                if close >= lv + brkAtr * atrV and bar_index - pb >= minAge and (na(bestRes) or lv > bestRes)
+                    bestRes  := lv
+                    bestResB := pb
+                array.remove(resP, k)
+                array.remove(resB, k)
+    float bestSup  = na
+    int   bestSupB = na
+    if array.size(supP) > 0
+        for k = array.size(supP) - 1 to 0
+            float lv = array.get(supP, k)
+            if close < lv
+                int pb = array.get(supB, k)
+                if close <= lv - brkAtr * atrV and bar_index - pb >= minAge and (na(bestSup) or lv < bestSup)
+                    bestSup  := lv
+                    bestSupB := pb
+                array.remove(supP, k)
+                array.remove(supB, k)
+    if tradeLongs and not na(bestRes)
+        newDir := 1
+        newLvl := bestRes
+        newPB  := bestResB
+    else if tradeShorts and not na(bestSup)
+        newDir := -1
+        newLvl := bestSup
+        newPB  := bestSupB
+
+if newDir != 0 and not inTr
+    bool trendPass = not trendOn or (not na(smaV) and (newDir == 1 ? close > smaV : close < smaV))
+    if trendPass
+        actOn     := true
+        actDir    := newDir
+        actLvl    := newLvl
+        actBrk    := bar_index
+        actAtr    := atrV
+        actTries  := 0
+        actPaid   := false
+        actTraded := false
+        int bi = newDir == 1 ? 0 : 1
+        array.set(aBrk, bi, array.get(aBrk, bi) + 1)
+        color lc = newDir == 1 ? color.teal : color.maroon
+        line.new(newPB, newLvl, bar_index + window, newLvl, color = lc, width = 2)
+        label.new(bar_index, newLvl, newDir == 1 ? "Flip ↑" : "Flip ↓",
+             style = newDir == 1 ? label.style_label_up : label.style_label_down,
+             color = lc, textcolor = color.white, size = size.tiny)
+        alert((newDir == 1 ? "Resistance broken – watching for retest LONG at " : "Support broken – watching for retest SHORT at ") +
+             str.tostring(newLvl, format.mintick) + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(actOn ? actLvl : na, "Flipped level", actDir == 1 ? color.teal : color.maroon, 2, plot.style_linebr)
+plot(actOn and not inTr ? actLvl + actDir * zoneAtr * actAtr : na, "Entry zone edge", color.new(color.blue, 40), 1, plot.style_linebr)
+plot(inTr ? trS : na, "Stop",   color.red,   1, plot.style_linebr)
+plot(inTr ? trT : na, "Target", color.green, 1, plot.style_linebr)
+
+// Unbroken swing levels (latest few) for context
+var array<line> ctx = array.new<line>()
+if barstate.islast and showLevels
+    while array.size(ctx) > 0
+        line.delete(array.pop(ctx))
+    int nR = array.size(resP)
+    if nR > 0
+        for k = math.max(0, nR - 5) to nR - 1
+            array.push(ctx, line.new(array.get(resB, k), array.get(resP, k), bar_index, array.get(resP, k),
+                 color = color.new(color.red, 50), style = line.style_dotted))
+    int nS = array.size(supP)
+    if nS > 0
+        for k = math.max(0, nS - 5) to nS - 1
+            array.push(ctx, line.new(array.get(supB, k), array.get(supP, k), bar_index, array.get(supP, k),
+                 color = color.new(color.green, 50), style = line.style_dotted))
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 5, 16, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+sumSet(array<float> a, array<int> ids) =>
+    float s = 0.0
+    for ix in ids
+        s += array.get(a, ix)
+    s
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, array<int> ids, array<int> longIds, array<int> shortIds) =>
+    float w  = sumSet(aWins, ids)
+    float l  = sumSet(aLoss, ids)
+    float r  = sumSet(aSumR, ids)
+    float gw = sumSet(aGW, ids)
+    float gl = sumSet(aGL, ids)
+    float n  = w + l
+    float rl = sumSet(aSumR, longIds)
+    float rs = sumSet(aSumR, shortIds)
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+    cellTxt(col, 8, fmtR(rl), colR(rl))
+    cellTxt(col, 9, fmtR(rs), colR(rs))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 4, 0)
+    for row = 10 to 13
+        table.merge_cells(tbl, 1, row, 4, row)
+
+if barstate.islast
+    string cfg = entryMode + " | max " + str.tostring(maxTries) + " tries | " + str.tostring(rr, "#.#") + ":1" +
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "")
+    cellTxt(0, 0, "S/R Flip — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Try 1", color.silver)
+    cellTxt(2, 1, "Try 2", color.silver)
+    cellTxt(3, 1, "Try 3+", color.silver)
+    cellTxt(4, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    cellTxt(0, 8, "Long net R")
+    cellTxt(0, 9, "Short net R")
+    writeCol(1, array.from(0, 3), array.from(0), array.from(3))
+    writeCol(2, array.from(1, 4), array.from(1), array.from(4))
+    writeCol(3, array.from(2, 5), array.from(2), array.from(5))
+    writeCol(4, array.from(0, 1, 2, 3, 4, 5), array.from(0, 1, 2), array.from(3, 4, 5))
+
+    float bL = array.get(aBrk, 0)
+    float bS = array.get(aBrk, 1)
+    float lt = array.get(aLvl, 0)
+    float lp = array.get(aLvl, 1)
+    cellTxt(0, 10, "Breakouts armed")
+    cellTxt(1, 10, str.tostring(bL + bS, "#") + "   (Long " + str.tostring(bL, "#") + " / Short " + str.tostring(bS, "#") + ")")
+    cellTxt(0, 11, "Levels retested / paid")
+    cellTxt(1, 11, str.tostring(lt, "#") + " retested, " + str.tostring(lp, "#") + " hit target" +
+         (lt > 0 ? "  (" + str.tostring(lp / lt * 100.0, "#") + "%)" : ""))
+    cellTxt(0, 12, "Max drawdown")
+    cellTxt(1, 12, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " try " + str.tostring(trTry + 1) + " | stop " +
+         str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) :
+         actOn ? "Watching " + (actDir == 1 ? "support" : "resistance") + " " + str.tostring(actLvl, format.mintick) +
+         " (" + str.tostring(actTries) + " tries used)" : "Flat"
+    cellTxt(0, 13, "Current")
+    cellTxt(1, 13, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)

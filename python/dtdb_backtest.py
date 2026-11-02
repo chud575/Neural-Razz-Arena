@@ -170,8 +170,9 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
     e1_open = e2_open = e2_pend = False
     sig_bar = -1
 
-    def record(direction, entry, entry_px, exit_px, stop_px, i, reason):
-        risk = abs(entry_px - stop_px)
+    def record(direction, entry, entry_px, exit_px, stop_px, i, reason, risk_ref=None):
+        # risk_ref: planned entry for limit orders, so a gap fill next to the stop can't create a tiny-risk outlier
+        risk = abs((entry_px if risk_ref is None else risk_ref) - stop_px)
         r = direction * (exit_px - entry_px) / risk if risk > 0 else 0.0
         pct = direction * (exit_px - entry_px) / entry_px * 100.0
         res.trades.append(Trade(symbol, direction, entry, t[sig_bar], t[i], entry_px, exit_px, stop_px, r, pct, reason))
@@ -240,7 +241,8 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
                 # never fill beyond the stop (gap through the whole pattern)
                 if filled and (fill_px < tStop if d == -1 else fill_px > tStop):
                     tE2fill = fill_px
-                    if p.tgt_mode == "per_entry" or not p.use_entry1:
+                    # confirm entries are at a known close -> target from the fill; limit fills keep the planned target
+                    if confirm and (p.tgt_mode == "per_entry" or not p.use_entry1):
                         tT2 = tgt(d, tE2fill, tStop)
                     e2_pend, e2_open, e2_just = False, True, True
                     res.e2_fills += 1
@@ -258,10 +260,10 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
                 sh = stop_hit and not (e2_just and confirm)
                 tp = (not e2_just) and (l[i] <= tT2 if d == -1 else h[i] >= tT2)
                 if sh:
-                    record(d, 1, tE2fill, stop_px, tStop, i, "SL"); e2_open = False
+                    record(d, 1, tE2fill, stop_px, tStop, i, "SL", None if confirm else tE2); e2_open = False
                 elif tp:
                     px = min(o[i], tT2) if d == -1 else max(o[i], tT2)
-                    record(d, 1, tE2fill, px, tStop, i, "TP"); e2_open = False
+                    record(d, 1, tE2fill, px, tStop, i, "TP", None if confirm else tE2); e2_open = False
             if e2_pend:
                 cancel = p.use_entry1 and not e1_open                       # entry 1 finished
                 cancel |= p.e2_expiry > 0 and i - sig_bar >= p.e2_expiry    # expired
