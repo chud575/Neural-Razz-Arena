@@ -1,0 +1,244 @@
+//@version=6
+// Double Top / Double Bottom strategy with a two-stage entry.
+//  • Entry 1: market entry on the bar that CLOSES through the neckline (breakout).
+//  • Entry 2: limit order at the midpoint between the neckline and the pattern
+//             extreme (top of a double top / bottom of a double bottom).
+//  • Stop:    just beyond the pattern extreme (optional buffer).
+//  • Target:  Reward:Risk (default 2:1), per entry or on the blended average entry.
+strategy("Double Top / Bottom – 2-Stage Entry", shorttitle = "DT/DB 2-Entry", overlay = true,
+     pyramiding = 2, default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     initial_capital = 10000, max_bars_back = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpP = "Pattern detection"
+pivLen   = input.int(5,     "Pivot strength (bars each side)",          minval = 1,                group = grpP)
+tolPct   = input.float(0.5, "Max difference between the 2 peaks (%)",   minval = 0.0, step = 0.1,  group = grpP)
+minSep   = input.int(10,    "Min bars between peaks",                   minval = 2,                group = grpP)
+maxSep   = input.int(100,   "Max bars between peaks",                   minval = 5, maxval = 400,  group = grpP)
+minDepth = input.float(1.0, "Min pattern height (% of price)",          minval = 0.0, step = 0.1,  group = grpP)
+maxWait  = input.int(30,    "Max bars after 2nd peak to wait for breakout", minval = 1,           group = grpP)
+
+grpT = "Trade management"
+tradeLongs  = input.bool(true,  "Trade double bottoms (long)",  group = grpT)
+tradeShorts = input.bool(true,  "Trade double tops (short)",    group = grpT)
+rr          = input.float(2.0,  "Reward : Risk",                minval = 0.1, step = 0.1, group = grpT)
+tgtMode     = input.string("Per entry", "Target mode", options = ["Per entry", "Blended average entry"], group = grpT,
+     tooltip = "Per entry: each entry gets its own RR target measured from its own entry price to the stop.\nBlended: both entries share one target, RR measured from the average of the two entry prices.")
+stopBufPct  = input.float(0.0,  "Stop buffer beyond extreme (% of pattern height)", minval = 0.0, step = 5.0, group = grpT)
+e2Expiry    = input.int(50,     "Cancel unfilled 2nd entry after N bars (0 = never)", minval = 0, group = grpT)
+
+grpV = "Visuals"
+showLevels = input.bool(true, "Draw pattern & trade levels", group = grpV)
+levelLen   = input.int(25, "Level line length (bars)", minval = 5, group = grpV)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+drawLevel(float y, color c, string txt) =>
+    line.new(bar_index, y, bar_index + levelLen, y, color = c, style = line.style_dashed, width = 1)
+    label.new(bar_index + levelLen, y, txt + "  " + str.tostring(y, format.mintick),
+         style = label.style_label_left, color = color.new(c, 85), textcolor = c, size = size.small)
+
+drawPattern(int b1, float p1, int bn, float n, int b2, float p2, float brk, color c, string txt) =>
+    line.new(b1, p1, bn, n, color = c, width = 2)
+    line.new(bn, n, b2, p2, color = c, width = 2)
+    line.new(b2, p2, bar_index, brk, color = c, width = 2)
+    line.new(bn, n, bar_index, n, color = color.gray, style = line.style_dotted)
+    label.new(b2, p2, txt, style = txt == "DT" ? label.style_label_down : label.style_label_up,
+         color = c, textcolor = color.white, size = size.small)
+
+// ───────────────────────────── Pivots ─────────────────────────────
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+var float lastPH    = na
+var int   lastPHBar = na
+var float lastPL    = na
+var int   lastPLBar = na
+
+// Pending (detected but not yet broken) patterns
+var bool  dtPend = false
+var float dtP1 = na
+var float dtP2 = na
+var float dtTop  = na
+var float dtNeck = na
+var int   dtB1 = na
+var int   dtB2 = na
+var int   dtNeckB = na
+var int dtSetBar = na
+
+var bool  dbPend = false
+var float dbP1 = na
+var float dbP2 = na
+var float dbBot  = na
+var float dbNeck = na
+var int   dbB1 = na
+var int   dbB2 = na
+var int   dbNeckB = na
+var int dbSetBar = na
+
+// ───────────────────── Double TOP detection ─────────────────────
+if not na(ph)
+    int   b2 = bar_index - pivLen
+    float p2 = ph
+    if tradeShorts and not na(lastPH)
+        int   sep  = b2 - lastPHBar
+        float diff = math.abs(p2 - lastPH) / lastPH * 100.0
+        if sep >= minSep and sep <= maxSep and diff <= tolPct
+            float topLvl  = math.max(p2, lastPH)
+            float neck    = low[pivLen + 1]
+            int   neckOff = pivLen + 1
+            float hiMid   = high[pivLen + 1]
+            int   lastOff = bar_index - lastPHBar - 1
+            for off = pivLen + 1 to lastOff
+                if low[off] < neck
+                    neck    := low[off]
+                    neckOff := off
+                hiMid := math.max(hiMid, high[off])
+            // already broken (or invalidated) during the pivot confirmation bars?
+            bool stale = false
+            if pivLen > 1
+                for off = 1 to pivLen - 1
+                    if close[off] < neck or close[off] > topLvl
+                        stale := true
+            float heightPct = (topLvl - neck) / topLvl * 100.0
+            if hiMid <= topLvl and heightPct >= minDepth and not stale
+                dtPend   := true
+                dtP1     := lastPH
+                dtB1     := lastPHBar
+                dtP2     := p2
+                dtB2     := b2
+                dtTop    := topLvl
+                dtNeck   := neck
+                dtNeckB  := bar_index - neckOff
+                dtSetBar := bar_index
+    lastPH    := p2
+    lastPHBar := b2
+
+// ──────────────────── Double BOTTOM detection ────────────────────
+if not na(pl)
+    int   b2 = bar_index - pivLen
+    float p2 = pl
+    if tradeLongs and not na(lastPL)
+        int   sep  = b2 - lastPLBar
+        float diff = math.abs(p2 - lastPL) / lastPL * 100.0
+        if sep >= minSep and sep <= maxSep and diff <= tolPct
+            float botLvl  = math.min(p2, lastPL)
+            float neck    = high[pivLen + 1]
+            int   neckOff = pivLen + 1
+            float loMid   = low[pivLen + 1]
+            int   lastOff = bar_index - lastPLBar - 1
+            for off = pivLen + 1 to lastOff
+                if high[off] > neck
+                    neck    := high[off]
+                    neckOff := off
+                loMid := math.min(loMid, low[off])
+            bool stale = false
+            if pivLen > 1
+                for off = 1 to pivLen - 1
+                    if close[off] > neck or close[off] < botLvl
+                        stale := true
+            float heightPct = (neck - botLvl) / botLvl * 100.0
+            if loMid >= botLvl and heightPct >= minDepth and not stale
+                dbPend   := true
+                dbP1     := lastPL
+                dbB1     := lastPLBar
+                dbP2     := p2
+                dbB2     := b2
+                dbBot    := botLvl
+                dbNeck   := neck
+                dbNeckB  := bar_index - neckOff
+                dbSetBar := bar_index
+    lastPL    := p2
+    lastPLBar := b2
+
+// ─────────────────── Pending pattern invalidation ───────────────────
+if dtPend and (close > dtTop or bar_index - dtSetBar > maxWait)
+    dtPend := false
+if dbPend and (close < dbBot or bar_index - dbSetBar > maxWait)
+    dbPend := false
+
+// ───────────────────── Open trade management ─────────────────────
+var bool   inTrade = false
+var int    sigBar  = na
+var string e2Id    = ""
+
+if inTrade and bar_index > sigBar
+    if strategy.position_size == 0
+        // Entry 1 (and Entry 2 if it filled) have exited → kill any leftover 2nd-entry order
+        strategy.cancel(e2Id)
+        inTrade := false
+    else if e2Expiry > 0 and bar_index - sigBar >= e2Expiry
+        strategy.cancel(e2Id)   // no effect if it already filled
+
+bool canEnter = strategy.position_size == 0 and not inTrade
+
+// ───────────────────── Short: double top breakout ─────────────────────
+if dtPend and canEnter and close < dtNeck
+    float H     = dtTop - dtNeck
+    float stopL = dtTop + H * stopBufPct / 100.0
+    float e1    = close                     // breakout bar close (fills next open)
+    float e2    = dtNeck + H / 2.0          // halfway between neckline and top
+    float avgE  = (e1 + e2) / 2.0
+    float t1    = tgtMode == "Per entry" ? e1 - rr * (stopL - e1) : avgE - rr * (stopL - avgE)
+    float t2    = tgtMode == "Per entry" ? e2 - rr * (stopL - e2) : t1
+
+    strategy.entry("Short E1", strategy.short, comment = "DT breakout")
+    strategy.entry("Short E2", strategy.short, limit = e2, comment = "DT 50% retest")
+    strategy.exit("Short E1 X", from_entry = "Short E1", stop = stopL, limit = t1, comment_loss = "SL 1", comment_profit = "TP 1")
+    strategy.exit("Short E2 X", from_entry = "Short E2", stop = stopL, limit = t2, comment_loss = "SL 2", comment_profit = "TP 2")
+
+    inTrade := true
+    sigBar  := bar_index
+    e2Id    := "Short E2"
+    dtPend  := false
+    dbPend  := false
+
+    if showLevels
+        drawPattern(dtB1, dtP1, dtNeckB, dtNeck, dtB2, dtP2, close, color.red, "DT")
+        drawLevel(e2,    color.orange, "Entry 2")
+        drawLevel(stopL, color.red,    "Stop")
+        drawLevel(t1,    color.green,  tgtMode == "Per entry" ? "TP 1" : "TP")
+        if tgtMode == "Per entry"
+            drawLevel(t2, color.teal, "TP 2")
+
+    alert("Double TOP breakout SHORT on " + syminfo.ticker + " | E1 ~" + str.tostring(e1, format.mintick) +
+         " | E2 limit " + str.tostring(e2, format.mintick) + " | Stop " + str.tostring(stopL, format.mintick) +
+         " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick),
+         alert.freq_once_per_bar_close)
+
+// ───────────────────── Long: double bottom breakout ─────────────────────
+if dbPend and canEnter and not inTrade and close > dbNeck
+    float H     = dbNeck - dbBot
+    float stopL = dbBot - H * stopBufPct / 100.0
+    float e1    = close
+    float e2    = dbNeck - H / 2.0          // halfway between neckline and bottom
+    float avgE  = (e1 + e2) / 2.0
+    float t1    = tgtMode == "Per entry" ? e1 + rr * (e1 - stopL) : avgE + rr * (avgE - stopL)
+    float t2    = tgtMode == "Per entry" ? e2 + rr * (e2 - stopL) : t1
+
+    strategy.entry("Long E1", strategy.long, comment = "DB breakout")
+    strategy.entry("Long E2", strategy.long, limit = e2, comment = "DB 50% retest")
+    strategy.exit("Long E1 X", from_entry = "Long E1", stop = stopL, limit = t1, comment_loss = "SL 1", comment_profit = "TP 1")
+    strategy.exit("Long E2 X", from_entry = "Long E2", stop = stopL, limit = t2, comment_loss = "SL 2", comment_profit = "TP 2")
+
+    inTrade := true
+    sigBar  := bar_index
+    e2Id    := "Long E2"
+    dbPend  := false
+    dtPend  := false
+
+    if showLevels
+        drawPattern(dbB1, dbP1, dbNeckB, dbNeck, dbB2, dbP2, close, color.green, "DB")
+        drawLevel(e2,    color.orange, "Entry 2")
+        drawLevel(stopL, color.red,    "Stop")
+        drawLevel(t1,    color.green,  tgtMode == "Per entry" ? "TP 1" : "TP")
+        if tgtMode == "Per entry"
+            drawLevel(t2, color.teal, "TP 2")
+
+    alert("Double BOTTOM breakout LONG on " + syminfo.ticker + " | E1 ~" + str.tostring(e1, format.mintick) +
+         " | E2 limit " + str.tostring(e2, format.mintick) + " | Stop " + str.tostring(stopL, format.mintick) +
+         " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick),
+         alert.freq_once_per_bar_close)
+
+// Live necklines of pending (not yet broken) patterns
+plot(dtPend ? dtNeck : na, "Pending DT neckline", color.new(color.red, 30),   2, plot.style_linebr)
+plot(dbPend ? dbNeck : na, "Pending DB neckline", color.new(color.green, 30), 2, plot.style_linebr)
