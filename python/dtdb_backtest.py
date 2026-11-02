@@ -118,6 +118,7 @@ class Trade:
     pct: float
     reason: str
     risk: float = float("nan")   # risk per unit used for R (planned risk for limit fills)
+    target: float = float("nan")  # take-profit price (when the strategy records it)
 
 
 @dataclass

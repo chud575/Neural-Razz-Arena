@@ -41,7 +41,11 @@ def random_control(df, trades, rr, reps=5):
             i = int(rng.integers(200, n - 2))
             e, d = c[i], t.direction
             stop = e * (1 - d * dist)
-            tgt = e + d * rr * abs(e - stop)
+            trr = rr
+            if not math.isnan(getattr(t, "target", float("nan"))) and risk > 0:
+                ref = t.stop_px + t.direction * risk          # planned entry (= actual entry unless a limit gap-filled)
+                trr = abs(t.target - ref) / risk              # this trade's own reward:risk
+            tgt = e + d * trr * abs(e - stop)
             for j in range(i + 1, n):
                 if (l[j] <= stop) if d == 1 else (h[j] >= stop):
                     px = min(o[j], stop) if d == 1 else max(o[j], stop)

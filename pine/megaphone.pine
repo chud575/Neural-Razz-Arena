@@ -1,0 +1,371 @@
+//@version=6
+// Megaphone (broadening formation) indicator with a built-in performance tracker.
+// Python twin: python/megaphone_backtest.py (same rules, so the numbers should match).
+//
+// Pattern: the last N swing points (alternating highs/lows) make HIGHER highs and LOWER lows.
+//          Upper line = through the last two swing highs, lower line = through the last two swing lows.
+//          The pattern stays live until a breakout close or until it gets too old.
+// Trades (toggle):
+//   Fade      price returns to an edge and reverses → trade back into the pattern
+//             entry: "Rejection close" (touch the line, close back inside) or "Touch" (limit at the line)
+//             stop: beyond the line by X × ATR   target: R:R, midline, or the opposite line
+//   Breakout  a bar CLOSES beyond a line by X × ATR → trade the breakout at the close
+//             stop: back inside the line by X × ATR   target: R:R. The pattern ends.
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill only
+// checks its stop on the fill bar; gaps fill at the open; one trade at a time.
+indicator("Megaphone – Broadening Formation", shorttitle = "Megaphone", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpP = "Pattern"
+pivLen    = input.int(5, "Swing strength (bars each side)", minval = 1, group = grpP)
+minPivots = input.int(4, "Swings required", options = [4, 5, 6], group = grpP,
+     tooltip = "4 = two higher highs + two lower lows. 5 = the classic '5-touch' megaphone.")
+minExpand = input.float(0.0, "Each new extreme must exceed the last by (%)", minval = 0.0, step = 0.1, group = grpP)
+maxLen    = input.int(200, "Max pattern length (bars)", minval = 20, maxval = 450, group = grpP)
+atrLen    = input.int(14, "ATR length", minval = 1, group = grpP)
+
+grpT = "Trades"
+modeIn    = input.string("Fade + Breakout", "Trade mode", options = ["Fade + Breakout", "Fade only", "Breakout only"], group = grpT)
+fadeEntry = input.string("Rejection close", "Fade entry", options = ["Rejection close", "Touch"], group = grpT)
+fadeTgt   = input.string("R:R", "Fade target", options = ["R:R", "Midline", "Opposite line"], group = grpT)
+rr        = input.float(2.0, "Reward : Risk", minval = 0.1, step = 0.1, group = grpT)
+zoneAtr   = input.float(0.1, "Fade zone inside the line (× ATR)", minval = 0.0, step = 0.05, group = grpT)
+stopAtr   = input.float(0.5, "Stop distance from the line (× ATR)", minval = 0.05, step = 0.05, group = grpT)
+brkAtr    = input.float(0.2, "Breakout close beyond line (× ATR)", minval = 0.0, step = 0.05, group = grpT)
+
+grpF = "Filters"
+tradeLongs  = input.bool(true,  "Longs", group = grpF)
+tradeShorts = input.bool(true,  "Shorts", group = grpF)
+trendOn     = input.bool(false, "Trend filter (longs above SMA, shorts below)", group = grpF)
+trendLen    = input.int(200, "Trend SMA length", minval = 2, group = grpF)
+
+grpV = "Visuals"
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+doFade = modeIn != "Breakout only"
+doBrk  = modeIn != "Fade only"
+atrV   = ta.atr(atrLen)
+smaV   = ta.sma(close, trendLen)
+
+// ─────────────────────── Performance storage ───────────────────────
+// index = kind * 2 + (long ? 0 : 1)   kind 0 = fade, 1 = breakout
+var array<float> aWins = array.new<float>(4, 0.0)
+var array<float> aLoss = array.new<float>(4, 0.0)
+var array<float> aSumR = array.new<float>(4, 0.0)
+var array<float> aGW   = array.new<float>(4, 0.0)
+var array<float> aGL   = array.new<float>(4, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+var int patCount = 0
+
+recordExit(int dir, int kind, float entryPx, float exitPx, float risk) =>
+    float r   = risk > 0 ? dir * (exitPx - entryPx) / risk : 0.0
+    int   idx = kind * 2 + (dir == 1 ? 0 : 1)
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+trendOk(int d) =>
+    not trendOn or (not na(smaV) and (d == 1 ? close > smaV : close < smaV))
+
+sideOk(int d) =>
+    d == 1 ? tradeLongs : tradeShorts
+
+// ───────────────────────────── Swing sequence ─────────────────────────────
+var array<int>   pvT = array.new<int>()     // 1 = high, -1 = low
+var array<float> pvP = array.new<float>()
+var array<int>   pvB = array.new<int>()
+
+// Append a swing, keeping the sequence alternating (two highs in a row → keep the higher one, etc.)
+pushPivot(int tp, float price, int bar) =>
+    bool changed = false
+    int sz = array.size(pvT)
+    if sz > 0 and array.get(pvT, sz - 1) == tp
+        float lastP = array.get(pvP, sz - 1)
+        if (tp == 1 and price > lastP) or (tp == -1 and price < lastP)
+            array.set(pvP, sz - 1, price)
+            array.set(pvB, sz - 1, bar)
+            changed := true
+    else
+        array.push(pvT, tp)
+        array.push(pvP, price)
+        array.push(pvB, bar)
+        if array.size(pvT) > 12
+            array.shift(pvT)
+            array.shift(pvP)
+            array.shift(pvB)
+        changed := true
+    changed
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+bool changed = false
+if not na(ph)
+    changed := pushPivot(1, ph, bar_index - pivLen) or changed
+if not na(pl)
+    changed := pushPivot(-1, pl, bar_index - pivLen) or changed
+
+// ───────────────────────────── Pattern state ─────────────────────────────
+var bool  patOn   = false
+var float pU      = na    // upper line anchor price / bar / slope
+var int   bU      = na
+var float sU      = na
+var float pL      = na
+var int   bL      = na
+var float sL      = na
+var int   pStart  = na
+var int   pConf   = na
+var line  upLine  = na
+var line  loLine  = na
+
+if changed and array.size(pvT) >= minPivots
+    int   sz  = array.size(pvT)
+    bool  ok  = true
+    int   nH  = 0
+    int   nL  = 0
+    float h1P = na
+    int   h1B = na
+    float h2P = na
+    int   h2B = na
+    float l1P = na
+    int   l1B = na
+    float l2P = na
+    int   l2B = na
+    for k = sz - minPivots to sz - 1
+        int   tp = array.get(pvT, k)
+        float pr = array.get(pvP, k)
+        int   br = array.get(pvB, k)
+        if tp == 1
+            if nH > 0 and pr <= h2P * (1 + minExpand / 100.0)
+                ok := false
+            h1P := h2P
+            h1B := h2B
+            h2P := pr
+            h2B := br
+            nH += 1
+        else
+            if nL > 0 and pr >= l2P * (1 - minExpand / 100.0)
+                ok := false
+            l1P := l2P
+            l1B := l2B
+            l2P := pr
+            l2B := br
+            nL += 1
+    if ok and nH >= 2 and nL >= 2
+        patOn  := true
+        pU     := h2P
+        bU     := h2B
+        sU     := (h2P - h1P) / (h2B - h1B)
+        pL     := l2P
+        bL     := l2B
+        sL     := (l2P - l1P) / (l2B - l1B)
+        pStart := array.get(pvB, sz - minPivots)
+        pConf  := bar_index
+        patCount += 1
+        upLine := line.new(h1B, h1P, bar_index, pU + sU * (bar_index - bU), color = color.new(color.orange, 0), width = 2)
+        loLine := line.new(l1B, l1P, bar_index, pL + sL * (bar_index - bL), color = color.new(color.orange, 0), width = 2)
+        label.new(bar_index, pU + sU * (bar_index - bU), "Megaphone", style = label.style_label_down,
+             color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+        alert("Megaphone detected on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Trade state ─────────────────────────────
+var bool  inTr   = false
+var int   trD    = 0
+var int   trKind = 0
+var float trE    = na
+var float trS    = na
+var float trT    = na
+var float trRisk = na
+var int   trBar  = na
+
+// 1) Manage open trade
+bool exited = false
+if inTr and bar_index > trBar
+    bool stopHit = trD == 1 ? low <= trS : high >= trS
+    bool tpHit   = trD == 1 ? high >= trT : low <= trT
+    if stopHit
+        float px = trD == 1 ? math.min(open, trS) : math.max(open, trS)
+        exitLabel(px, "SL", recordExit(trD, trKind, trE, px, trRisk))
+        inTr   := false
+        exited := true
+    else if tpHit
+        float px = trD == 1 ? math.max(open, trT) : math.min(open, trT)
+        exitLabel(px, "TP", recordExit(trD, trKind, trE, px, trRisk))
+        inTr   := false
+        exited := true
+
+// 2) Pattern lines, expiry, breakout, fades
+if patOn and not na(atrV)
+    float up = pU + sU * (bar_index - bU)
+    float lo = pL + sL * (bar_index - bL)
+    if bar_index - pStart > maxLen
+        patOn := false
+    else
+        line.set_xy2(upLine, bar_index, up)
+        line.set_xy2(loLine, bar_index, lo)
+        // Fades are checked BEFORE the breakout: a touch limit order fills intrabar, before the close is known
+        if doFade and not inTr and not exited and bar_index > pConf
+            for side = 0 to 1
+                int   d    = side == 0 ? -1 : 1               // short at the top edge, long at the bottom edge
+                float ln   = d == -1 ? up : lo
+                float edge = ln + d * zoneAtr * atrV
+                bool  touched = d == -1 ? high >= edge : low <= edge
+                if sideOk(d) and trendOk(d) and touched
+                    float stp   = ln - d * stopAtr * atrV
+                    float entry = na
+                    float plan  = na
+                    if fadeEntry == "Touch"
+                        entry := d == -1 ? math.max(open, edge) : math.min(open, edge)
+                        plan  := edge
+                    else if (d == -1 ? close < ln : close > ln)
+                        entry := close
+                    float ref = na(plan) ? entry : plan
+                    if not na(entry) and (ref - stp) * d > 0 and (entry - stp) * d > 0
+                        float risk = math.abs(ref - stp)
+                        float tgt  = fadeTgt == "R:R" ? ref + d * rr * risk : fadeTgt == "Midline" ? (up + lo) / 2.0 : (d == -1 ? lo : up)
+                        if (tgt - ref) * d > 0
+                            inTr   := true
+                            trD    := d
+                            trKind := 0
+                            trE    := entry
+                            trS    := stp
+                            trRisk := risk
+                            trT    := tgt
+                            trBar  := bar_index
+                            if showTrades
+                                label.new(bar_index, entry, d == 1 ? "Fade ↑" : "Fade ↓",
+                                     style = d == 1 ? label.style_label_up : label.style_label_down,
+                                     color = color.new(color.purple, 10), textcolor = color.white, size = size.tiny)
+                            alert("Megaphone FADE " + (d == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker +
+                                 " | entry " + str.tostring(entry, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+                                 " | target " + str.tostring(tgt, format.mintick), alert.freq_once_per_bar)
+                            if not na(plan) and (d == -1 ? high >= stp : low <= stp)
+                                exitLabel(stp, "SL", recordExit(trD, trKind, trE, stp, trRisk))
+                                inTr := false
+                            break
+        // Breakout close ends the pattern (traded only if flat)
+        int brk = close > up + brkAtr * atrV ? 1 : close < lo - brkAtr * atrV ? -1 : 0
+        if brk != 0
+            if doBrk and not inTr and sideOk(brk) and trendOk(brk)
+                float ln   = brk == 1 ? up : lo
+                float stp  = ln - brk * stopAtr * atrV
+                float risk = math.abs(close - stp)
+                if (close - stp) * brk > 0
+                    inTr   := true
+                    trD    := brk
+                    trKind := 1
+                    trE    := close
+                    trS    := stp
+                    trRisk := risk
+                    trT    := close + brk * rr * risk
+                    trBar  := bar_index
+                    if showTrades
+                        label.new(bar_index, close, brk == 1 ? "BO ↑" : "BO ↓",
+                             style = brk == 1 ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.blue, 10), textcolor = color.white, size = size.tiny)
+                    alert("Megaphone BREAKOUT " + (brk == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker +
+                         " | entry " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+                         " | target " + str.tostring(trT, format.mintick), alert.freq_once_per_bar_close)
+            patOn := false
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(inTr ? trS : na, "Stop",   color.red,   1, plot.style_linebr)
+plot(inTr ? trT : na, "Target", color.green, 1, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 15, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+sumSet(array<float> a, array<int> ids) =>
+    float s = 0.0
+    for ix in ids
+        s += array.get(a, ix)
+    s
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, array<int> ids, array<int> longIds, array<int> shortIds) =>
+    float w  = sumSet(aWins, ids)
+    float l  = sumSet(aLoss, ids)
+    float r  = sumSet(aSumR, ids)
+    float n  = w + l
+    float rl = sumSet(aSumR, longIds)
+    float rs = sumSet(aSumR, shortIds)
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(sumSet(aGW, ids), sumSet(aGL, ids)))
+    cellTxt(col, 8, fmtR(rl), colR(rl))
+    cellTxt(col, 9, fmtR(rs), colR(rs))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 10 to 12
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string cfg = modeIn + (doFade ? " | fade: " + fadeEntry + " → " + fadeTgt : "") + " | " + str.tostring(rr, "#.#") + ":1" +
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "")
+    cellTxt(0, 0, "Megaphone — Historical Performance  (" + cfg + ")", color.white, color.new(color.orange, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Fade", color.silver)
+    cellTxt(2, 1, "Breakout", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    cellTxt(0, 8, "Long net R")
+    cellTxt(0, 9, "Short net R")
+    writeCol(1, array.from(0, 1), array.from(0), array.from(1))
+    writeCol(2, array.from(2, 3), array.from(2), array.from(3))
+    writeCol(3, array.from(0, 1, 2, 3), array.from(0, 2), array.from(1, 3))
+    cellTxt(0, 10, "Megaphones detected")
+    cellTxt(1, 10, str.tostring(patCount))
+    cellTxt(0, 11, "Max drawdown")
+    cellTxt(1, 11, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG " : "SHORT ") + (trKind == 0 ? "fade" : "breakout") + " | stop " +
+         str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) :
+         patOn ? "Megaphone live — watching edges" : "Flat"
+    cellTxt(0, 12, "Current")
+    cellTxt(1, 12, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
