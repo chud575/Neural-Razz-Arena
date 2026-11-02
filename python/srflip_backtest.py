@@ -100,7 +100,8 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
     def record(i, exit_px, reason):
         r = tr_d * (exit_px - tr_e) / tr_risk if tr_risk > 0 else 0.0
         pct = tr_d * (exit_px - tr_e) / tr_e * 100
-        res.trades.append(Trade(symbol, tr_d, min(tr_try, 2), t[act_brk_bar], t[i], tr_e, exit_px, tr_s, r, pct, reason))
+        res.trades.append(Trade(symbol, tr_d, min(tr_try, 2), t[act_brk_bar], t[i], tr_e, exit_px, tr_s, r, pct, reason,
+                                tr_risk))
 
     act_brk_bar = 0
     for i in range(n):

@@ -117,6 +117,7 @@ class Trade:
     r: float
     pct: float
     reason: str
+    risk: float = float("nan")   # risk per unit used for R (planned risk for limit fills)
 
 
 @dataclass

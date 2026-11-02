@@ -33,7 +33,8 @@ def random_control(df, trades, rr, reps=5):
     n = len(c)
     out = []
     for t in trades:
-        dist = abs(t.entry_px - t.stop_px) / t.entry_px
+        risk = t.risk if not math.isnan(t.risk) else abs(t.entry_px - t.stop_px)
+        dist = risk / t.entry_px
         if dist <= 0:
             continue
         for _ in range(reps):
