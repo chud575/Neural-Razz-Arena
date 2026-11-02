@@ -3,6 +3,8 @@
 // Python twin: python/srflip_backtest.py (same rules, so the numbers should match).
 //
 //  1. Resistance = an unbroken swing high at least "min age" bars old (support = swing low).
+//     Levels can come from the chart, a HIGHER TIMEFRAME, or both. Nearby swings can merge into one
+//     level (each counts as a touch), and you can trade only "major" levels with N+ swings.
 //  2. Breakout   = a bar CLOSES beyond the level by at least X × ATR → the level has "flipped".
 //  3. Retest     = within the retest window price comes back to the level. Entry modes:
 //                  Touch           limit order in a small zone on the breakout side of the level
@@ -24,6 +26,16 @@ minAge   = input.int(10,    "Min level age at breakout (bars)", minval = 0, grou
 maxAge   = input.int(250,   "Max level age (bars)", minval = 10, group = grpL)
 atrLen   = input.int(14,    "ATR length", minval = 1, group = grpL)
 brkAtr   = input.float(0.2, "Breakout close must clear level by (× ATR)", minval = 0.0, step = 0.05, group = grpL)
+
+grpS = "Level source & strength"
+levelSrc   = input.string("Chart timeframe", "Find levels on", options = ["Chart timeframe", "Higher timeframe", "Both"], group = grpS)
+htfIn      = input.timeframe("W", "Higher timeframe", group = grpS,
+     tooltip = "Swing levels are found on this timeframe and traded on your chart timeframe. Must be higher than the chart. A level only appears after the higher-timeframe bar that confirms it has closed (no repainting).")
+htfPivLen  = input.int(3, "HTF swing strength (HTF bars each side)", minval = 1, group = grpS)
+htfMaxAge  = input.int(100, "HTF max level age (HTF bars)", minval = 5, group = grpS)
+mergePct   = input.float(0.0, "Merge swing levels within (%)", minval = 0.0, step = 0.05, group = grpS,
+     tooltip = "Swing points this close together become one level, and each one counts as a touch. 0 = off.")
+minTouches = input.int(1, "Only trade levels with at least N swings", minval = 1, maxval = 10, group = grpS)
 
 grpE = "Retest entry"
 entryMode   = input.string("Touch", "Entry mode", options = ["Touch", "Rejection close", "Sweep reclaim"], group = grpE)
@@ -88,29 +100,85 @@ exitLabel(float px, string txt, float r) =>
 ph = ta.pivothigh(high, pivLen, pivLen)
 pl = ta.pivotlow(low, pivLen, pivLen)
 
+// Each level: price P, chart bar B, origin time T, swing count N (strength), H = came from the higher timeframe
 var array<float> resP = array.new<float>()
 var array<int>   resB = array.new<int>()
+var array<int>   resT = array.new<int>()
+var array<int>   resN = array.new<int>()
+var array<bool>  resH = array.new<bool>()
 var array<float> supP = array.new<float>()
 var array<int>   supB = array.new<int>()
+var array<int>   supT = array.new<int>()
+var array<int>   supN = array.new<int>()
+var array<bool>  supH = array.new<bool>()
 
-if not na(ph)
-    array.push(resP, ph)
-    array.push(resB, bar_index - pivLen)
-if not na(pl)
-    array.push(supP, pl)
-    array.push(supB, bar_index - pivLen)
+// Add a swing level, or merge it into an existing level within mergePct % (strength +1, keep the oldest origin)
+addLevel(array<float> P, array<int> B, array<int> T, array<int> N, array<bool> H, float price, int bar, int t, bool isHtf) =>
+    int   best  = -1
+    float bestD = na
+    if mergePct > 0 and array.size(P) > 0
+        for k = 0 to array.size(P) - 1
+            float dd = math.abs(array.get(P, k) - price)
+            if dd / price * 100 <= mergePct and (best < 0 or dd < bestD)
+                best  := k
+                bestD := dd
+    if best >= 0
+        int n = array.get(N, best)
+        array.set(P, best, (array.get(P, best) * n + price) / (n + 1))
+        array.set(N, best, n + 1)
+        array.set(B, best, math.min(array.get(B, best), bar))
+        array.set(T, best, math.min(array.get(T, best), t))
+        array.set(H, best, array.get(H, best) or isHtf)
+    else
+        array.push(P, price)
+        array.push(B, bar)
+        array.push(T, t)
+        array.push(N, 1)
+        array.push(H, isHtf)
+    true
+
+removeLevel(array<float> P, array<int> B, array<int> T, array<int> N, array<bool> H, int k) =>
+    array.remove(P, k)
+    array.remove(B, k)
+    array.remove(T, k)
+    array.remove(N, k)
+    array.remove(H, k)
+    true
+
+useChartLv = levelSrc != "Higher timeframe"
+useHtfLv   = levelSrc != "Chart timeframe"
+htfSec     = timeframe.in_seconds(htfIn)
+chartSec   = timeframe.in_seconds(timeframe.period)
+if useHtfLv and htfSec <= chartSec
+    runtime.error("S/R Flip: the higher timeframe (" + htfIn + ") must be above the chart timeframe.")
+
+// Higher-timeframe swings: [1] + lookahead_on = values of the last CLOSED HTF bar only (no repainting)
+[hPh, hPl, hT] = request.security(syminfo.tickerid, htfIn,
+     [ta.pivothigh(high, htfPivLen, htfPivLen)[1], ta.pivotlow(low, htfPivLen, htfPivLen)[1], time_close[htfPivLen + 1]],
+     lookahead = barmerge.lookahead_on)
+bool newHtfBar = timeframe.change(htfIn)
+
+if useChartLv and not na(ph)
+    addLevel(resP, resB, resT, resN, resH, ph, bar_index - pivLen, time[pivLen], false)
+if useChartLv and not na(pl)
+    addLevel(supP, supB, supT, supN, supH, pl, bar_index - pivLen, time[pivLen], false)
+if useHtfLv and newHtfBar and not na(hPh)
+    addLevel(resP, resB, resT, resN, resH, hPh, bar_index, hT, true)
+if useHtfLv and newHtfBar and not na(hPl)
+    addLevel(supP, supB, supT, supN, supH, hPl, bar_index, hT, true)
+
+levelAlive(bool isHtf, int b, int t) =>
+    isHtf ? time - t <= htfMaxAge * htfSec * 1000 : bar_index - b <= maxAge
 
 // prune old levels
-if array.size(resB) > 0
-    for k = array.size(resB) - 1 to 0
-        if bar_index - array.get(resB, k) > maxAge
-            array.remove(resP, k)
-            array.remove(resB, k)
-if array.size(supB) > 0
-    for k = array.size(supB) - 1 to 0
-        if bar_index - array.get(supB, k) > maxAge
-            array.remove(supP, k)
-            array.remove(supB, k)
+if array.size(resP) > 0
+    for k = array.size(resP) - 1 to 0
+        if not levelAlive(array.get(resH, k), array.get(resB, k), array.get(resT, k))
+            removeLevel(resP, resB, resT, resN, resH, k)
+if array.size(supP) > 0
+    for k = array.size(supP) - 1 to 0
+        if not levelAlive(array.get(supH, k), array.get(supB, k), array.get(supT, k))
+            removeLevel(supP, supB, supT, supN, supH, k)
 
 // ───────────────────────────── State ─────────────────────────────
 var bool  actOn    = false   // a flipped level is live
@@ -214,43 +282,59 @@ if actOn and not inTr
     if (actDir == 1 ? close < inval : close > inval) or bar_index - actBrk > window
         actOn := false
 
-// 4) Breakouts
+// 4) Breakouts (every broken level is removed; only old-enough, strong-enough ones arm a retest)
 int   newDir = 0
 float newLvl = na
-int   newPB  = na
+int   newT   = na
+int   newN   = 0
+bool  newH   = false
 if not na(atrV)
-    float bestRes  = na
-    int   bestResB = na
+    float bestRes = na
+    int   bestResT = na
+    int   bestResN = 0
+    bool  bestResH = false
     if array.size(resP) > 0
         for k = array.size(resP) - 1 to 0
             float lv = array.get(resP, k)
             if close > lv
-                int pb = array.get(resB, k)
-                if close >= lv + brkAtr * atrV and bar_index - pb >= minAge and (na(bestRes) or lv > bestRes)
+                bool isH  = array.get(resH, k)
+                bool aged = isH or bar_index - array.get(resB, k) >= minAge
+                int  nn   = array.get(resN, k)
+                if close >= lv + brkAtr * atrV and aged and nn >= minTouches and (na(bestRes) or lv > bestRes)
                     bestRes  := lv
-                    bestResB := pb
-                array.remove(resP, k)
-                array.remove(resB, k)
-    float bestSup  = na
-    int   bestSupB = na
+                    bestResT := array.get(resT, k)
+                    bestResN := nn
+                    bestResH := isH
+                removeLevel(resP, resB, resT, resN, resH, k)
+    float bestSup = na
+    int   bestSupT = na
+    int   bestSupN = 0
+    bool  bestSupH = false
     if array.size(supP) > 0
         for k = array.size(supP) - 1 to 0
             float lv = array.get(supP, k)
             if close < lv
-                int pb = array.get(supB, k)
-                if close <= lv - brkAtr * atrV and bar_index - pb >= minAge and (na(bestSup) or lv < bestSup)
+                bool isH  = array.get(supH, k)
+                bool aged = isH or bar_index - array.get(supB, k) >= minAge
+                int  nn   = array.get(supN, k)
+                if close <= lv - brkAtr * atrV and aged and nn >= minTouches and (na(bestSup) or lv < bestSup)
                     bestSup  := lv
-                    bestSupB := pb
-                array.remove(supP, k)
-                array.remove(supB, k)
+                    bestSupT := array.get(supT, k)
+                    bestSupN := nn
+                    bestSupH := isH
+                removeLevel(supP, supB, supT, supN, supH, k)
     if tradeLongs and not na(bestRes)
         newDir := 1
         newLvl := bestRes
-        newPB  := bestResB
+        newT   := bestResT
+        newN   := bestResN
+        newH   := bestResH
     else if tradeShorts and not na(bestSup)
         newDir := -1
         newLvl := bestSup
-        newPB  := bestSupB
+        newT   := bestSupT
+        newN   := bestSupN
+        newH   := bestSupH
 
 if newDir != 0 and not inTr
     bool trendPass = not trendOn or (not na(smaV) and (newDir == 1 ? close > smaV : close < smaV))
@@ -266,8 +350,9 @@ if newDir != 0 and not inTr
         int bi = newDir == 1 ? 0 : 1
         array.set(aBrk, bi, array.get(aBrk, bi) + 1)
         color lc = newDir == 1 ? color.teal : color.maroon
-        line.new(newPB, newLvl, bar_index + window, newLvl, color = lc, width = 2)
-        label.new(bar_index, newLvl, newDir == 1 ? "Flip ↑" : "Flip ↓",
+        line.new(newT, newLvl, time + window * chartSec * 1000, newLvl, xloc = xloc.bar_time, color = lc, width = newH ? 3 : 2)
+        string tag = (newH ? htfIn + " " : "") + (newN > 1 ? "×" + str.tostring(newN) : "")
+        label.new(bar_index, newLvl, (newDir == 1 ? "Flip ↑" : "Flip ↓") + (tag != "" ? " " + tag : ""),
              style = newDir == 1 ? label.style_label_up : label.style_label_down,
              color = lc, textcolor = color.white, size = size.tiny)
         alert((newDir == 1 ? "Resistance broken – watching for retest LONG at " : "Support broken – watching for retest SHORT at ") +
@@ -279,21 +364,31 @@ plot(actOn and not inTr ? actLvl + actDir * zoneAtr * actAtr : na, "Entry zone e
 plot(inTr ? trS : na, "Stop",   color.red,   1, plot.style_linebr)
 plot(inTr ? trT : na, "Target", color.green, 1, plot.style_linebr)
 
-// Unbroken swing levels (latest few) for context
-var array<line> ctx = array.new<line>()
+// Unbroken levels for context (strong-enough ones only; thicker = higher timeframe, label = swing count)
+var array<line>  ctx  = array.new<line>()
+var array<label> ctxL = array.new<label>()
+drawCtx(array<float> P, array<int> T, array<int> N, array<bool> H, color c) =>
+    int sz = array.size(P)
+    int drawn = 0
+    if sz > 0
+        for k = sz - 1 to 0
+            if drawn < 12 and array.get(N, k) >= minTouches
+                float lv = array.get(P, k)
+                bool  isH = array.get(H, k)
+                array.push(ctx, line.new(array.get(T, k), lv, time, lv, xloc = xloc.bar_time,
+                     color = color.new(c, isH ? 20 : 55), width = isH ? 2 : 1, style = isH ? line.style_solid : line.style_dotted))
+                string tx = (isH ? htfIn + " " : "") + "×" + str.tostring(array.get(N, k))
+                array.push(ctxL, label.new(bar_index + 2, lv, tx, style = label.style_none, textcolor = color.new(c, 20), size = size.tiny))
+                drawn += 1
+    drawn
+
 if barstate.islast and showLevels
     while array.size(ctx) > 0
         line.delete(array.pop(ctx))
-    int nR = array.size(resP)
-    if nR > 0
-        for k = math.max(0, nR - 5) to nR - 1
-            array.push(ctx, line.new(array.get(resB, k), array.get(resP, k), bar_index, array.get(resP, k),
-                 color = color.new(color.red, 50), style = line.style_dotted))
-    int nS = array.size(supP)
-    if nS > 0
-        for k = math.max(0, nS - 5) to nS - 1
-            array.push(ctx, line.new(array.get(supB, k), array.get(supP, k), bar_index, array.get(supP, k),
-                 color = color.new(color.green, 50), style = line.style_dotted))
+    while array.size(ctxL) > 0
+        label.delete(array.pop(ctxL))
+    drawCtx(resP, resT, resN, resH, color.red)
+    drawCtx(supP, supT, supN, supH, color.green)
 
 // ─────────────────────────── Stats table ───────────────────────────
 tblPos = switch tblPosIn
@@ -350,7 +445,9 @@ if barstate.isfirst
 
 if barstate.islast
     string cfg = entryMode + " | max " + str.tostring(maxTries) + " tries | " + str.tostring(rr, "#.#") + ":1" +
-         (trendOn ? " | SMA" + str.tostring(trendLen) : "")
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "") +
+         (useHtfLv ? " | levels: " + (useChartLv ? "chart + " : "") + htfIn : "") +
+         (minTouches > 1 ? " | min " + str.tostring(minTouches) + " swings" : "")
     cellTxt(0, 0, "S/R Flip — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Try 1", color.silver)

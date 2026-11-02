@@ -10,6 +10,8 @@ Idea
         sweep      a bar wicks BELOW the level by >= sweep_atr x ATR (stop-hunt) and CLOSES back above -> enter at close
   4. Stop       = level - stop_atr x ATR (sweep mode: also below the sweep wick).
      Target     = rr x risk.
+  Levels can come from the chart, a higher timeframe (level_src/htf), or both. Swing points within
+  merge_pct % merge into one level and count as touches; min_touches keeps only "major" levels.
   5. Multiple tries: after a stop-out the level stays live (up to `max_tries`) unless a bar CLOSES
      beyond the stop level, the window expires, or a target is hit.
   Shorts are the mirror image (support breaks, retest from below).
@@ -51,9 +53,20 @@ class SRParams:
     trend_len: int = 200
     trade_longs: bool = True
     trade_shorts: bool = True
+    # level source / strength
+    level_src: str = "chart"    # chart | htf | both
+    htf: str = "W"              # pandas resample rule for the higher timeframe (D, W, ME ...)
+    htf_piv_len: int = 3        # swing strength on the higher timeframe
+    htf_max_age: int = 100      # HTF level expires after this many HTF bars
+    merge_pct: float = 0.0      # swing points within this % of each other merge into one level (touch count +1)
+    min_touches: int = 1        # only trade levels built from at least this many swing points
 
     def label(self) -> str:
         s = f"{self.entry_mode} | tries {self.max_tries} | {self.rr:g}:1"
+        if self.level_src != "chart":
+            s += f" | levels {self.level_src}:{self.htf}"
+        if self.merge_pct > 0 or self.min_touches > 1:
+            s += f" | merge {self.merge_pct:g}% min {self.min_touches} swings"
         if self.trend_filter == "sma":
             s += f" | SMA{self.trend_len}"
         if not self.trade_shorts:
@@ -75,6 +88,51 @@ def atr(h, l, c, n):
     return out
 
 
+HTF_SECONDS = {"D": 86400, "W": 7 * 86400, "ME": 2628000, "M": 2628000}
+
+
+def htf_pivot_schedule(df: pd.DataFrame, p: SRParams):
+    """Swing levels from a higher timeframe, keyed by the first chart bar that may know about them.
+
+    A pivot confirmed on HTF bar k is only usable once bar k has CLOSED, i.e. from the first chart bar after
+    the end of that HTF period (same as request.security(..., expr[1], lookahead_on) in Pine). Returns
+    {chart_pos: [(type, price, origin_time_ns), ...]}.
+    """
+    hdf = df.resample(p.htf, label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    if len(hdf) <= 2 * p.htf_piv_len:
+        return {}
+    hph, hpl = pivots(hdf["high"].to_numpy(float), hdf["low"].to_numpy(float), p.htf_piv_len)
+    ends = hdf.index
+    chart_t = df.index
+    out: dict[int, list] = {}
+    for k in range(len(hdf)):
+        for tp, arr in ((1, hph), (-1, hpl)):
+            if not math.isnan(arr[k]):
+                pos = int(chart_t.searchsorted(ends[k], side="right"))
+                if pos < len(chart_t):
+                    origin = ends[k - p.htf_piv_len].value          # end of the pivot's HTF bar
+                    out.setdefault(pos, []).append((tp, arr[k], origin))
+    return out
+
+
+def add_level(levels: list, price: float, bar: int, t_ns: int, is_htf: bool, merge_pct: float):
+    """Add a swing level; merge into an existing one within merge_pct % (touch count +1, keep oldest origin)."""
+    if merge_pct > 0:
+        best = None
+        for lv in levels:
+            if abs(lv["p"] - price) / price * 100 <= merge_pct and (best is None or abs(lv["p"] - price) < abs(best["p"] - price)):
+                best = lv
+        if best is not None:
+            best["p"] = (best["p"] * best["n"] + price) / (best["n"] + 1)
+            best["n"] += 1
+            best["bar"] = min(best["bar"], bar)
+            best["t"] = min(best["t"], t_ns)
+            best["htf"] = best["htf"] or is_htf
+            return
+    levels.append(dict(p=price, bar=bar, t=t_ns, n=1, htf=is_htf))
+
+
 def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
     o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
     t = df.index
@@ -85,8 +143,20 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
     sma = pd.Series(c).rolling(p.trend_len).mean().to_numpy() if p.trend_filter == "sma" else None
     res = Result()
 
-    res_lv: list[tuple[float, int]] = []   # unbroken resistance (price, pivot bar)
-    sup_lv: list[tuple[float, int]] = []   # unbroken support
+    res_lv: list[dict] = []   # unbroken resistance levels: dict(p, bar, t, n, htf)
+    sup_lv: list[dict] = []   # unbroken support levels
+    tns = t.asi8 if hasattr(t, "asi8") else np.array([x.value for x in t])
+    use_chart = p.level_src in ("chart", "both")
+    htf_sched = htf_pivot_schedule(df, p) if p.level_src in ("htf", "both") else {}
+    htf_life = p.htf_max_age * HTF_SECONDS.get(p.htf, 7 * 86400) * 1_000_000_000
+
+    def alive(lv, i):
+        if lv["htf"]:
+            return tns[i] - lv["t"] <= htf_life
+        return i - lv["bar"] <= p.max_age
+
+    def old_enough(lv, i):
+        return lv["htf"] or i - lv["bar"] >= p.min_age   # HTF levels are already >= htf_piv_len HTF bars old
 
     # active flipped level
     act = None   # dict(d, lvl, brk_bar, atr, tries)
@@ -105,12 +175,14 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
 
     act_brk_bar = 0
     for i in range(n):
-        if not math.isnan(ph[i]):
-            res_lv.append((ph[i], i - L))
-        if not math.isnan(pl[i]):
-            sup_lv.append((pl[i], i - L))
-        res_lv = [x for x in res_lv if i - x[1] <= p.max_age]
-        sup_lv = [x for x in sup_lv if i - x[1] <= p.max_age]
+        if use_chart and not math.isnan(ph[i]):
+            add_level(res_lv, ph[i], i - L, tns[i - L], False, p.merge_pct)
+        if use_chart and not math.isnan(pl[i]):
+            add_level(sup_lv, pl[i], i - L, tns[i - L], False, p.merge_pct)
+        for tp, price, origin in htf_sched.get(i, ()):
+            add_level(res_lv if tp == 1 else sup_lv, price, i, origin, True, p.merge_pct)
+        res_lv = [x for x in res_lv if alive(x, i)]
+        sup_lv = [x for x in sup_lv if alive(x, i)]
 
         # 1) manage open trade
         exited = False
@@ -177,18 +249,18 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
         if math.isnan(a[i]):
             continue
         new = None
-        broken = [x for x in res_lv if c[i] > x[0]]
+        broken = [x for x in res_lv if c[i] > x["p"]]
         if broken:
-            res_lv = [x for x in res_lv if c[i] <= x[0]]
-            ok = [x for x in broken if c[i] >= x[0] + p.brk_atr * a[i] and i - x[1] >= p.min_age]
+            res_lv = [x for x in res_lv if c[i] <= x["p"]]
+            ok = [x for x in broken if c[i] >= x["p"] + p.brk_atr * a[i] and old_enough(x, i) and x["n"] >= p.min_touches]
             if ok and p.trade_longs:
-                new = (1, max(ok)[0])
-        broken = [x for x in sup_lv if c[i] < x[0]]
+                new = (1, max(x["p"] for x in ok))
+        broken = [x for x in sup_lv if c[i] < x["p"]]
         if broken:
-            sup_lv = [x for x in sup_lv if c[i] >= x[0]]
-            ok = [x for x in broken if c[i] <= x[0] - p.brk_atr * a[i] and i - x[1] >= p.min_age]
+            sup_lv = [x for x in sup_lv if c[i] >= x["p"]]
+            ok = [x for x in broken if c[i] <= x["p"] - p.brk_atr * a[i] and old_enough(x, i) and x["n"] >= p.min_touches]
             if ok and p.trade_shorts and new is None:
-                new = (-1, min(ok)[0])
+                new = (-1, min(x["p"] for x in ok))
         if new and not in_tr:
             d, lvl = new
             if sma is None or (not math.isnan(sma[i]) and (c[i] > sma[i] if d == 1 else c[i] < sma[i])):
@@ -236,11 +308,16 @@ def main(argv=None):
     ap.add_argument("--rr", type=float, default=2.0)
     ap.add_argument("--tries", type=int, default=3)
     ap.add_argument("--trend", default="off", choices=["off", "sma"])
+    ap.add_argument("--levels", default="chart", choices=["chart", "htf", "both"])
+    ap.add_argument("--htf", default="W", help="higher timeframe for levels: D, W, ME")
+    ap.add_argument("--merge", type=float, default=0.0, help="merge swing levels within this %%")
+    ap.add_argument("--min-touches", type=int, default=1)
     ap.add_argument("--longs-only", action="store_true")
     ap.add_argument("--shorts-only", action="store_true")
     ap.add_argument("--cache", default=None)
     a = ap.parse_args(argv)
-    p = SRParams(entry_mode=a.mode, rr=a.rr, max_tries=a.tries, trend_filter=a.trend,
+    p = SRParams(entry_mode=a.mode, rr=a.rr, max_tries=a.tries, trend_filter=a.trend, level_src=a.levels, htf=a.htf,
+                 merge_pct=a.merge, min_touches=a.min_touches,
                  trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
     print("Config:", p.label())
     for sym in a.symbols:
