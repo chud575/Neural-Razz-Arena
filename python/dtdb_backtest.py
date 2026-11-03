@@ -10,7 +10,11 @@ Toggles (see Params):
                  "midpoint"       limit halfway between neckline and pattern extreme (original idea)
                  "retest"         limit at the neckline (retest of the breakout point)
                  "retest_confirm" a bar touches the neckline and CLOSES back on the breakout side; enter at that close
-  rr             reward : risk for the targets
+  rr             reward : risk of the final target (TP2)
+  tp1_rr         reward : risk of TP1
+  tp1_pct        % of each entry closed at TP1 (0 = single target at rr — the default here, so older results
+                 reproduce; the Pine indicator defaults to 50)
+  be_after_tp1   move the remainder's stop to breakeven after TP1 (remainder managed from the next bar)
   tgt_mode       "per_entry" (each entry its own RR target) or "blended" (one target off the average entry)
   trend_filter   "off" or "sma" (longs only above the N-period SMA, shorts only below)
   trade_longs / trade_shorts
@@ -21,7 +25,7 @@ Examples:
 """
 from __future__ import annotations
 
-__version__ = "1.4"  # same version as pine/double_top_bottom_2entry.pine
+__version__ = "1.5"  # same version as pine/double_top_bottom_2entry.pine
 
 import argparse
 import json
@@ -51,7 +55,10 @@ class Params:
     trade_shorts: bool = True
     use_entry1: bool = True
     entry2_mode: str = "midpoint"      # off | midpoint | retest | retest_confirm
-    rr: float = 2.0
+    rr: float = 2.0                    # TP2 (final target) as R multiple
+    tp1_rr: float = 1.0                # TP1 as R multiple
+    tp1_pct: float = 0.0               # % closed at TP1 (0 = single target)
+    be_after_tp1: bool = True
     tgt_mode: str = "per_entry"        # per_entry | blended
     stop_buf_pct: float = 0.0
     e2_expiry: int = 50                # 0 = never
@@ -70,6 +77,8 @@ class Params:
             name += " | longs only"
         if not self.trade_longs:
             name += " | shorts only"
+        if self.tp1_pct > 0:
+            return f"{name} | TP1 {self.tp1_rr:g}R ({self.tp1_pct:g}%) / TP2 {self.rr:g}R" + (" | BE" if self.be_after_tp1 else "")
         return f"{name} | {self.rr:g}:1"
 
 
@@ -170,19 +179,53 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
     db = None  # pending double bottom
 
     t_dir = 0
-    tE1 = tE2 = tE2fill = tStop = tT1 = tT2 = tT2plan = math.nan
+    tE1 = tE2 = tE2fill = tStop = tT2plan = math.nan
     e1_open = e2_open = e2_pend = False
     sig_bar = -1
+    p1 = p.tp1_pct / 100.0
+    # per-entry exit state: e = entry price, risk = risk unit (planned for limit fills), stop (moves to BE),
+    # tp1 / tp2, done1 = TP1 taken, r / pct = running totals
+    ent = [dict(), dict()]
 
-    def record(direction, entry, entry_px, exit_px, stop_px, i, reason, risk_ref=None):
-        # risk_ref: planned entry for limit orders, so a gap fill next to the stop can't create a tiny-risk outlier
-        risk = abs((entry_px if risk_ref is None else risk_ref) - stop_px)
-        r = direction * (exit_px - entry_px) / risk if risk > 0 else 0.0
-        pct = direction * (exit_px - entry_px) / entry_px * 100.0
-        res.trades.append(Trade(symbol, direction, entry, t[sig_bar], t[i], entry_px, exit_px, stop_px, r, pct, reason))
+    def tgt(direction, entry_px, stop_px, mult=None):
+        return entry_px + direction * (p.rr if mult is None else mult) * abs(entry_px - stop_px)
 
-    def tgt(direction, entry_px, stop_px):
-        return entry_px + direction * p.rr * abs(entry_px - stop_px)
+    def new_ent(e, risk, stop, tp1, tp2):
+        return dict(e=e, risk=risk, stop=stop, tp1=tp1, tp2=tp2, done1=p1 <= 0, r=0.0, pct=0.0)
+
+    def step(k, i, d, stop_only):
+        """Advance entry k one bar (mirrors stepEntry in the Pine script). Returns True when it is fully closed."""
+        en = ent[k]
+        rem = 1.0 if (p1 <= 0 or not en["done1"]) else 1.0 - p1
+        x_px, reason = None, ""
+        if (l[i] <= en["stop"]) if d == 1 else (h[i] >= en["stop"]):
+            x_px = min(o[i], en["stop"]) if d == 1 else max(o[i], en["stop"])
+            reason = "BE" if (en["done1"] and p.be_after_tp1 and p1 > 0) else "SL"
+        elif not stop_only:
+            if not en["done1"] and ((h[i] >= en["tp1"]) if d == 1 else (l[i] <= en["tp1"])):
+                px = max(o[i], en["tp1"]) if d == 1 else min(o[i], en["tp1"])
+                en["r"] += p1 * d * (px - en["e"]) / en["risk"]
+                en["pct"] += p1 * d * (px - en["e"]) / en["e"] * 100
+                en["done1"] = True
+                if p1 >= 1:
+                    finish(k, i, d, px, "TP1")
+                    return True
+                if p.be_after_tp1:
+                    en["stop"] = en["e"]          # remainder managed from the next bar
+            elif en["done1"] and ((h[i] >= en["tp2"]) if d == 1 else (l[i] <= en["tp2"])):
+                x_px = max(o[i], en["tp2"]) if d == 1 else min(o[i], en["tp2"])
+                reason = "TP"
+        if x_px is None:
+            return False
+        en["r"] += rem * d * (x_px - en["e"]) / en["risk"] if en["risk"] > 0 else 0.0
+        en["pct"] += rem * d * (x_px - en["e"]) / en["e"] * 100
+        finish(k, i, d, x_px, reason)
+        return True
+
+    def finish(k, i, d, x_px, reason):
+        en = ent[k]
+        res.trades.append(Trade(symbol, d, k, t[sig_bar], t[i], en["e"], x_px, tStop, en["r"], en["pct"], reason,
+                                en["risk"], en["tp2"]))
 
     def trend_ok(direction, i):
         if sma is None:
@@ -245,29 +288,21 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
                 # never fill beyond the stop (gap through the whole pattern)
                 if filled and (fill_px < tStop if d == -1 else fill_px > tStop):
                     tE2fill = fill_px
-                    # confirm entries are at a known close -> target from the fill; limit fills keep the planned target
-                    if confirm and (p.tgt_mode == "per_entry" or not p.use_entry1):
-                        tT2 = tgt(d, tE2fill, tStop)
+                    # confirm entries are at a known close -> risk/targets from the fill; limit fills keep the plan
+                    e2 = ent[1]
+                    e2.update(e=fill_px, stop=tStop, done1=p1 <= 0, r=0.0, pct=0.0)
+                    if confirm:
+                        e2["risk"] = abs(fill_px - tStop)
+                        if p.tgt_mode == "per_entry" or not p.use_entry1:
+                            e2["tp1"] = tgt(d, fill_px, tStop, p.tp1_rr)
+                            e2["tp2"] = tgt(d, fill_px, tStop)
                     e2_pend, e2_open, e2_just = False, True, True
                     res.e2_fills += 1
-            stop_hit = h[i] >= tStop if d == -1 else l[i] <= tStop
-            stop_px = max(o[i], tStop) if d == -1 else min(o[i], tStop)
-            if e1_open:
-                tp = l[i] <= tT1 if d == -1 else h[i] >= tT1
-                if stop_hit:
-                    record(d, 0, tE1, stop_px, tStop, i, "SL"); e1_open = False
-                elif tp:
-                    px = min(o[i], tT1) if d == -1 else max(o[i], tT1)
-                    record(d, 0, tE1, px, tStop, i, "TP"); e1_open = False
-            if e2_open:
-                # limit fills: stop can still hit on the fill bar; confirm fills enter at the close -> nothing on that bar
-                sh = stop_hit and not (e2_just and confirm)
-                tp = (not e2_just) and (l[i] <= tT2 if d == -1 else h[i] >= tT2)
-                if sh:
-                    record(d, 1, tE2fill, stop_px, tStop, i, "SL", None if confirm else tE2); e2_open = False
-                elif tp:
-                    px = min(o[i], tT2) if d == -1 else max(o[i], tT2)
-                    record(d, 1, tE2fill, px, tStop, i, "TP", None if confirm else tE2); e2_open = False
+            if e1_open and step(0, i, d, stop_only=False):
+                e1_open = False
+            # limit fills: only the stop can hit on the fill bar; confirm fills enter at the close -> nothing on that bar
+            if e2_open and not (e2_just and confirm) and step(1, i, d, stop_only=e2_just):
+                e2_open = False
             if e2_pend:
                 cancel = p.use_entry1 and not e1_open                       # entry 1 finished
                 cancel |= p.e2_expiry > 0 and i - sig_bar >= p.e2_expiry    # expired
@@ -281,7 +316,7 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
 
         # ── New entries
         def open_trade(d, extreme, neck):
-            nonlocal t_dir, tE1, tE2, tStop, tT1, tT2, tT2plan, e1_open, e2_open, e2_pend, sig_bar
+            nonlocal t_dir, tE1, tE2, tStop, tT2plan, e1_open, e2_open, e2_pend, sig_bar
             H = abs(extreme - neck)
             tStop = extreme - d * H * p.stop_buf_pct / 100
             tE1 = c[i]
@@ -291,11 +326,14 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
                 tE2 = neck
             if p.tgt_mode == "blended" and p.use_entry1 and use_e2:
                 avg = (tE1 + tE2) / 2
-                tT1 = tT2 = tgt(d, avg, tStop)
+                a1, a2 = tgt(d, avg, tStop, p.tp1_rr), tgt(d, avg, tStop)
+                b1, b2 = a1, a2
             else:
-                tT1 = tgt(d, tE1, tStop)
-                tT2 = tgt(d, tE2, tStop)
-            tT2plan = tT2
+                a1, a2 = tgt(d, tE1, tStop, p.tp1_rr), tgt(d, tE1, tStop)
+                b1, b2 = tgt(d, tE2, tStop, p.tp1_rr), tgt(d, tE2, tStop)
+            ent[0] = new_ent(tE1, abs(tE1 - tStop), tStop, a1, a2)
+            ent[1] = new_ent(tE2, abs(tE2 - tStop), tStop, b1, b2)
+            tT2plan = b2
             t_dir, sig_bar = d, i
             e1_open, e2_open, e2_pend = p.use_entry1, False, use_e2
 
@@ -375,7 +413,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("symbols", nargs="+")
     ap.add_argument("--interval", default="1d")
     ap.add_argument("--range", default="max")
-    ap.add_argument("--rr", type=float, default=2.0)
+    ap.add_argument("--rr", type=float, default=2.0, help="TP2 / final target as R multiple")
+    ap.add_argument("--tp1", type=float, default=1.0, help="TP1 as R multiple")
+    ap.add_argument("--tp1-pct", type=float, default=0.0, help="%% of each entry closed at TP1 (0 = single target)")
+    ap.add_argument("--no-be", action="store_true", help="do not move the stop to breakeven after TP1")
     ap.add_argument("--blended", action="store_true", help="shared target off the average entry")
     ap.add_argument("--no-entry1", action="store_true", help="disable the breakout entry")
     ap.add_argument("--entry2", default="midpoint", choices=["off", "midpoint", "retest", "retest_confirm"])
@@ -390,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    p = Params(rr=a.rr, tgt_mode="blended" if a.blended else "per_entry", use_entry1=not a.no_entry1,
+    p = Params(rr=a.rr, tp1_rr=a.tp1, tp1_pct=a.tp1_pct, be_after_tp1=not a.no_be, tgt_mode="blended" if a.blended else "per_entry", use_entry1=not a.no_entry1,
                entry2_mode=a.entry2, trend_filter=a.trend, trend_len=a.trend_len,
                trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
     print(f"Config: {p.label()}")

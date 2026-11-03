@@ -1,0 +1,13 @@
+setup                 exits                          trades   win%    avgR    netR  maxDD   longR  shortR
+Breakout + Midpoint   Single target 2R                 1206   36.8  +0.110  +132.7   57.0  +0.278  -0.078
+Breakout + Midpoint   Single target 3R                 1116   28.6  +0.143  +159.7   54.4  +0.374  -0.117
+Breakout + Midpoint   TP1 1R 50% / TP2 2R, BE          1257   51.9  +0.079   +98.8   24.5  +0.190  -0.048
+Breakout + Midpoint   TP1 1R 50% / TP2 2R, no BE       1207   38.8  +0.089  +106.8   33.5  +0.213  -0.051
+Breakout + Midpoint   TP1 1R 50% / TP2 3R, BE          1207   51.8  +0.083  +100.3   27.8  +0.211  -0.058
+Breakout + Midpoint   TP1 1.5R 50% / TP2 3R, BE        1173   42.0  +0.089  +104.7   29.9  +0.260  -0.096
+Breakout only         Single target 2R                  749   37.7  +0.123   +92.2   49.2  +0.361  -0.162
+Breakout only         Single target 3R                  685   28.2  +0.122   +83.3   46.3  +0.447  -0.265
+Breakout only         TP1 1R 50% / TP2 2R, BE           809   53.2  +0.083   +67.2   21.8  +0.236  -0.100
+Breakout only         TP1 1R 50% / TP2 2R, no BE        749   39.7  +0.102   +76.4   29.0  +0.273  -0.103
+Breakout only         TP1 1R 50% / TP2 3R, BE           772   52.7  +0.073   +56.5   31.4  +0.248  -0.132
+Breakout only         TP1 1.5R 50% / TP2 3R, BE         733   43.7  +0.098   +71.6   29.7  +0.327  -0.167
