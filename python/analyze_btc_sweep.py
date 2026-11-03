@@ -123,7 +123,7 @@ def main(argv=None):
             fb = fam_ok.iloc[0] if len(fam_ok) else None
             fb_cfg = None
             if fb is not None:
-                inside = ranked[[family(strat, c) == fb.family for c in ranked.config] & (ranked.direction == fb.direction)]
+                inside = ranked[np.array([family(strat, c) == fb.family for c in ranked.config]) & (ranked.direction == fb.direction).to_numpy()]
                 fb_cfg = inside.iloc[0] if len(inside) else None
             fctrl, _ = finalist_control(strat, tf, fb_cfg.config, fb_cfg.direction) if fb_cfg is not None else (math.nan, 0)
             pos_is = (elig.is_avg > 0).mean() * 100
