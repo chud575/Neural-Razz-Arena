@@ -23,7 +23,7 @@ the same bar; limit fills only check the stop on the fill bar; gaps fill at the 
 """
 from __future__ import annotations
 
-__version__ = "1.1"  # same version as pine/sr_flip.pine
+__version__ = "1.2"  # same version as pine/sr_flip.pine
 
 import argparse
 import math
@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from dtdb_backtest import Result, Trade, fetch_yahoo, max_dd_r, pivots, stats, _f
+from exits import make_entry, scale_step
 
 
 @dataclass
@@ -50,7 +51,10 @@ class SRParams:
     sweep_atr: float = 0.1      # sweep: wick must pierce the level by this x ATR
     stop_atr: float = 0.5       # stop (and close-invalidation) distance beyond the level
     max_tries: int = 3
-    rr: float = 2.0
+    rr: float = 2.0             # TP2 (final target) as R multiple
+    tp1_rr: float = 1.0         # TP1 as R multiple
+    tp1_pct: float = 0.0        # % closed at TP1 (0 = single target at rr; Pine defaults to 50)
+    be_after_tp1: bool = True   # remainder's stop to breakeven after TP1
     trend_filter: str = "off"   # off | sma
     trend_len: int = 200
     trade_longs: bool = True
@@ -65,6 +69,8 @@ class SRParams:
 
     def label(self) -> str:
         s = f"{self.entry_mode} | tries {self.max_tries} | {self.rr:g}:1"
+        if self.tp1_pct > 0:
+            s += f" | TP1 {self.tp1_rr:g}R ({self.tp1_pct:g}%)" + (" BE" if self.be_after_tp1 else "")
         if self.level_src != "chart":
             s += f" | levels {self.level_src}:{self.htf}"
         if self.merge_pct > 0 or self.min_touches > 1:
@@ -169,11 +175,15 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
     tr_bar = -1
     tr_try = 0
 
-    def record(i, exit_px, reason):
-        r = tr_d * (exit_px - tr_e) / tr_risk if tr_risk > 0 else 0.0
-        pct = tr_d * (exit_px - tr_e) / tr_e * 100
+    p1 = p.tp1_pct / 100.0
+    en = {}
+
+    def record(i, exit_px, reason, r=None, pct=None):
+        if r is None:
+            r = tr_d * (exit_px - tr_e) / tr_risk if tr_risk > 0 else 0.0
+            pct = tr_d * (exit_px - tr_e) / tr_e * 100
         res.trades.append(Trade(symbol, tr_d, min(tr_try, 2), t[act_brk_bar], t[i], tr_e, exit_px, tr_s, r, pct, reason,
-                                tr_risk))
+                                tr_risk, tr_t))
 
     act_brk_bar = 0
     for i in range(n):
@@ -189,19 +199,16 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
         # 1) manage open trade
         exited = False
         if in_tr and i > tr_bar:
-            d = tr_d
-            stop_hit = l[i] <= tr_s if d == 1 else h[i] >= tr_s
-            tp_hit = h[i] >= tr_t if d == 1 else l[i] <= tr_t
-            if stop_hit:
-                record(i, min(o[i], tr_s) if d == 1 else max(o[i], tr_s), "SL")
+            closed, x_px, reason, _ = scale_step(o, h, l, i, tr_d, en, p1, p.be_after_tp1)
+            if closed:
+                record(i, x_px, reason, en["r"], en["pct"])
                 in_tr, exited = False, True
-                act["tries"] += 1
-                if act["tries"] >= p.max_tries:
+                if en["r"] > 0:                  # paid: this level is done
                     act = None
-            elif tp_hit:
-                record(i, max(o[i], tr_t) if d == 1 else min(o[i], tr_t), "TP")
-                in_tr, exited = False, True
-                act = None
+                else:                            # stopped (or scratched): another try if allowed
+                    act["tries"] += 1
+                    if act["tries"] >= p.max_tries:
+                        act = None
 
         # 2) entry on a retest of the active level
         if act and not in_tr and not exited and i >= act["brk_bar"] + p.min_bars_after:
@@ -232,6 +239,7 @@ def backtest(df: pd.DataFrame, p: SRParams, symbol: str = "") -> Result:
                 ref = plan if plan is not None else entry
                 tr_risk = abs(ref - stop)
                 tr_t = ref + d * p.rr * tr_risk
+                en = make_entry(entry, tr_risk, stop, ref + d * p.tp1_rr * tr_risk, tr_t, d, p1)
                 act_brk_bar = act["brk_bar"]
                 if same_bar_stop_check and (l[i] <= stop if d == 1 else h[i] >= stop):
                     record(i, stop, "SL")      # filled then stopped in the same bar
@@ -307,7 +315,10 @@ def main(argv=None):
     ap.add_argument("--interval", default="1d")
     ap.add_argument("--range", default="max")
     ap.add_argument("--mode", default="touch", choices=["touch", "rejection", "sweep"])
-    ap.add_argument("--rr", type=float, default=2.0)
+    ap.add_argument("--rr", type=float, default=2.0, help="TP2 / final target as R multiple")
+    ap.add_argument("--tp1", type=float, default=1.0)
+    ap.add_argument("--tp1-pct", type=float, default=0.0, help="%% closed at TP1 (0 = single target)")
+    ap.add_argument("--no-be", action="store_true")
     ap.add_argument("--tries", type=int, default=3)
     ap.add_argument("--trend", default="off", choices=["off", "sma"])
     ap.add_argument("--levels", default="chart", choices=["chart", "htf", "both"])
@@ -318,7 +329,7 @@ def main(argv=None):
     ap.add_argument("--shorts-only", action="store_true")
     ap.add_argument("--cache", default=None)
     a = ap.parse_args(argv)
-    p = SRParams(entry_mode=a.mode, rr=a.rr, max_tries=a.tries, trend_filter=a.trend, level_src=a.levels, htf=a.htf,
+    p = SRParams(entry_mode=a.mode, rr=a.rr, tp1_rr=a.tp1, tp1_pct=a.tp1_pct, be_after_tp1=not a.no_be, max_tries=a.tries, trend_filter=a.trend, level_src=a.levels, htf=a.htf,
                  merge_pct=a.merge, min_touches=a.min_touches,
                  trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
     print("Config:", p.label())

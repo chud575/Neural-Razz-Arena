@@ -321,6 +321,7 @@ if tDir != 0 and bar_index > sigBar
             if perEntry and e2Confirm
                 e2Tp1 := fillPx + tDir * tp1RR * e2Risk
                 e2Tp2 := fillPx + tDir * tp2RR * e2Risk
+                e2Tp1 := (e2Tp1 - e2Tp2) * tDir > 0 ? e2Tp2 : e2Tp1
             e2Stop       := tStop
             e2Done1      := p1 <= 0
             e2R          := 0.0
@@ -403,6 +404,8 @@ if shortSig or longSig
         float a2    = perEntry ? e1 + d * tp2RR * r1 : avgE + d * tp2RR * rA     // Entry 1 TP2
         float b1    = perEntry ? e2 + d * tp1RR * r2 : a1                       // Entry 2 TP1
         float b2    = perEntry ? e2 + d * tp2RR * r2 : a2                       // Entry 2 TP2
+        a1 := (a1 - a2) * d > 0 ? a2 : a1                                      // TP1 never beyond TP2
+        b1 := (b1 - b2) * d > 0 ? b2 : b1
 
         tDir    := d
         tE1     := e1

@@ -30,7 +30,7 @@ entries measure R from the planned price.
 """
 from __future__ import annotations
 
-__version__ = "1.1"  # same version as pine/megaphone.pine
+__version__ = "1.2"  # same version as pine/megaphone.pine
 
 import argparse
 import math
@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 from dtdb_backtest import Result, Trade, _f, fetch_yahoo, max_dd_r, pivots, stats
+from exits import make_entry, scale_step
 from srflip_backtest import atr
 
 KINDS = ("Fade", "Breakout", "Failed BO")
@@ -66,7 +67,10 @@ class MPParams:
     retest_window: int = 10
     failed_bo: bool = False
     fb_window: int = 5
-    rr: float = 2.0
+    rr: float = 2.0              # TP2 (final target) as R multiple, when the target is R-based
+    tp1_rr: float = 1.0          # TP1 as R multiple (pulled back to TP2 if it would be beyond it)
+    tp1_pct: float = 0.0         # % closed at TP1 (0 = single target; Pine defaults to 50)
+    be_after_tp1: bool = True
     trend_filter: str = "off"    # off | sma
     trend_len: int = 200
     trade_longs: bool = True
@@ -151,9 +155,12 @@ def backtest(df: pd.DataFrame, p: MPParams, symbol: str = "") -> Result:
             del seq[0]
         return True
 
-    def record(i, exit_px, reason):
-        r = tr["d"] * (exit_px - tr["e"]) / tr["risk"] if tr["risk"] > 0 else 0.0
-        pct = tr["d"] * (exit_px - tr["e"]) / tr["e"] * 100
+    p1 = p.tp1_pct / 100.0
+
+    def record(i, exit_px, reason, r=None, pct=None):
+        if r is None:
+            r = tr["d"] * (exit_px - tr["e"]) / tr["risk"] if tr["risk"] > 0 else 0.0
+            pct = tr["d"] * (exit_px - tr["e"]) / tr["e"] * 100
         res.trades.append(Trade(symbol, tr["d"], tr["kind"], t[tr["sig"]], t[i], tr["e"], exit_px, tr["s"], r, pct,
                                 reason, tr["risk"], tr["t"]))
 
@@ -177,7 +184,9 @@ def backtest(df: pd.DataFrame, p: MPParams, symbol: str = "") -> Result:
         nonlocal in_tr, tr
         if risk <= 0 or (e - stop) * d <= 0 or (tgt - e) * d <= 0:
             return False
-        tr = dict(d=d, kind=kind, e=e, s=stop, t=tgt, risk=risk, bar=i, sig=i)
+        ref = stop + d * risk                    # planned entry (= e unless a limit gap-filled)
+        tr = dict(d=d, kind=kind, e=e, s=stop, t=tgt, risk=risk, bar=i, sig=i,
+                  en=make_entry(e, risk, stop, ref + d * p.tp1_rr * risk, tgt, d, p1))
         in_tr = True
         if limit_fill and (l[i] <= stop if d == 1 else h[i] >= stop):
             record(i, stop, "SL")
@@ -201,14 +210,9 @@ def backtest(df: pd.DataFrame, p: MPParams, symbol: str = "") -> Result:
         # 2) manage open trade
         exited = False
         if in_tr and i > tr["bar"]:
-            d = tr["d"]
-            stop_hit = l[i] <= tr["s"] if d == 1 else h[i] >= tr["s"]
-            tp_hit = h[i] >= tr["t"] if d == 1 else l[i] <= tr["t"]
-            if stop_hit:
-                record(i, min(o[i], tr["s"]) if d == 1 else max(o[i], tr["s"]), "SL")
-                in_tr, exited = False, True
-            elif tp_hit:
-                record(i, max(o[i], tr["t"]) if d == 1 else min(o[i], tr["t"]), "TP")
+            closed, x_px, reason, _ = scale_step(o, h, l, i, tr["d"], tr["en"], p1, p.be_after_tp1)
+            if closed:
+                record(i, x_px, reason, tr["en"]["r"], tr["en"]["pct"])
                 in_tr, exited = False, True
 
         if pat is None or math.isnan(a[i]):
@@ -332,7 +336,10 @@ def main(argv=None):
     ap.add_argument("--bo-entry", default="close", choices=["close", "retest"])
     ap.add_argument("--bo-target", default="rr", choices=["rr", "measured"])
     ap.add_argument("--failed-bo", action="store_true")
-    ap.add_argument("--rr", type=float, default=2.0)
+    ap.add_argument("--rr", type=float, default=2.0, help="TP2 / final target as R multiple")
+    ap.add_argument("--tp1", type=float, default=1.0)
+    ap.add_argument("--tp1-pct", type=float, default=0.0, help="%% closed at TP1 (0 = single target)")
+    ap.add_argument("--no-be", action="store_true")
     ap.add_argument("--pivots", type=int, default=4, choices=[4, 5, 6])
     ap.add_argument("--expand-atr", type=float, default=0.0)
     ap.add_argument("--fit-atr", type=float, default=0.0)
@@ -341,7 +348,8 @@ def main(argv=None):
     ap.add_argument("--shorts-only", action="store_true")
     ap.add_argument("--cache", default=None)
     a = ap.parse_args(argv)
-    p = MPParams(mode=a.mode, fade_entry=a.fade_entry, target=a.target, rr=a.rr, min_pivots=a.pivots,
+    p = MPParams(mode=a.mode, fade_entry=a.fade_entry, target=a.target, rr=a.rr, tp1_rr=a.tp1, tp1_pct=a.tp1_pct,
+                 be_after_tp1=not a.no_be, min_pivots=a.pivots,
                  min_expand_atr=a.expand_atr, fit_atr=a.fit_atr, bo_entry=a.bo_entry, bo_target=a.bo_target,
                  failed_bo=a.failed_bo, trend_filter=a.trend, trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
     print("Config:", p.label())

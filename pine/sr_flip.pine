@@ -1,6 +1,7 @@
 //@version=6
-// S/R Flip – Break & Retest   ·   v1.1
+// S/R Flip – Break & Retest   ·   v1.2
 // Changelog
+//  v1.2  TP1 / TP2 as R multiples, % closed at TP1, optional breakeven after TP1
 //  v1.1  Levels from a higher timeframe (or both), merge nearby swings into zones, min-swings (strength) filter
 //  v1.0  First version: touch / rejection / sweep entries, multiple tries per level, stats table by attempt
 //
@@ -15,13 +16,15 @@
 //                  Touch           limit order in a small zone on the breakout side of the level
 //                  Rejection close bar trades into the zone and CLOSES back on the breakout side → enter at close
 //                  Sweep reclaim   bar wicks THROUGH the level (stop hunt) and CLOSES back → enter at close
-//  4. Stop = level ∓ X × ATR (sweep: also beyond the sweep wick). Target = R:R × risk.
+//  4. Stop = level ∓ X × ATR (sweep: also beyond the sweep wick). TP1 / TP2 = multiples of the risk; a chosen %
+//     closes at TP1, the rest rides to TP2, and the stop can move to breakeven after TP1 (remainder managed
+//     from the next bar). A try that finishes with a positive total R counts as "paid" and ends the level.
 //  5. Multiple tries: after a stop-out the level stays live (up to "max tries") unless a bar CLOSES
 //     beyond the stop level, the window expires, or a target is hit.
 //
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill
 // only checks its stop on the fill bar; gaps fill at the open; one trade at a time.
-indicator("S/R Flip – Break & Retest v1.1", shorttitle = "SR Flip v1.1", overlay = true,
+indicator("S/R Flip – Break & Retest v1.2", shorttitle = "SR Flip v1.2", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -50,7 +53,14 @@ zoneAtr     = input.float(0.1, "Entry zone beyond level (× ATR)", minval = 0.0,
 sweepAtr    = input.float(0.1, "Sweep: wick must pierce level by (× ATR)", minval = 0.0, step = 0.05, group = grpE)
 stopAtr     = input.float(0.5, "Stop beyond level (× ATR)", minval = 0.05, step = 0.05, group = grpE)
 maxTries    = input.int(3,     "Max tries per level", minval = 1, maxval = 10, group = grpE)
-rr          = input.float(2.0, "Reward : Risk", minval = 0.1, step = 0.1, group = grpE)
+tp1RR       = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpE,
+     tooltip = "TP1 distance as a multiple of the risk (entry → stop). If it would be beyond TP2 it is pulled back to TP2.")
+tp2RR       = input.float(2.0, "TP2 (reward : risk)", minval = 0.1, step = 0.1, group = grpE,
+     tooltip = "Final target as a multiple of the risk.")
+tp1Pct      = input.float(50, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpE,
+     tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
+beOn        = input.bool(true, "Move stop to breakeven after TP1", group = grpE)
+p1          = tp1Pct / 100.0
 
 grpF = "Filters"
 tradeLongs  = input.bool(true,  "Longs (resistance → support)", group = grpF)
@@ -79,8 +89,7 @@ var array<float> aBrk  = array.new<float>(2, 0.0)   // breakouts armed [long, sh
 var array<float> aLvl  = array.new<float>(2, 0.0)   // [levels traded, levels that paid]
 var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
 
-recordExit(int dir, int tryIdx, float entryPx, float exitPx, float risk) =>
-    float r   = risk > 0 ? dir * (exitPx - entryPx) / risk : 0.0
+recordExit(int dir, int tryIdx, float r) =>
     int   idx = (dir == 1 ? 0 : 3) + tryIdx
     if r > 0
         array.set(aWins, idx, array.get(aWins, idx) + 1)
@@ -94,6 +103,39 @@ recordExit(int dir, int tryIdx, float entryPx, float exitPx, float risk) =>
     array.set(eq, 1, math.max(array.get(eq, 1), cum))
     array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
     r
+
+// Advance an open trade by one bar (TP1 / TP2 scale-out).
+// Returns [stillOpen, tp1Done, stop, totalR, tp1FillPx (na = none), finalExitPx (na = none), exitTag]
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn, bool stopOnly) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 and p1 > 0 ? 1.0 - p1 : 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit                                            // stop (or breakeven stop) first
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else if not stopOnly
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false                               // everything closed at TP1
+            else if beOn
+                st := ePx                                 // remainder: stop to breakeven, managed from next bar
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP2"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        op   := false
+    [op, done1, st, accR, t1Px, xPx, tag]
 
 exitLabel(float px, string txt, float r) =>
     if showTrades
@@ -199,7 +241,10 @@ var bool  inTr   = false
 var int   trD    = 0
 var float trE    = na
 var float trS    = na
-var float trT    = na
+var float trT    = na      // TP2 (final target)
+var float trT1   = na      // TP1
+var bool  trDone1 = false
+var float trR    = 0.0     // running R of the open trade
 var float trRisk = na
 var int   trBar  = na
 var int   trTry  = 0
@@ -207,27 +252,26 @@ var int   trTry  = 0
 // 1) Manage open trade
 bool exited = false
 if inTr and bar_index > trBar
-    bool stopHit = trD == 1 ? low <= trS : high >= trS
-    bool tpHit   = trD == 1 ? high >= trT : low <= trT
-    if stopHit
-        float px = trD == 1 ? math.min(open, trS) : math.max(open, trS)
-        float r  = recordExit(trD, trTry, trE, px, trRisk)
-        exitLabel(px, "SL", r)
-        inTr     := false
-        exited   := true
-        actTries += 1
-        if actTries >= maxTries
+    [op, dn, st, ar, t1Fill, xPx, tag] = stepEntry(trD, trE, trRisk, trS, trT1, trT, trDone1, trR, false)
+    trDone1 := dn
+    trS     := st
+    trR     := ar
+    if not na(t1Fill) and p1 < 1
+        exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
+    if not op
+        recordExit(trD, trTry, trR)
+        exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
+        inTr   := false
+        exited := true
+        if trR > 0                                  // paid: this level is done
             actOn := false
-    else if tpHit
-        float px = trD == 1 ? math.max(open, trT) : math.min(open, trT)
-        float r  = recordExit(trD, trTry, trE, px, trRisk)
-        exitLabel(px, "TP", r)
-        inTr    := false
-        exited  := true
-        actOn   := false
-        if not actPaid
-            actPaid := true
-            array.set(aLvl, 1, array.get(aLvl, 1) + 1)
+            if not actPaid
+                actPaid := true
+                array.set(aLvl, 1, array.get(aLvl, 1) + 1)
+        else                                        // stopped / scratched: another try if allowed
+            actTries += 1
+            if actTries >= maxTries
+                actOn := false
 
 // 2) Entry on a retest of the flipped level
 if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
@@ -262,7 +306,11 @@ if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
         trBar  := bar_index
         trTry  := math.min(actTries, 2)
         trRisk := math.abs(ref - stp)
-        trT    := ref + d * rr * trRisk
+        trT    := ref + d * tp2RR * trRisk
+        trT1   := ref + d * tp1RR * trRisk
+        trT1   := (trT1 - trT) * d > 0 ? trT : trT1     // TP1 never beyond TP2
+        trDone1 := p1 <= 0
+        trR    := 0.0
         if not actTraded
             actTraded := true
             array.set(aLvl, 0, array.get(aLvl, 0) + 1)
@@ -272,9 +320,9 @@ if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
                  color = color.new(color.blue, 10), textcolor = color.white, size = size.tiny, yloc = yloc.price)
         alert((d == 1 ? "SR flip LONG" : "SR flip SHORT") + " try " + str.tostring(actTries + 1) + " on " + syminfo.ticker +
              " | entry " + str.tostring(entry, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
-             " | target " + str.tostring(trT, format.mintick), alert.freq_once_per_bar)
+             " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(trT, format.mintick), alert.freq_once_per_bar)
         if sameBar and (d == 1 ? low <= stp : high >= stp)
-            float r = recordExit(trD, trTry, trE, stp, trRisk)
+            float r = recordExit(trD, trTry, trD * (stp - trE) / trRisk)
             exitLabel(stp, "SL", r)
             inTr     := false
             actTries += 1
@@ -367,7 +415,8 @@ if newDir != 0 and not inTr
 plot(actOn ? actLvl : na, "Flipped level", actDir == 1 ? color.teal : color.maroon, 2, plot.style_linebr)
 plot(actOn and not inTr ? actLvl + actDir * zoneAtr * actAtr : na, "Entry zone edge", color.new(color.blue, 40), 1, plot.style_linebr)
 plot(inTr ? trS : na, "Stop",   color.red,   1, plot.style_linebr)
-plot(inTr ? trT : na, "Target", color.green, 1, plot.style_linebr)
+plot(inTr and p1 > 0 and not trDone1 ? trT1 : na, "TP1", color.green, 1, plot.style_linebr)
+plot(inTr and p1 < 1 ? trT : na, "TP2", color.teal, 2, plot.style_linebr)
 
 // Unbroken levels for context (strong-enough ones only; thicker = higher timeframe, label = swing count)
 var array<line>  ctx  = array.new<line>()
@@ -449,11 +498,11 @@ if barstate.isfirst
         table.merge_cells(tbl, 1, row, 4, row)
 
 if barstate.islast
-    string cfg = entryMode + " | max " + str.tostring(maxTries) + " tries | " + str.tostring(rr, "#.#") + ":1" +
+    string cfg = entryMode + " | max " + str.tostring(maxTries) + " tries | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%) / TP2 " + str.tostring(tp2RR, "#.##") + "R" + (beOn ? " BE" : "") +
          (trendOn ? " | SMA" + str.tostring(trendLen) : "") +
          (useHtfLv ? " | levels: " + (useChartLv ? "chart + " : "") + htfIn : "") +
          (minTouches > 1 ? " | min " + str.tostring(minTouches) + " swings" : "")
-    cellTxt(0, 0, "S/R Flip v1.1 — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
+    cellTxt(0, 0, "S/R Flip v1.2 — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Try 1", color.silver)
     cellTxt(2, 1, "Try 2", color.silver)
@@ -484,7 +533,7 @@ if barstate.islast
     cellTxt(0, 12, "Max drawdown")
     cellTxt(1, 12, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
     string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " try " + str.tostring(trTry + 1) + " | stop " +
-         str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) :
+         str.tostring(trS, format.mintick) + (trDone1 and p1 > 0 ? " (TP1 hit)" : " | TP1 " + str.tostring(trT1, format.mintick)) + " | TP2 " + str.tostring(trT, format.mintick) :
          actOn ? "Watching " + (actDir == 1 ? "support" : "resistance") + " " + str.tostring(actLvl, format.mintick) +
          " (" + str.tostring(actTries) + " tries used)" : "Flat"
     cellTxt(0, 13, "Current")

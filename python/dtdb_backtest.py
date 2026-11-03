@@ -191,6 +191,8 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
         return entry_px + direction * (p.rr if mult is None else mult) * abs(entry_px - stop_px)
 
     def new_ent(e, risk, stop, tp1, tp2):
+        if (tp1 - tp2) * t_dir > 0:            # TP1 never beyond TP2
+            tp1 = tp2
         return dict(e=e, risk=risk, stop=stop, tp1=tp1, tp2=tp2, done1=p1 <= 0, r=0.0, pct=0.0)
 
     def step(k, i, d, stop_only):
@@ -296,6 +298,8 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
                         if p.tgt_mode == "per_entry" or not p.use_entry1:
                             e2["tp1"] = tgt(d, fill_px, tStop, p.tp1_rr)
                             e2["tp2"] = tgt(d, fill_px, tStop)
+                            if (e2["tp1"] - e2["tp2"]) * d > 0:
+                                e2["tp1"] = e2["tp2"]
                     e2_pend, e2_open, e2_just = False, True, True
                     res.e2_fills += 1
             if e1_open and step(0, i, d, stop_only=False):
@@ -331,6 +335,7 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
             else:
                 a1, a2 = tgt(d, tE1, tStop, p.tp1_rr), tgt(d, tE1, tStop)
                 b1, b2 = tgt(d, tE2, tStop, p.tp1_rr), tgt(d, tE2, tStop)
+            t_dir = d
             ent[0] = new_ent(tE1, abs(tE1 - tStop), tStop, a1, a2)
             ent[1] = new_ent(tE2, abs(tE2 - tStop), tStop, b1, b2)
             tT2plan = b2

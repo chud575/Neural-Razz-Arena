@@ -1,0 +1,21 @@
+strategy                                      exits                        trades   win%    avgR    netR  maxDD
+S/R flip, monthly levels, rejection           Single 2R                       902   37.4  +0.086   +77.6   38.8
+S/R flip, monthly levels, rejection           Single 3R                       903   30.5  +0.168  +151.7   29.5
+S/R flip, monthly levels, rejection           TP1 1R 50% / TP2 2R, BE         865   50.6  +0.026   +22.2   40.8
+S/R flip, monthly levels, rejection           TP1 1R 50% / TP2 2R, no BE      894   38.5  +0.050   +44.8   37.8
+S/R flip, monthly levels, rejection           TP1 1R 50% / TP2 3R, BE         863   50.4  +0.024   +20.7   43.9
+S/R flip, daily levels, touch (baseline)      Single 2R                     13880   28.7  +0.007   +98.6  432.6
+S/R flip, daily levels, touch (baseline)      Single 3R                     13921   22.2  +0.025  +342.7  303.1
+S/R flip, daily levels, touch (baseline)      TP1 1R 50% / TP2 2R, BE       13015   38.3  -0.012  -153.8  412.7
+S/R flip, daily levels, touch (baseline)      TP1 1R 50% / TP2 2R, no BE    13418   31.6  -0.000    -2.3  410.1
+S/R flip, daily levels, touch (baseline)      TP1 1R 50% / TP2 3R, BE       12897   38.2  -0.007   -94.7  375.8
+Megaphone 5 swings, expand 0.5 ATR, BO close  Single 2R                       243   40.7  +0.229   +55.6   10.1
+Megaphone 5 swings, expand 0.5 ATR, BO close  Single 3R                       242   33.5  +0.328   +79.3   12.1
+Megaphone 5 swings, expand 0.5 ATR, BO close  TP1 1R 50% / TP2 2R, BE         243   52.3  +0.110   +26.8    9.8
+Megaphone 5 swings, expand 0.5 ATR, BO close  TP1 1R 50% / TP2 2R, no BE      243   42.0  +0.136   +33.0    9.3
+Megaphone 5 swings, expand 0.5 ATR, BO close  TP1 1R 50% / TP2 3R, BE         242   52.1  +0.142   +34.2    8.7
+Megaphone 4 swings, BO close                  Single 2R                      2236   35.8  +0.059  +132.2   69.1
+Megaphone 4 swings, BO close                  Single 3R                      2206   27.6  +0.070  +153.7  107.1
+Megaphone 4 swings, BO close                  TP1 1R 50% / TP2 2R, BE        2247   51.5  +0.039   +86.8   54.5
+Megaphone 4 swings, BO close                  TP1 1R 50% / TP2 2R, no BE     2234   37.1  +0.047  +106.1   58.2
+Megaphone 4 swings, BO close                  TP1 1R 50% / TP2 3R, BE        2234   51.3  +0.030   +66.5   69.4
