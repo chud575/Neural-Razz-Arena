@@ -30,6 +30,8 @@ entries measure R from the planned price.
 """
 from __future__ import annotations
 
+__version__ = "1.1"  # same version as pine/megaphone.pine
+
 import argparse
 import math
 import sys

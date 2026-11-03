@@ -23,6 +23,8 @@ the same bar; limit fills only check the stop on the fill bar; gaps fill at the 
 """
 from __future__ import annotations
 
+__version__ = "1.1"  # same version as pine/sr_flip.pine
+
 import argparse
 import math
 import sys

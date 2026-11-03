@@ -1,4 +1,12 @@
 //@version=6
+// Double Top / Bottom – 2-Stage Entry   ·   v1.4
+// Changelog
+//  v1.4  Entry lines: dashed = potential entry (pending neckline / unfilled Entry 2), solid = active entry
+//  v1.3  Limit entries keep planned risk/target on gap fills (no tiny-risk outliers)
+//  v1.2  Toggles: Entry 1 on/off, Entry 2 mode (off / midpoint / retest / retest + confirm), R:R, trend filter
+//  v1.1  Converted to an indicator with a simulated performance table
+//  v1.0  First version (strategy)
+//
 // Double Top / Double Bottom indicator with a two-stage entry plan and a built-in
 // historical performance tracker (no strategy engine — trades are simulated bar by bar).
 //
@@ -15,7 +23,7 @@
 //  • Limit entries keep their planned target/risk on gap fills; confirm entries use the actual close.
 //  • Gaps through a stop/target/limit fill at the bar's open.
 //  • Only one pattern trade is tracked at a time; new signals are ignored while a trade is live.
-indicator("Double Top / Bottom – 2-Stage Entry", shorttitle = "DT/DB 2-Entry", overlay = true,
+indicator("Double Top / Bottom – 2-Stage Entry v1.4", shorttitle = "DT/DB v1.4", overlay = true,
      max_bars_back = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -235,6 +243,9 @@ bool e2Retest   = e2Mode == "Retest" or e2Confirm
 bool perEntry   = tgtMode == "Per entry" or not useE1 or not useE2
 smaV            = ta.sma(close, trendLen)
 
+bool e2FilledNow = false     // set when Entry 2 fills on this bar (for the entry lines)
+bool newSig      = false     // set when a new trade plan starts on this bar
+
 if tDir != 0 and bar_index > sigBar
     string side = tDir == 1 ? "Long" : "Short"
 
@@ -252,6 +263,7 @@ if tDir != 0 and bar_index > sigBar
             e2Pend       := false
             e2Open       := true
             e2JustFilled := true
+            e2FilledNow  := true
             int fi = tDir == 1 ? 0 : 1
             array.set(aFill, fi, array.get(aFill, fi) + 1)
             alert(side + " Entry 2 filled on " + syminfo.ticker + " @ " + str.tostring(tE2Fill, format.mintick), alert.freq_once_per_bar)
@@ -335,13 +347,12 @@ if shortSig or longSig
         e2Open  := false
         e2Pend  := useE2
         sigBar  := bar_index
+        newSig  := true
         int si = d == 1 ? 0 : 1
         array.set(aSig, si, array.get(aSig, si) + 1)
 
         if showLevels
             drawPattern(pB1, pP1, pNB, neck, pB2, pP2, close, d == 1 ? color.green : color.red, d == 1 ? "DB" : "DT")
-            if useE2
-                drawLevel(e2, color.orange, e2Retest ? "Retest entry" : "Entry 2")
             drawLevel(stopL, color.red, "Stop")
             if useE1
                 drawLevel(t1, color.green, perEntry ? "TP 1" : "TP")
@@ -353,15 +364,67 @@ if shortSig or longSig
              (useE2 ? " | E2 (" + e2Mode + ") " + str.tostring(e2, format.mintick) + " TP2 " + str.tostring(t2, format.mintick) : "") +
              " | Stop " + str.tostring(stopL, format.mintick), alert.freq_once_per_bar_close)
 
-// Live necklines of pending (not yet broken) patterns
-plot(dtPend ? dtNeck : na, "Pending DT neckline", color.new(color.red, 30),   2, plot.style_linebr)
-plot(dbPend ? dbNeck : na, "Pending DB neckline", color.new(color.green, 30), 2, plot.style_linebr)
+// ───────────────── Entry lines: DASHED = potential entry, SOLID = active entry ─────────────────
+var line dtPotL   = na      // dashed: neckline of a pending double top (potential short entry on a close below)
+var line dbPotL   = na      // dashed: neckline of a pending double bottom (potential long entry on a close above)
+var int  dtPotSet = na
+var int  dbPotSet = na
+var line e1Line   = na      // solid while Entry 1 is open
+var line e2Line   = na      // dashed while Entry 2 waits to fill, solid once filled
+var bool e2Solid  = false
+
+// potential breakout entries (necklines of patterns waiting for a breakout)
+if dtPend and showLevels
+    if na(dtPotSet) or dtPotSet != dtSetBar       // new pattern (or replaced one)
+        line.delete(dtPotL)
+        dtPotL   := line.new(dtNeckB, dtNeck, bar_index, dtNeck, color = color.new(color.red, 0), width = 2, style = line.style_dashed)
+        dtPotSet := dtSetBar
+    else
+        line.set_x2(dtPotL, bar_index)
+if not dtPend and not na(dtPotL)                  // broke out (solid entry line takes over) or invalidated
+    line.delete(dtPotL)
+    dtPotL   := na
+    dtPotSet := na
+if dbPend and showLevels
+    if na(dbPotSet) or dbPotSet != dbSetBar
+        line.delete(dbPotL)
+        dbPotL   := line.new(dbNeckB, dbNeck, bar_index, dbNeck, color = color.new(color.green, 0), width = 2, style = line.style_dashed)
+        dbPotSet := dbSetBar
+    else
+        line.set_x2(dbPotL, bar_index)
+if not dbPend and not na(dbPotL)
+    line.delete(dbPotL)
+    dbPotL   := na
+    dbPotSet := na
+
+// Entry 1: solid from the breakout bar until it exits
+if newSig and useE1 and showLevels
+    e1Line := line.new(bar_index, tE1, bar_index, tE1, color = color.blue, width = 2, style = line.style_solid)
+    label.new(bar_index, tE1, "E1 " + str.tostring(tE1, format.mintick), style = label.style_label_right,
+         color = color.new(color.blue, 80), textcolor = color.blue, size = size.small)
+if not na(e1Line)
+    line.set_x2(e1Line, bar_index)
+    if not e1Open
+        e1Line := na                              // trade closed: stop extending
+
+// Entry 2: dashed while the limit is waiting, solid from the fill until it exits
+if newSig and useE2 and showLevels
+    e2Line  := line.new(bar_index, tE2, bar_index, tE2, color = color.orange, width = 2, style = line.style_dashed)
+    e2Solid := false
+    label.new(bar_index, tE2, (e2Retest ? "Retest entry " : "E2 limit ") + str.tostring(tE2, format.mintick),
+         style = label.style_label_right, color = color.new(color.orange, 80), textcolor = color.orange, size = size.small)
+if not na(e2Line)
+    line.set_x2(e2Line, bar_index)
+    if e2FilledNow and not e2Solid
+        e2Line  := line.new(bar_index, tE2Fill, bar_index, tE2Fill, color = color.orange, width = 2, style = line.style_solid)
+        e2Solid := true
+    if (e2Solid and not e2Open) or (not e2Solid and not e2Pend)
+        e2Line := na                              // filled-and-closed, or cancelled: stop extending
 
 // Active trade levels
 plot(tDir != 0 ? tStop : na, "Active stop",     color.new(color.red, 0),    1, plot.style_linebr)
 plot(tDir != 0 and e1Open ? tT1 : na, "Active TP 1", color.new(color.green, 0), 1, plot.style_linebr)
 plot(tDir != 0 and (e2Open or e2Pend) ? tT2 : na, "Active TP 2", color.new(color.teal, 0), 1, plot.style_linebr)
-plot(tDir != 0 and e2Pend ? tE2 : na, "Pending Entry 2", color.new(color.orange, 0), 1, plot.style_linebr)
 
 // ─────────────────────────── Stats table ───────────────────────────
 tblPos = switch tblPosIn
@@ -433,7 +496,7 @@ if barstate.islast
     hdrBg = color.new(color.blue, 40)
     string cfg = (useE1 ? "Breakout" : "") + (useE1 and useE2 ? " + " : "") + (useE2 ? e2Mode : "") +
          (trendOn ? " | SMA" + str.tostring(trendLen) : "") + " | " + str.tostring(rr, "#.#") + ":1"
-    cellTxt(0, 0, "DT/DB — Historical Performance  (" + cfg + ")", color.white, hdrBg)
+    cellTxt(0, 0, "DT/DB v1.4 — Historical Performance  (" + cfg + ")", color.white, hdrBg)
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Entry 1", color.silver)
     cellTxt(2, 1, "Entry 2", color.silver)

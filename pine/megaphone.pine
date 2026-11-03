@@ -1,4 +1,10 @@
 //@version=6
+// Megaphone – Broadening Formation   ·   v1.1
+// Changelog
+//  v1.1  Tightening toggles: min expansion (× ATR), swings-on-lines fit, breakout retest entry,
+//        measured-move target, failed-breakout fade (+ Failed BO column in the table)
+//  v1.0  First version: edge fades (touch / rejection) and breakouts, stats table
+//
 // Megaphone (broadening formation) indicator with a built-in performance tracker.
 // Python twin: python/megaphone_backtest.py (same rules, so the numbers should match).
 //
@@ -17,7 +23,7 @@
 //             stop beyond the breakout's extreme, target as for fades.
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill only
 // checks its stop on the fill bar; gaps fill at the open; one trade at a time.
-indicator("Megaphone – Broadening Formation", shorttitle = "Megaphone", overlay = true,
+indicator("Megaphone – Broadening Formation v1.1", shorttitle = "Megaphone v1.1", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -501,7 +507,7 @@ if barstate.islast
          (doFade ? " | fade: " + fadeEntry + " → " + fadeTgt : "") +
          (doBrk ? " | BO: " + boEntry + " → " + boTarget : "") + (failedBo ? " | failed-BO fade" : "") +
          " | " + str.tostring(rr, "#.#") + ":1" + (trendOn ? " | SMA" + str.tostring(trendLen) : "")
-    cellTxt(0, 0, "Megaphone — Historical Performance  (" + cfg + ")", color.white, color.new(color.orange, 40))
+    cellTxt(0, 0, "Megaphone v1.1 — Historical Performance  (" + cfg + ")", color.white, color.new(color.orange, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Edge fade", color.silver)
     cellTxt(2, 1, "Breakout", color.silver)

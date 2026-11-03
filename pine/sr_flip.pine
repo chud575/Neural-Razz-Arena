@@ -1,4 +1,9 @@
 //@version=6
+// S/R Flip – Break & Retest   ·   v1.1
+// Changelog
+//  v1.1  Levels from a higher timeframe (or both), merge nearby swings into zones, min-swings (strength) filter
+//  v1.0  First version: touch / rejection / sweep entries, multiple tries per level, stats table by attempt
+//
 // S/R Flip (break & retest / liquidity sweep) indicator with a built-in performance tracker.
 // Python twin: python/srflip_backtest.py (same rules, so the numbers should match).
 //
@@ -16,7 +21,7 @@
 //
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill
 // only checks its stop on the fill bar; gaps fill at the open; one trade at a time.
-indicator("S/R Flip – Break & Retest", shorttitle = "SR Flip", overlay = true,
+indicator("S/R Flip – Break & Retest v1.1", shorttitle = "SR Flip v1.1", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -448,7 +453,7 @@ if barstate.islast
          (trendOn ? " | SMA" + str.tostring(trendLen) : "") +
          (useHtfLv ? " | levels: " + (useChartLv ? "chart + " : "") + htfIn : "") +
          (minTouches > 1 ? " | min " + str.tostring(minTouches) + " swings" : "")
-    cellTxt(0, 0, "S/R Flip — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
+    cellTxt(0, 0, "S/R Flip v1.1 — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Try 1", color.silver)
     cellTxt(2, 1, "Try 2", color.silver)

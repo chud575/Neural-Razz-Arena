@@ -21,6 +21,8 @@ Examples:
 """
 from __future__ import annotations
 
+__version__ = "1.4"  # same version as pine/double_top_bottom_2entry.pine
+
 import argparse
 import json
 import math
