@@ -55,13 +55,13 @@ def load(data_dir: str, tfs):
 EXITS = [("single", dict(tp1_pct=0.0)), ("TP1 1R 50% BE", dict(tp1_pct=50.0, tp1_rr=1.0, be_after_tp1=True))]
 
 
-def grid_dtdb(tf):
+def grid_dtdb(tf, tols=(0.3, 0.6, 1.0)):
     setups = [("B+Mid", dict(use_entry1=True, entry2_mode="midpoint")), ("B", dict(use_entry1=True, entry2_mode="off")),
               ("Retest", dict(use_entry1=False, entry2_mode="retest")),
               ("RetestConf", dict(use_entry1=False, entry2_mode="retest_confirm")),
               ("B+Retest", dict(use_entry1=True, entry2_mode="retest"))]
     for piv, tol, depth, (sn, s), rr, trend, (en, e) in itertools.product(
-            (3, 5, 8), (0.3, 0.6, 1.0), (0.5, 1.0, 2.0), setups, (1.5, 2.0, 3.0), ("off", "sma"), EXITS):
+            (3, 5, 8), tols, (0.5, 1.0, 2.0), setups, (1.5, 2.0, 3.0), ("off", "sma"), EXITS):
         yield (f"piv{piv} tol{tol} depth{depth} {sn} {rr:g}R trend:{trend} exit:{en}",
                dict(piv_len=piv, tol_pct=tol, min_depth=depth, rr=rr, trend_filter=trend, **s, **e))
 
@@ -97,7 +97,14 @@ def grid_megaphone(tf):
                dict(piv_len=piv, min_pivots=npv, min_expand_atr=exp, trend_filter=trend, **c, **e))
 
 
-STRATS = {"dtdb": (DT, DT.Params, grid_dtdb), "srflip": (SR, SR.SRParams, grid_srflip),
+def grid_ttb(tf):
+    """Triple top / bottom: same grid as double with peaks=3, but wider peak tolerances (three peaks within
+    1% of each other almost never happens on BTC 4h / daily)."""
+    for name, kw in grid_dtdb(tf, tols=(1.0, 2.0, 3.0)):
+        yield name, dict(kw, peaks=3)
+
+
+STRATS = {"dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
           "megaphone": (MP, MP.MPParams, grid_megaphone)}
 
 

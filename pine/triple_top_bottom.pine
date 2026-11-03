@@ -1,0 +1,698 @@
+//@version=6
+// Triple Top / Bottom – 2-Stage Entry   ·   v1.0
+// Changelog
+//  v1.0  First version: identical to Double Top / Bottom v1.5 except the pattern needs THREE peaks/troughs
+//        (all within the tolerance), and the neckline is the lowest low (top) / highest high (bottom)
+//        across both dips between them.
+//
+// Triple Top / Triple Bottom indicator with a two-stage entry plan and a built-in
+// historical performance tracker (no strategy engine — trades are simulated bar by bar).
+//
+//  • Entry 1 (toggle): on the bar that CLOSES through the neckline (breakout), at that close.
+//  • Entry 2 (mode):   Off | Midpoint between neckline and pattern extreme | Retest of the neckline |
+//                      Retest + confirm (touch neckline, close back on the breakout side).
+//  • Optional SMA trend filter (longs above, shorts below).
+//  • Stop:    just beyond the pattern extreme (optional buffer).
+//  • Targets: TP1 and TP2 as multiples of risk (default 1R / 2R). A chosen % of each entry closes at TP1,
+//             the rest rides to TP2; the stop can move to breakeven after TP1. Per entry or blended average entry.
+//             After TP1 fills, the remainder is managed from the next bar (no same-bar guessing).
+//
+// Simulation rules (conservative):
+//  • If the stop and target are both touched in the same bar, the stop is assumed hit first.
+//  • On the bar a limit Entry 2 fills, only its stop is checked (no same-bar target).
+//  • Limit entries keep their planned target/risk on gap fills; confirm entries use the actual close.
+//  • Gaps through a stop/target/limit fill at the bar's open.
+//  • Only one pattern trade is tracked at a time; new signals are ignored while a trade is live.
+indicator("Triple Top / Bottom – 2-Stage Entry v1.0", shorttitle = "TT/TB v1.0", overlay = true,
+     max_bars_back = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpP = "Pattern detection"
+pivLen   = input.int(5,     "Pivot strength (bars each side)",          minval = 1,                group = grpP)
+tolPct   = input.float(0.5, "Max difference between the 3 peaks (%)",   minval = 0.0, step = 0.1,  group = grpP,
+     tooltip = "Highest peak minus lowest peak, as % of the highest (troughs: as % of the lowest).")
+minSep   = input.int(10,    "Min bars between peaks",                   minval = 2,                group = grpP)
+maxSep   = input.int(100,   "Max bars between peaks",                   minval = 5, maxval = 200,  group = grpP,
+     tooltip = "Applies to each gap (peak 1 → 2 and peak 2 → 3).")
+minDepth = input.float(1.0, "Min pattern height (% of price)",          minval = 0.0, step = 0.1,  group = grpP)
+maxWait  = input.int(30,    "Max bars after 2nd peak to wait for breakout", minval = 1,           group = grpP)
+
+grpT = "Trade plan"
+tradeLongs  = input.bool(true,  "Signal triple bottoms (long)", group = grpT)
+tradeShorts = input.bool(true,  "Signal triple tops (short)",   group = grpT)
+tp1RR       = input.float(1.0,  "TP1 (reward : risk)",          minval = 0.1, step = 0.1, group = grpT,
+     tooltip = "TP1 distance as a multiple of the risk (entry → stop). 1 = 1:1.")
+tp2RR       = input.float(2.0,  "TP2 (reward : risk)",          minval = 0.1, step = 0.1, group = grpT,
+     tooltip = "TP2 distance as a multiple of the risk. Should be larger than TP1.")
+tp1Pct      = input.float(50,   "% of each entry closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
+     tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
+beOn        = input.bool(true,  "Move stop to breakeven after TP1", group = grpT)
+tgtMode     = input.string("Per entry", "Target mode", options = ["Per entry", "Blended average entry"], group = grpT,
+     tooltip = "Per entry: each entry's TP1/TP2 are measured from its own entry price to the stop.\nBlended: both entries share TP1/TP2, measured from the average of the two entry prices.")
+p1          = tp1Pct / 100.0
+stopBufPct  = input.float(0.0,  "Stop buffer beyond extreme (% of pattern height)", minval = 0.0, step = 5.0, group = grpT)
+e2Expiry    = input.int(50,     "Cancel unfilled 2nd entry after N bars (0 = never)", minval = 0, group = grpT)
+
+grpE = "Strategy toggles"
+useE1    = input.bool(true, "Entry 1: enter at breakout close", group = grpE)
+e2Mode   = input.string("Midpoint", "Entry 2 mode", options = ["Off", "Midpoint", "Retest", "Retest + confirm"], group = grpE,
+     tooltip = "Off: no second entry.\nMidpoint: limit halfway between neckline and pattern top/bottom.\nRetest: limit at the neckline (retest of the breakout point).\nRetest + confirm: a bar touches the neckline and closes back on the breakout side; enter at that close.\nRetest modes are cancelled if price reaches the target or the stop level first.")
+trendOn  = input.bool(false, "Trend filter (longs above SMA, shorts below)", group = grpE)
+trendLen = input.int(200, "Trend SMA length", minval = 2, group = grpE)
+
+grpV = "Visuals"
+showLevels = input.bool(true, "Draw pattern & trade levels", group = grpV)
+showExits  = input.bool(true, "Label trade exits",           group = grpV)
+levelLen   = input.int(25, "Level line length (bars)", minval = 5, group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+drawLevel(float y, color c, string txt) =>
+    line.new(bar_index, y, bar_index + levelLen, y, color = c, style = line.style_dashed, width = 1)
+    label.new(bar_index + levelLen, y, txt + "  " + str.tostring(y, format.mintick),
+         style = label.style_label_left, color = color.new(c, 85), textcolor = c, size = size.small)
+
+// Zig-zag peak 1 → dip 1 → peak 2 → dip 2 → peak 3 → breakout, plus a dotted neckline
+drawPattern(int b1, float p1, int t1b, float t1, int b2, float p2, int t2b, float t2, int b3, float p3,
+     int nb, float n, float brk, color c, string txt) =>
+    line.new(b1, p1, t1b, t1, color = c, width = 2)
+    line.new(t1b, t1, b2, p2, color = c, width = 2)
+    line.new(b2, p2, t2b, t2, color = c, width = 2)
+    line.new(t2b, t2, b3, p3, color = c, width = 2)
+    line.new(b3, p3, bar_index, brk, color = c, width = 2)
+    line.new(nb, n, bar_index, n, color = color.gray, style = line.style_dotted)
+    label.new(b3, p3, txt, style = txt == "TT" ? label.style_label_down : label.style_label_up,
+         color = c, textcolor = color.white, size = size.small)
+
+// ─────────────────────── Performance storage ───────────────────────
+// Index = (long ? 0 : 2) + entry   where entry 0 = Entry 1, entry 1 = Entry 2
+var array<float> aWins = array.new<float>(4, 0.0)
+var array<float> aLoss = array.new<float>(4, 0.0)
+var array<float> aSumR = array.new<float>(4, 0.0)
+var array<float> aGW   = array.new<float>(4, 0.0)   // gross winning R
+var array<float> aGL   = array.new<float>(4, 0.0)   // gross losing R (positive number)
+var array<float> aPct  = array.new<float>(4, 0.0)   // summed % return per entry
+var array<float> aSig  = array.new<float>(2, 0.0)   // signals  [long, short]
+var array<float> aFill = array.new<float>(2, 0.0)   // entry-2 fills [long, short]
+var array<float> eq    = array.new<float>(3, 0.0)   // [cumulative R, peak R, max drawdown R]
+
+// Record one finished entry: r = total R (TP1 part + remainder), pct = total % return
+recordTrade(int dir, int entry, float r, float pct) =>
+    int idx = (dir == 1 ? 0 : 2) + entry
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    array.set(aPct,  idx, array.get(aPct, idx) + pct)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+// Advance one open entry by one bar.
+// Returns [stillOpen, tp1Done, stop, totalR, totalPct, tp1FillPx (na = none), finalExitPx (na = none), exitTag]
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn, float pIn, bool stopOnly) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  accP  = pIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 ? 1.0 - p1 : 1.0
+    if p1 <= 0
+        rem := 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit                                            // stop (or breakeven stop) first
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else if not stopOnly
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            accP  += p1 * d * (t1Px - ePx) / ePx * 100.0
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false                               // everything closed at TP1
+            else if beOn
+                st := ePx                                 // remainder: stop to breakeven, managed from next bar
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP2"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        accP += rem * d * (xPx - ePx) / ePx * 100.0
+        op   := false
+    [op, done1, st, accR, accP, t1Px, xPx, tag]
+
+exitLabel(float px, int dir, string txt, float r) =>
+    if showExits
+        bool win = r > 0
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = dir == -1 ? (win ? label.style_label_up : label.style_label_down) : (win ? label.style_label_down : label.style_label_up),
+             color = win ? color.new(color.green, 20) : color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── Pivots ─────────────────────────────
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+// last two confirmed swing highs / lows (1 = older, 2 = newer)
+var float ph1  = na
+var int   ph1B = na
+var float ph2  = na
+var int   ph2B = na
+var float pl1  = na
+var int   pl1B = na
+var float pl2  = na
+var int   pl2B = na
+
+// Pending (detected but not yet broken) patterns.  dt* = triple TOP, db* = triple BOTTOM
+var bool  dtPend   = false
+var float dtP1     = na
+var float dtP2     = na
+var float dtP3     = na
+var int   dtB1     = na
+var int   dtB2     = na
+var int   dtB3     = na
+var float dtT1     = na      // dip between peaks 1 and 2
+var int   dtT1B    = na
+var float dtT2     = na      // dip between peaks 2 and 3
+var int   dtT2B    = na
+var float dtTop    = na
+var float dtNeck   = na
+var int   dtNeckB  = na
+var int   dtSetBar = na
+
+var bool  dbPend   = false
+var float dbP1     = na
+var float dbP2     = na
+var float dbP3     = na
+var int   dbB1     = na
+var int   dbB2     = na
+var int   dbB3     = na
+var float dbT1     = na
+var int   dbT1B    = na
+var float dbT2     = na
+var int   dbT2B    = na
+var float dbBot    = na
+var float dbNeck   = na
+var int   dbNeckB  = na
+var int   dbSetBar = na
+
+// ───────────────────── Triple TOP detection ─────────────────────
+if not na(ph)
+    int   b3 = bar_index - pivLen
+    float p3 = ph
+    if tradeShorts and not na(ph1)
+        int   s12  = ph2B - ph1B
+        int   s23  = b3 - ph2B
+        float hiP  = math.max(ph1, math.max(ph2, p3))
+        float loP  = math.min(ph1, math.min(ph2, p3))
+        float diff = (hiP - loP) / hiP * 100.0
+        if s12 >= minSep and s12 <= maxSep and s23 >= minSep and s23 <= maxSep and diff <= tolPct
+            int   off2  = bar_index - ph2B            // offset of peak 2
+            int   off1  = bar_index - ph1B            // offset of peak 1
+            float t2    = low[pivLen + 1]             // dip between peaks 2 and 3
+            int   t2Off = pivLen + 1
+            float t1    = low[off2 + 1]               // dip between peaks 1 and 2
+            int   t1Off = off2 + 1
+            float hiMid = high[pivLen + 1]
+            for off = pivLen + 1 to off1 - 1
+                hiMid := math.max(hiMid, high[off])
+                if off < off2 and low[off] < t2
+                    t2    := low[off]
+                    t2Off := off
+                if off > off2 and low[off] < t1
+                    t1    := low[off]
+                    t1Off := off
+            float neck    = math.min(t1, t2)
+            int   neckOff = t1 < t2 ? t1Off : t2Off
+            // already broken (or invalidated) during the pivot confirmation bars?
+            bool stale = false
+            if pivLen > 1
+                for off = 1 to pivLen - 1
+                    if close[off] < neck or close[off] > hiP
+                        stale := true
+            float heightPct = (hiP - neck) / hiP * 100.0
+            if hiMid <= hiP and heightPct >= minDepth and not stale
+                dtPend   := true
+                dtP1     := ph1
+                dtB1     := ph1B
+                dtP2     := ph2
+                dtB2     := ph2B
+                dtP3     := p3
+                dtB3     := b3
+                dtT1     := t1
+                dtT1B    := bar_index - t1Off
+                dtT2     := t2
+                dtT2B    := bar_index - t2Off
+                dtTop    := hiP
+                dtNeck   := neck
+                dtNeckB  := bar_index - neckOff
+                dtSetBar := bar_index
+    ph1  := ph2
+    ph1B := ph2B
+    ph2  := p3
+    ph2B := b3
+
+// ──────────────────── Triple BOTTOM detection ────────────────────
+if not na(pl)
+    int   b3 = bar_index - pivLen
+    float p3 = pl
+    if tradeLongs and not na(pl1)
+        int   s12  = pl2B - pl1B
+        int   s23  = b3 - pl2B
+        float hiP  = math.max(pl1, math.max(pl2, p3))
+        float loP  = math.min(pl1, math.min(pl2, p3))
+        float diff = (hiP - loP) / loP * 100.0
+        if s12 >= minSep and s12 <= maxSep and s23 >= minSep and s23 <= maxSep and diff <= tolPct
+            int   off2  = bar_index - pl2B
+            int   off1  = bar_index - pl1B
+            float t2    = high[pivLen + 1]            // rally between troughs 2 and 3
+            int   t2Off = pivLen + 1
+            float t1    = high[off2 + 1]              // rally between troughs 1 and 2
+            int   t1Off = off2 + 1
+            float loMid = low[pivLen + 1]
+            for off = pivLen + 1 to off1 - 1
+                loMid := math.min(loMid, low[off])
+                if off < off2 and high[off] > t2
+                    t2    := high[off]
+                    t2Off := off
+                if off > off2 and high[off] > t1
+                    t1    := high[off]
+                    t1Off := off
+            float neck    = math.max(t1, t2)
+            int   neckOff = t1 > t2 ? t1Off : t2Off
+            bool stale = false
+            if pivLen > 1
+                for off = 1 to pivLen - 1
+                    if close[off] > neck or close[off] < loP
+                        stale := true
+            float heightPct = (neck - loP) / loP * 100.0
+            if loMid >= loP and heightPct >= minDepth and not stale
+                dbPend   := true
+                dbP1     := pl1
+                dbB1     := pl1B
+                dbP2     := pl2
+                dbB2     := pl2B
+                dbP3     := p3
+                dbB3     := b3
+                dbT1     := t1
+                dbT1B    := bar_index - t1Off
+                dbT2     := t2
+                dbT2B    := bar_index - t2Off
+                dbBot    := loP
+                dbNeck   := neck
+                dbNeckB  := bar_index - neckOff
+                dbSetBar := bar_index
+    pl1  := pl2
+    pl1B := pl2B
+    pl2  := p3
+    pl2B := b3
+
+// ─────────────────── Pending pattern invalidation ───────────────────
+if dtPend and (close > dtTop or bar_index - dtSetBar > maxWait)
+    dtPend := false
+if dbPend and (close < dbBot or bar_index - dbSetBar > maxWait)
+    dbPend := false
+
+// ───────────────────── Simulated trade state ─────────────────────
+var int   tDir    = 0        // 1 long, -1 short, 0 flat
+var float tE1     = na       // entry 1 price
+var float tE2     = na       // entry 2 level (midpoint or neckline)
+var float tE2Fill = na       // entry 2 actual fill price
+var float tStop   = na       // pattern stop (both entries start here)
+var float tT2Plan = na       // entry 2 TP2 from the planned level (used to cancel un-retested setups)
+var bool  e1Open  = false
+var bool  e2Open  = false
+// per-entry exit state: risk unit, current stop (moves to breakeven), TP1, TP2, TP1 done, running R and %
+var float e1Risk  = na
+var float e1Stop  = na
+var float e1Tp1   = na
+var float e1Tp2   = na
+var bool  e1Done1 = false
+var float e1R     = 0.0
+var float e1P     = 0.0
+var float e2Risk  = na
+var float e2Stop  = na
+var float e2Tp1   = na
+var float e2Tp2   = na
+var bool  e2Done1 = false
+var float e2R     = 0.0
+var float e2P     = 0.0
+var bool  e2Pend  = false
+var int   sigBar  = na
+
+bool useE2      = e2Mode != "Off"
+bool e2Confirm  = e2Mode == "Retest + confirm"
+bool e2Retest   = e2Mode == "Retest" or e2Confirm
+bool perEntry   = tgtMode == "Per entry" or not useE1 or not useE2
+smaV            = ta.sma(close, trendLen)
+
+bool e2FilledNow = false     // set when Entry 2 fills on this bar (for the entry lines)
+bool newSig      = false     // set when a new trade plan starts on this bar
+
+if tDir != 0 and bar_index > sigBar
+    string side = tDir == 1 ? "Long" : "Short"
+
+    // 1) Entry 2 fill
+    bool e2JustFilled = false
+    if e2Pend
+        bool  touched = tDir == -1 ? high >= tE2 : low <= tE2
+        bool  filled  = e2Confirm ? touched and (tDir == -1 ? close < tE2 : close > tE2) : touched
+        float fillPx  = e2Confirm ? close : tDir == -1 ? math.max(open, tE2) : math.min(open, tE2)
+        bool  sane    = tDir == -1 ? fillPx < tStop : fillPx > tStop     // never fill beyond the stop
+        if filled and sane
+            tE2Fill      := fillPx
+            // limit fills keep the planned risk/targets; confirm fills (at a known close) use the actual fill
+            e2Risk       := e2Confirm ? math.abs(fillPx - tStop) : math.abs(tE2 - tStop)
+            if perEntry and e2Confirm
+                e2Tp1 := fillPx + tDir * tp1RR * e2Risk
+                e2Tp2 := fillPx + tDir * tp2RR * e2Risk
+                e2Tp1 := (e2Tp1 - e2Tp2) * tDir > 0 ? e2Tp2 : e2Tp1
+            e2Stop       := tStop
+            e2Done1      := p1 <= 0
+            e2R          := 0.0
+            e2P          := 0.0
+            e2Pend       := false
+            e2Open       := true
+            e2JustFilled := true
+            e2FilledNow  := true
+            int fi = tDir == 1 ? 0 : 1
+            array.set(aFill, fi, array.get(aFill, fi) + 1)
+            alert(side + " Entry 2 filled on " + syminfo.ticker + " @ " + str.tostring(tE2Fill, format.mintick), alert.freq_once_per_bar)
+
+    // 2) Exits: stop first, then TP1 (partial), then TP2 for the remainder
+    if e1Open
+        [op1, dn1, st1, ar1, ap1, tp1Fill1, x1, tag1] = stepEntry(tDir, tE1, e1Risk, e1Stop, e1Tp1, e1Tp2, e1Done1, e1R, e1P, false)
+        e1Done1 := dn1
+        e1Stop  := st1
+        e1R     := ar1
+        e1P     := ap1
+        if not na(tp1Fill1) and p1 < 1
+            exitLabel(tp1Fill1, tDir, "E1 TP1 " + str.tostring(tp1Pct) + "%", tDir * (tp1Fill1 - tE1) / e1Risk)
+        if not op1
+            recordTrade(tDir, 0, e1R, e1P)
+            exitLabel(na(x1) ? tp1Fill1 : x1, tDir, "E1 " + (tag1 == "" ? "TP1" : tag1) + " total", e1R)
+            e1Open := false
+
+    // confirm-mode fills happen at the close, so nothing else can happen to them on that bar
+    if e2Open and not (e2JustFilled and e2Confirm)
+        [op2, dn2, st2, ar2, ap2, tp1Fill2, x2, tag2] = stepEntry(tDir, tE2Fill, e2Risk, e2Stop, e2Tp1, e2Tp2, e2Done1, e2R, e2P, e2JustFilled)
+        e2Done1 := dn2
+        e2Stop  := st2
+        e2R     := ar2
+        e2P     := ap2
+        if not na(tp1Fill2) and p1 < 1
+            exitLabel(tp1Fill2, tDir, "E2 TP1 " + str.tostring(tp1Pct) + "%", tDir * (tp1Fill2 - tE2Fill) / e2Risk)
+        if not op2
+            recordTrade(tDir, 1, e2R, e2P)
+            exitLabel(na(x2) ? tp1Fill2 : x2, tDir, "E2 " + (tag2 == "" ? "TP1" : tag2) + " total", e2R)
+            e2Open := false
+
+    // 3) Cancel an unfilled Entry 2
+    if e2Pend
+        bool cancel = (useE1 and not e1Open) or (e2Expiry > 0 and bar_index - sigBar >= e2Expiry)
+        if e2Retest
+            cancel := cancel or (tDir == -1 ? low <= tT2Plan : high >= tT2Plan) or (tDir == -1 ? high >= tStop : low <= tStop)
+        if cancel
+            e2Pend := false
+
+    // 4) Trade finished?
+    if not e1Open and not e2Open and not e2Pend
+        tDir := 0
+
+// ───────────────────── New signals (breakout close through neckline) ─────────────────────
+bool shortSig = dtPend and tDir == 0 and close < dtNeck
+bool longSig  = not shortSig and dbPend and tDir == 0 and close > dbNeck
+
+if shortSig or longSig
+    int   d     = shortSig ? -1 : 1
+    float ext   = shortSig ? dtTop  : dbBot
+    float neck  = shortSig ? dtNeck : dbNeck
+    int   pB1   = shortSig ? dtB1 : dbB1
+    float pP1   = shortSig ? dtP1 : dbP1
+    int   pB2   = shortSig ? dtB2 : dbB2
+    float pP2   = shortSig ? dtP2 : dbP2
+    int   pB3   = shortSig ? dtB3 : dbB3
+    float pP3   = shortSig ? dtP3 : dbP3
+    int   pT1B  = shortSig ? dtT1B : dbT1B
+    float pT1   = shortSig ? dtT1 : dbT1
+    int   pT2B  = shortSig ? dtT2B : dbT2B
+    float pT2   = shortSig ? dtT2 : dbT2
+    int   pNB   = shortSig ? dtNeckB : dbNeckB
+    dtPend := false
+    dbPend := false
+
+    bool trendPass = not trendOn or (not na(smaV) and (d == 1 ? close > smaV : close < smaV))
+    if trendPass
+        float H     = math.abs(ext - neck)
+        float stopL = ext - d * H * stopBufPct / 100.0
+        float e1    = close
+        float e2    = e2Mode == "Midpoint" ? neck - d * H / 2.0 : neck
+        float avgE  = (e1 + e2) / 2.0
+        float r1    = math.abs(e1 - stopL)
+        float r2    = math.abs(e2 - stopL)
+        float rA    = math.abs(avgE - stopL)
+        float a1    = perEntry ? e1 + d * tp1RR * r1 : avgE + d * tp1RR * rA     // Entry 1 TP1
+        float a2    = perEntry ? e1 + d * tp2RR * r1 : avgE + d * tp2RR * rA     // Entry 1 TP2
+        float b1    = perEntry ? e2 + d * tp1RR * r2 : a1                       // Entry 2 TP1
+        float b2    = perEntry ? e2 + d * tp2RR * r2 : a2                       // Entry 2 TP2
+        a1 := (a1 - a2) * d > 0 ? a2 : a1                                      // TP1 never beyond TP2
+        b1 := (b1 - b2) * d > 0 ? b2 : b1
+
+        tDir    := d
+        tE1     := e1
+        tE2     := e2
+        tStop   := stopL
+        tT2Plan := b2
+        e1Risk  := r1
+        e1Stop  := stopL
+        e1Tp1   := a1
+        e1Tp2   := a2
+        e1Done1 := p1 <= 0
+        e1R     := 0.0
+        e1P     := 0.0
+        e2Risk  := r2
+        e2Stop  := stopL
+        e2Tp1   := b1
+        e2Tp2   := b2
+        e1Open  := useE1
+        e2Open  := false
+        e2Pend  := useE2
+        sigBar  := bar_index
+        newSig  := true
+        int si = d == 1 ? 0 : 1
+        array.set(aSig, si, array.get(aSig, si) + 1)
+
+        if showLevels
+            drawPattern(pB1, pP1, pT1B, pT1, pB2, pP2, pT2B, pT2, pB3, pP3, pNB, neck, close,
+                 d == 1 ? color.green : color.red, d == 1 ? "TB" : "TT")
+            drawLevel(stopL, color.red, "Stop")
+            if useE1 or not perEntry
+                if p1 > 0
+                    drawLevel(a1, color.green, perEntry ? "E1 TP1" : "TP1")
+                if p1 < 1
+                    drawLevel(a2, color.green, perEntry ? "E1 TP2" : "TP2")
+            if useE2 and perEntry
+                if p1 > 0
+                    drawLevel(b1, color.teal, useE1 ? "E2 TP1" : "TP1")
+                if p1 < 1
+                    drawLevel(b2, color.teal, useE1 ? "E2 TP2" : "TP2")
+
+        alert((d == 1 ? "Triple BOTTOM breakout LONG on " : "Triple TOP breakout SHORT on ") + syminfo.ticker +
+             (useE1 ? " | E1 " + str.tostring(e1, format.mintick) + " TP1 " + str.tostring(a1, format.mintick) + " TP2 " + str.tostring(a2, format.mintick) : "") +
+             (useE2 ? " | E2 (" + e2Mode + ") " + str.tostring(e2, format.mintick) + " TP1 " + str.tostring(b1, format.mintick) + " TP2 " + str.tostring(b2, format.mintick) : "") +
+             " | Stop " + str.tostring(stopL, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────────────── Entry lines: DASHED = potential entry, SOLID = active entry ─────────────────
+var line dtPotL   = na      // dashed: neckline of a pending triple top (potential short entry on a close below)
+var line dbPotL   = na      // dashed: neckline of a pending triple bottom (potential long entry on a close above)
+var int  dtPotSet = na
+var int  dbPotSet = na
+var line e1Line   = na      // solid while Entry 1 is open
+var line e2Line   = na      // dashed while Entry 2 waits to fill, solid once filled
+var bool e2Solid  = false
+
+// potential breakout entries (necklines of patterns waiting for a breakout)
+if dtPend and showLevels
+    if na(dtPotSet) or dtPotSet != dtSetBar       // new pattern (or replaced one)
+        line.delete(dtPotL)
+        dtPotL   := line.new(dtNeckB, dtNeck, bar_index, dtNeck, color = color.new(color.red, 0), width = 2, style = line.style_dashed)
+        dtPotSet := dtSetBar
+    else
+        line.set_x2(dtPotL, bar_index)
+if not dtPend and not na(dtPotL)                  // broke out (solid entry line takes over) or invalidated
+    line.delete(dtPotL)
+    dtPotL   := na
+    dtPotSet := na
+if dbPend and showLevels
+    if na(dbPotSet) or dbPotSet != dbSetBar
+        line.delete(dbPotL)
+        dbPotL   := line.new(dbNeckB, dbNeck, bar_index, dbNeck, color = color.new(color.green, 0), width = 2, style = line.style_dashed)
+        dbPotSet := dbSetBar
+    else
+        line.set_x2(dbPotL, bar_index)
+if not dbPend and not na(dbPotL)
+    line.delete(dbPotL)
+    dbPotL   := na
+    dbPotSet := na
+
+// Entry 1: solid from the breakout bar until it exits
+if newSig and useE1 and showLevels
+    e1Line := line.new(bar_index, tE1, bar_index, tE1, color = color.blue, width = 2, style = line.style_solid)
+    label.new(bar_index, tE1, "E1 " + str.tostring(tE1, format.mintick), style = label.style_label_right,
+         color = color.new(color.blue, 80), textcolor = color.blue, size = size.small)
+if not na(e1Line)
+    line.set_x2(e1Line, bar_index)
+    if not e1Open
+        e1Line := na                              // trade closed: stop extending
+
+// Entry 2: dashed while the limit is waiting, solid from the fill until it exits
+if newSig and useE2 and showLevels
+    e2Line  := line.new(bar_index, tE2, bar_index, tE2, color = color.orange, width = 2, style = line.style_dashed)
+    e2Solid := false
+    label.new(bar_index, tE2, (e2Retest ? "Retest entry " : "E2 limit ") + str.tostring(tE2, format.mintick),
+         style = label.style_label_right, color = color.new(color.orange, 80), textcolor = color.orange, size = size.small)
+if not na(e2Line)
+    line.set_x2(e2Line, bar_index)
+    if e2FilledNow and not e2Solid
+        e2Line  := line.new(bar_index, tE2Fill, bar_index, tE2Fill, color = color.orange, width = 2, style = line.style_solid)
+        e2Solid := true
+    if (e2Solid and not e2Open) or (not e2Solid and not e2Pend)
+        e2Line := na                              // filled-and-closed, or cancelled: stop extending
+
+// Active trade levels
+// Active trade levels (Entry 1's while it is open, otherwise Entry 2's). Stop moves to breakeven after TP1 if enabled.
+bool  showE1 = tDir != 0 and e1Open
+bool  showE2 = tDir != 0 and not e1Open and (e2Open or e2Pend)
+float curStop = showE1 ? e1Stop : showE2 ? (e2Open ? e2Stop : tStop) : na
+float curTp1  = showE1 ? (e1Done1 ? na : e1Tp1) : showE2 ? (e2Done1 ? na : e2Tp1) : na
+float curTp2  = showE1 ? e1Tp2 : showE2 ? e2Tp2 : na
+plot(curStop, "Active stop", color.new(color.red, 0), 1, plot.style_linebr)
+plot(p1 > 0 ? curTp1 : na, "Active TP1", color.new(color.green, 0), 1, plot.style_linebr)
+plot(p1 < 1 ? curTp2 : na, "Active TP2", color.new(color.teal, 0), 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 18, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg, text_halign = c == 0 ? text.align_left : text.align_center)
+
+// Sum a stat array over the chosen indices
+sumIdx(array<float> a, int i1, int i2 = -1, int i3 = -1, int i4 = -1) =>
+    float s = array.get(a, i1)
+    if i2 >= 0
+        s += array.get(a, i2)
+    if i3 >= 0
+        s += array.get(a, i3)
+    if i4 >= 0
+        s += array.get(a, i4)
+    s
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+// Writes the metric rows for one column given the array indices it covers
+writeCol(int col, int i1, int i2, int i3 = -1, int i4 = -1) =>
+    float w   = sumIdx(aWins, i1, i2, i3, i4)
+    float l   = sumIdx(aLoss, i1, i2, i3, i4)
+    float n   = w + l
+    float r   = sumIdx(aSumR, i1, i2, i3, i4)
+    float gw  = sumIdx(aGW,   i1, i2, i3, i4)
+    float gl  = sumIdx(aGL,   i1, i2, i3, i4)
+    float pc  = sumIdx(aPct,  i1, i2, i3, i4)
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+    cellTxt(col, 8, (pc >= 0 ? "+" : "") + str.tostring(pc, "#.##") + "%", colR(pc))
+
+writeSide(int col, int iE1, int iE2, int rowWR, int rowR) =>
+    // iE1/iE2 = long or short indices for this column (-1 = not used)
+    int a = iE1 >= 0 ? iE1 : iE2
+    int b = iE1 >= 0 and iE2 >= 0 ? iE2 : -1
+    float w = sumIdx(aWins, a, b)
+    float l = sumIdx(aLoss, a, b)
+    float r = sumIdx(aSumR, a, b)
+    cellTxt(col, rowWR, fmtWR(w, l))
+    cellTxt(col, rowR,  fmtR(r), colR(r))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 13 to 16
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    hdrBg = color.new(color.blue, 40)
+    string cfg = (useE1 ? "Breakout" : "") + (useE1 and useE2 ? " + " : "") + (useE2 ? e2Mode : "") +
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "") + " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%) / TP2 " + str.tostring(tp2RR, "#.##") + "R" + (beOn ? " | BE after TP1" : "")
+    cellTxt(0, 0, "TT/TB v1.0 — Historical Performance  (" + cfg + ")", color.white, hdrBg)
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Entry 1", color.silver)
+    cellTxt(2, 1, "Entry 2", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Closed trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    cellTxt(0, 8, "Net % (summed)")
+    cellTxt(0, 9,  "Long win rate")
+    cellTxt(0, 10, "Long net R")
+    cellTxt(0, 11, "Short win rate")
+    cellTxt(0, 12, "Short net R")
+
+    writeCol(1, 0, 2)          // Entry 1 = long E1 + short E1
+    writeCol(2, 1, 3)          // Entry 2 = long E2 + short E2
+    writeCol(3, 0, 1, 2, 3)    // Total
+
+    writeSide(1, 0, -1, 9, 10)
+    writeSide(2, 1, -1, 9, 10)
+    writeSide(3, 0, 1, 9, 10)
+    writeSide(1, 2, -1, 11, 12)
+    writeSide(2, 3, -1, 11, 12)
+    writeSide(3, 2, 3, 11, 12)
+
+    float sigL  = array.get(aSig, 0)
+    float sigS  = array.get(aSig, 1)
+    float fills = array.get(aFill, 0) + array.get(aFill, 1)
+    float sigT  = sigL + sigS
+    cellTxt(0, 13, "Signals")
+    cellTxt(1, 13, str.tostring(sigT, "#") + "   (Long " + str.tostring(sigL, "#") + " / Short " + str.tostring(sigS, "#") + ")")
+    cellTxt(0, 14, "Entry 2 fill rate")
+    cellTxt(1, 14, sigT > 0 ? str.tostring(fills / sigT * 100.0, "#.#") + "%   (" + str.tostring(fills, "#") + " of " + str.tostring(sigT, "#") + ")" : "–")
+    cellTxt(0, 15, "Max drawdown")
+    cellTxt(1, 15, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+
+    string openTxt = "Flat"
+    if tDir != 0
+        openTxt := (tDir == 1 ? "LONG" : "SHORT") + " | E1 " + (not useE1 ? "off" : e1Open ? (e1Done1 and p1 > 0 ? "open, TP1 hit" : "open") : "closed") +
+             " | E2 " + (e2Open ? (e2Done1 and p1 > 0 ? "open, TP1 hit" : "open") : e2Pend ? "pending @ " + str.tostring(tE2, format.mintick) : "closed/none")
+    cellTxt(0, 16, "Current trade")
+    cellTxt(1, 16, openTxt, tDir == 1 ? color.lime : tDir == -1 ? color.red : color.white)

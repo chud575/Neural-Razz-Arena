@@ -16,7 +16,7 @@ import run_btc_sweep as S
 
 TF_ORDER = ["15m", "1h", "4h", "1d"]
 TF_NAME = {"15m": "15-minute", "1h": "1-hour", "4h": "4-hour", "1d": "Daily"}
-STRAT_NAME = {"dtdb": "Double Top / Bottom", "srflip": "S/R Flip", "megaphone": "Megaphone"}
+STRAT_NAME = {"dtdb": "Double Top / Bottom", "ttb": "Triple Top / Bottom", "srflip": "S/R Flip", "megaphone": "Megaphone"}
 
 
 def config_kwargs(strat: str, tf: str, name: str) -> dict:
@@ -56,7 +56,7 @@ def buy_hold(tf):
 def family(strat: str, cfg: str) -> str:
     """Entry-type family of a configuration (used to average over the fine-tuning knobs)."""
     tok = cfg.split()
-    if strat == "dtdb":
+    if strat in ("dtdb", "ttb"):
         return tok[3]                                   # B+Mid / B / Retest / RetestConf / B+Retest
     if strat == "srflip":
         lv = re.search(r"levels:(\S+)", cfg).group(1)
@@ -97,7 +97,7 @@ def main(argv=None):
         bh_is, bh_oos, t0, tk, t1 = buy_hold(tf)
         lines.append(f"\n## {TF_NAME[tf]}  (IS {t0.date()} → {tk.date()}, OOS {tk.date()} → {t1.date()}; "
                      f"BTC buy & hold: IS {bh_is:+.0f}%, OOS {bh_oos:+.0f}%)\n")
-        for strat in ("dtdb", "srflip", "megaphone"):
+        for strat in ("dtdb", "ttb", "srflip", "megaphone"):
             sub = df[(df.tf == tf) & (df.strategy == strat)]
             if sub.empty:
                 continue

@@ -44,6 +44,7 @@ import requests
 @dataclass
 class Params:
     # pattern detection
+    peaks: int = 2                     # 2 = double top/bottom, 3 = triple (pine/triple_top_bottom.pine)
     piv_len: int = 5
     tol_pct: float = 0.5
     min_sep: int = 10
@@ -175,6 +176,26 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
 
     last_ph = last_ph_bar = None
     last_pl = last_pl_bar = None
+    ph_hist: list[tuple[float, int]] = []   # last two swing highs (triple mode)
+    pl_hist: list[tuple[float, int]] = []
+
+    def triple(hist, p3, b3, i, top: bool):
+        """Triple top (top=True) / bottom: returns pending-pattern dict or None. Mirrors the Pine script."""
+        (p1, b1), (p2, b2) = hist
+        s12, s23 = b2 - b1, b3 - b2
+        hi, lo = max(p1, p2, p3), min(p1, p2, p3)
+        diff = (hi - lo) / (hi if top else lo) * 100
+        if not (p.min_sep <= s12 <= p.max_sep and p.min_sep <= s23 <= p.max_sep and diff <= p.tol_pct):
+            return None
+        if top:
+            neck = min(l[b1 + 1:b2].min(), l[b2 + 1:b3].min())
+            if h[b1 + 1:b3].max() > hi or any(c[k] < neck or c[k] > hi for k in range(b3 + 1, i)):
+                return None
+            return dict(top=hi, neck=neck, set_bar=i) if (hi - neck) / hi * 100 >= p.min_depth else None
+        neck = max(h[b1 + 1:b2].max(), h[b2 + 1:b3].max())
+        if l[b1 + 1:b3].min() < lo or any(c[k] > neck or c[k] < lo for k in range(b3 + 1, i)):
+            return None
+        return dict(bot=lo, neck=neck, set_bar=i) if (neck - lo) / lo * 100 >= p.min_depth else None
     dt = None  # pending double top
     db = None  # pending double bottom
 
@@ -237,8 +258,23 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
         return c[i] > sma[i] if direction == 1 else c[i] < sma[i]
 
     for i in range(n):
+        # ── Triple top / bottom detection (peaks == 3)
+        if p.peaks == 3:
+            if not math.isnan(ph[i]):
+                if p.trade_shorts and len(ph_hist) == 2:
+                    found = triple(ph_hist, ph[i], i - L, i, True)
+                    if found:
+                        dt = found
+                ph_hist = (ph_hist + [(ph[i], i - L)])[-2:]
+            if not math.isnan(pl[i]):
+                if p.trade_longs and len(pl_hist) == 2:
+                    found = triple(pl_hist, pl[i], i - L, i, False)
+                    if found:
+                        db = found
+                pl_hist = (pl_hist + [(pl[i], i - L)])[-2:]
+
         # ── Double top detection
-        if not math.isnan(ph[i]):
+        if p.peaks == 2 and not math.isnan(ph[i]):
             b2, p2 = i - L, ph[i]
             if p.trade_shorts and last_ph is not None:
                 sep = b2 - last_ph_bar
@@ -254,7 +290,7 @@ def backtest(df: pd.DataFrame, p: Params, symbol: str = "") -> Result:
             last_ph, last_ph_bar = p2, b2
 
         # ── Double bottom detection
-        if not math.isnan(pl[i]):
+        if p.peaks == 2 and not math.isnan(pl[i]):
             b2, p2 = i - L, pl[i]
             if p.trade_longs and last_pl is not None:
                 sep = b2 - last_pl_bar
@@ -418,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("symbols", nargs="+")
     ap.add_argument("--interval", default="1d")
     ap.add_argument("--range", default="max")
+    ap.add_argument("--triple", action="store_true", help="triple top/bottom instead of double")
     ap.add_argument("--rr", type=float, default=2.0, help="TP2 / final target as R multiple")
     ap.add_argument("--tp1", type=float, default=1.0, help="TP1 as R multiple")
     ap.add_argument("--tp1-pct", type=float, default=0.0, help="%% of each entry closed at TP1 (0 = single target)")
@@ -436,7 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    p = Params(rr=a.rr, tp1_rr=a.tp1, tp1_pct=a.tp1_pct, be_after_tp1=not a.no_be, tgt_mode="blended" if a.blended else "per_entry", use_entry1=not a.no_entry1,
+    p = Params(peaks=3 if a.triple else 2, rr=a.rr, tp1_rr=a.tp1, tp1_pct=a.tp1_pct, be_after_tp1=not a.no_be, tgt_mode="blended" if a.blended else "per_entry", use_entry1=not a.no_entry1,
                entry2_mode=a.entry2, trend_filter=a.trend, trend_len=a.trend_len,
                trade_longs=not a.shorts_only, trade_shorts=not a.longs_only)
     print(f"Config: {p.label()}")
