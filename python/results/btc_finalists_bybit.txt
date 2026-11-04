@@ -1,0 +1,37 @@
+Bybit futures fees, liquidation distance at 25x ≈ 3.50% (isolated, MMR 0.5%)
+
+strategy  tf  settings                                                  side    IS n    IS R OOS n   OOS R  random med stop% max stop% liq-first
+dtdb      4h  piv5 tol0.6 depth1.0 B+Retest 2R trend:off exit:single    both     103  +0.186    48  +0.348  -0.059     4.59%    15.56%       71%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Retest 2R trend:off exit:single    longs     52  +0.034    22  +0.798  +0.080     4.69%    12.84%       76%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Retest 2R trend:off exit:single    shorts    51  +0.340    26  -0.032  -0.130     4.59%    15.56%       66%
+dtdb      4h  piv5 tol0.6 depth1.0 B 2R trend:off exit:single           both      56  +0.276    26  +0.354  +0.002     4.96%    15.56%       76%
+dtdb      4h  piv5 tol0.6 depth1.0 B 2R trend:off exit:single           longs     29  +0.178    13  +0.744  +0.038     4.96%    12.84%       81%
+dtdb      4h  piv5 tol0.6 depth1.0 B 2R trend:off exit:single           shorts    27  +0.381    13  -0.035  -0.097     5.04%    15.56%       70%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Mid 2R trend:off exit:single       both      88  +0.145    42  +0.313  -0.009     3.86%    15.56%       53%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Mid 2R trend:off exit:single       longs     44  -0.051    21  +0.741  -0.001     3.89%    12.84%       55%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Mid 2R trend:off exit:single       shorts    44  +0.342    21  -0.115  -0.081     3.77%    15.56%       51%
+ttb       4h  piv5 tol2.0 depth1.0 B+Retest 2R trend:off exit:single    both      63  +0.823    38  +0.048  -0.039     5.18%    21.56%       78%
+ttb       4h  piv5 tol2.0 depth1.0 B+Retest 2R trend:off exit:single    longs     34  +1.021    26  +0.283  +0.059     5.13%     9.34%       77%
+ttb       4h  piv5 tol2.0 depth1.0 B+Retest 2R trend:off exit:single    shorts    29  +0.592    12  -0.462  -0.042     5.26%    21.56%       80%
+ttb       4h  piv5 tol2.0 depth1.0 B 2R trend:off exit:single           both      35  +0.851    21  +0.083  -0.046     5.77%    21.56%       82%
+ttb       4h  piv5 tol2.0 depth1.0 B 2R trend:off exit:single           longs     19  +1.114    15  +0.302  +0.040     5.69%     9.34%       79%
+ttb       4h  piv5 tol2.0 depth1.0 B 2R trend:off exit:single           shorts    16  +0.539     6  -0.465  +0.052     5.77%    21.56%       86%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 2R trend:off exit:single  both      94  +0.416    57  +0.001  -0.072     1.83%    20.19%       15%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 2R trend:off exit:single  longs     60  +0.676    30  +0.127  -0.020     1.73%    11.86%       12%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 2R trend:off exit:single  shorts    34  -0.043    27  -0.139  +0.023     2.00%    20.19%       20%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 3R trend:off exit:single  both      93  +0.576    56  +0.158  -0.068     1.83%    20.19%       15%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 3R trend:off exit:single  longs     59  +0.811    30  +0.251  +0.029     1.76%    11.86%       12%
+megaphone 4h  piv5 swings4 expand0.0 BO-close 3R trend:off exit:single  shorts    34  +0.169    26  +0.050  +0.011     1.99%    20.19%       20%
+megaphone 1d  piv3 swings4 expand0.0 BO-close 2R trend:off exit:single  both      23  +0.535    11  +0.827  +0.012     4.62%    12.09%       62%
+megaphone 1d  piv3 swings4 expand0.0 BO-close 2R trend:off exit:single  longs     17  +0.703     8  +0.747  -0.018     3.86%     8.86%       60%
+megaphone 1d  piv3 swings4 expand0.0 BO-close 2R trend:off exit:single  shorts     6  +0.061     3  +1.043  +0.099     4.93%    12.09%       67%
+ttb       1h  piv5 tol2.0 depth0.5 B 1.5R trend:sma exit:TP1 1R 50% BE  both     273  +0.184   134  -0.026  -0.054     3.93%    14.80%       61%
+ttb       1h  piv5 tol2.0 depth0.5 B 1.5R trend:sma exit:TP1 1R 50% BE  longs    142  +0.260    66  +0.090  +0.060     3.72%    14.80%       56%
+ttb       1h  piv5 tol2.0 depth0.5 B 1.5R trend:sma exit:TP1 1R 50% BE  shorts   131  +0.101    68  -0.139  -0.117     4.15%    14.14%       66%
+
+Max isolated leverage so that the stop is inside the liquidation price (MMR 0.5%, 0.5% safety buffer):
+strategy  tf  settings                                                   median stop  95th pct  lev for median  lev for 95%
+dtdb      4h  piv5 tol0.6 depth1.0 B+Retest 2R trend:off exit:single           4.59%    10.28%           17.9x         8.9x
+ttb       4h  piv5 tol2.0 depth1.0 B+Retest 2R trend:off exit:single           5.18%     9.34%           16.2x         9.7x
+megaphone 4h  piv5 swings4 expand0.0 BO-close 3R trend:off exit:single         1.83%     5.82%           35.3x        14.7x
+megaphone 1d  piv3 swings4 expand0.0 BO-close 2R trend:off exit:single         4.62%     9.79%           17.8x         9.3x
