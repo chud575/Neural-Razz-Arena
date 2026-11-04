@@ -39,15 +39,19 @@ HTF_FOR = {"15m": ("4h", "D"), "1h": ("D", "W"), "4h": ("D", "W"), "1d": ("W", "
 SR.HTF_SECONDS.update({"4h": 4 * 3600, "h": 3600, "1h": 3600})
 
 DATA: dict[str, pd.DataFrame] = {}
+PREFIX = "btc"          # data files are <prefix>_<tf>.csv (btc, eth, xrp, avax ...)
 
 
-def load(data_dir: str, tfs):
+def load(data_dir: str, tfs, prefix: str | None = None):
+    global PREFIX
+    if prefix:
+        PREFIX = prefix
     for tf in tfs:
         if tf == "4h":
-            h = pd.read_csv(os.path.join(data_dir, "btc_1h.csv"), index_col=0, parse_dates=True)
+            h = pd.read_csv(os.path.join(data_dir, f"{PREFIX}_1h.csv"), index_col=0, parse_dates=True)
             df = h.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
         else:
-            df = pd.read_csv(os.path.join(data_dir, f"btc_{tf}.csv"), index_col=0, parse_dates=True)
+            df = pd.read_csv(os.path.join(data_dir, f"{PREFIX}_{tf}.csv"), index_col=0, parse_dates=True)
         df = df[["open", "high", "low", "close"]]
         DATA[tf] = df[(df > 0).all(axis=1)]
 
@@ -109,7 +113,7 @@ def grid_rangesweep(tf):
     targets = [("opposite", dict(target="opposite")), ("midline", dict(target="midline")),
                ("2R", dict(target="rr", rr=2.0)), ("3R", dict(target="rr", rr=3.0))]
     for rl, mx, tch, rec, smax, st, (tn, tk), (en, e) in itertools.product(
-            (24, 48, 96), (6.0, 10.0, 15.0), (1, 2, 3), ("same_bar", "within_n"), (1.0, 3.0), (0.25, 0.75), targets, EXITS):
+            (24, 48, 96, 144), (6.0, 10.0, 15.0), (1, 2, 3), ("same_bar", "within_n"), (1.0, 3.0), (0.25, 0.75), targets, EXITS):
         yield (f"range{rl} max{mx:g}ATR touches{tch} {rec} sweepMax{smax:g} stop{st:g}ATR target:{tn} exit:{en}",
                dict(range_len=rl, max_range_atr=mx, min_touches=tch, reclaim=rec, sweep_max_atr=smax, stop_atr=st, **tk, **e))
 
@@ -139,7 +143,7 @@ def run_one(job):
     mod, P, _ = STRATS[strat]
     df = DATA[tf]
     split_t = df.index[int(len(df) * SPLIT)]
-    res = mod.backtest(df, P(**kw), "BTC")
+    res = mod.backtest(df, P(**kw), PREFIX.upper())
     out = []
     for dname, sel in (("both", lambda t: True), ("longs", lambda t: t.direction == 1), ("shorts", lambda t: t.direction == -1)):
         tr = [t for t in res.trades if sel(t)]
@@ -190,9 +194,10 @@ def main(argv=None):
     ap.add_argument("--tfs", default="1d,4h,1h,15m")
     ap.add_argument("--strategies", default="dtdb,srflip,megaphone")
     ap.add_argument("--procs", type=int, default=os.cpu_count())
+    ap.add_argument("--prefix", default="btc", help="asset prefix of the data files (btc, eth, xrp, avax)")
     a = ap.parse_args(argv)
     tfs = a.tfs.split(",")
-    load(a.data, tfs)
+    load(a.data, tfs, a.prefix)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
 
     rows = []

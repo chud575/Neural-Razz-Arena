@@ -30,7 +30,7 @@ def finalist_control(strat, tf, name, direction):
     mod, P, _ = S.STRATS[strat]
     df = S.DATA[tf]
     split_t = df.index[int(len(df) * S.SPLIT)]
-    res = mod.backtest(df, P(**config_kwargs(strat, tf, name)), "BTC")
+    res = mod.backtest(df, P(**config_kwargs(strat, tf, name)), S.PREFIX.upper())
     tr = [t for t in res.trades if t.signal_time >= split_t and
           (direction == "both" or (direction == "longs") == (t.direction == 1))]
     if not tr:
@@ -80,25 +80,26 @@ def main(argv=None):
     ap.add_argument("--csv", nargs="+", required=True)
     ap.add_argument("--out", default="results/btc_sweep.md")
     ap.add_argument("--top", type=int, default=5)
+    ap.add_argument("--prefix", default="btc")
     a = ap.parse_args(argv)
     df = pd.concat([pd.read_csv(p) for p in a.csv], ignore_index=True)
     df = df.drop_duplicates(["strategy", "tf", "config", "direction"], keep="last")
     tfs = [tf for tf in TF_ORDER if tf in set(df.tf)]
-    S.load(a.data, tfs)
+    S.load(a.data, tfs, a.prefix)
 
     cols = [("config", "Settings", ""), ("direction", "Side", ""), ("is_n", "IS trades", "{:.0f}"),
             ("is_avg", "IS avg R (net)", "{:+.3f}"), ("is_t", "IS t-stat", "{:.2f}"),
             ("oos_n", "OOS trades", "{:.0f}"), ("oos_avg", "OOS avg R (net)", "{:+.3f}"), ("oos_sum", "OOS total R", "{:+.1f}"),
             ("oos_win", "OOS win %", "{:.0f}")]
-    lines = ["# BTC strategy sweep — 15m / 1h / 4h / 1D\n",
+    lines = [f"# {a.prefix.upper()} strategy sweep — 15m / 1h / 4h / 1D\n",
              f"Costs: {S.COST_RT * 100:.2f}% round trip per trade (0.1% per side), charged in R. "
              f"In-sample (IS) = first {int(S.SPLIT * 100)}% of each timeframe's history, out-of-sample (OOS) = last "
-             f"{100 - int(S.SPLIT * 100)}%. Rankings use IS only. Data: Coinbase BTC-USD (4h resampled from 1h).\n"]
+             f"{100 - int(S.SPLIT * 100)}%. Rankings use IS only. Data: Coinbase {a.prefix.upper()}-USD (4h resampled from 1h).\n"]
     summary = []
     for tf in tfs:
         bh_is, bh_oos, t0, tk, t1 = buy_hold(tf)
         lines.append(f"\n## {TF_NAME[tf]}  (IS {t0.date()} → {tk.date()}, OOS {tk.date()} → {t1.date()}; "
-                     f"BTC buy & hold: IS {bh_is:+.0f}%, OOS {bh_oos:+.0f}%)\n")
+                     f"{a.prefix.upper()} buy & hold: IS {bh_is:+.0f}%, OOS {bh_oos:+.0f}%)\n")
         for strat in ("rangesweep", "dtdb", "ttb", "srflip", "megaphone"):
             sub = df[(df.tf == tf) & (df.strategy == strat)]
             if sub.empty:
