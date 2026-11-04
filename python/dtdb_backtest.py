@@ -25,7 +25,7 @@ Examples:
 """
 from __future__ import annotations
 
-__version__ = "1.5"  # same version as pine/double_top_bottom_2entry.pine
+__version__ = "1.6"  # same version as pine/double_top_bottom_2entry.pine (costs: run_btc_sweep.py --fees)
 
 import argparse
 import json

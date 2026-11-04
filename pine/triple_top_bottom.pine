@@ -1,6 +1,7 @@
 //@version=6
-// Triple Top / Bottom – 2-Stage Entry   ·   v1.0
+// Triple Top / Bottom – 2-Stage Entry   ·   v1.1
 // Changelog
+//  v1.1  Costs: maker/taker fees + funding (default Bybit VIP 3) — table is net of fees; liquidation check at your leverage
 //  v1.0  First version: identical to Double Top / Bottom v1.5 except the pattern needs THREE peaks/troughs
 //        (all within the tolerance), and the neckline is the lowest low (top) / highest high (bottom)
 //        across both dips between them.
@@ -23,7 +24,7 @@
 //  • Limit entries keep their planned target/risk on gap fills; confirm entries use the actual close.
 //  • Gaps through a stop/target/limit fill at the bar's open.
 //  • Only one pattern trade is tracked at a time; new signals are ignored while a trade is live.
-indicator("Triple Top / Bottom – 2-Stage Entry v1.0", shorttitle = "TT/TB v1.0", overlay = true,
+indicator("Triple Top / Bottom – 2-Stage Entry v1.1", shorttitle = "TT/TB v1.1", overlay = true,
      max_bars_back = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -50,6 +51,32 @@ beOn        = input.bool(true,  "Move stop to breakeven after TP1", group = grpT
 tgtMode     = input.string("Per entry", "Target mode", options = ["Per entry", "Blended average entry"], group = grpT,
      tooltip = "Per entry: each entry's TP1/TP2 are measured from its own entry price to the stop.\nBlended: both entries share TP1/TP2, measured from the average of the two entry prices.")
 p1          = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive; negative = the reverse). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC,
+     tooltip = "Isolated margin: liquidation ≈ (100 / leverage − maintenance margin) % against the entry. Trades whose stop is further away than that would be liquidated before the stop.")
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+// Warn when the stop is beyond the liquidation distance at the chosen leverage
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
 stopBufPct  = input.float(0.0,  "Stop buffer beyond extreme (% of pattern height)", minval = 0.0, step = 5.0, group = grpT)
 e2Expiry    = input.int(50,     "Cancel unfilled 2nd entry after N bars (0 = never)", minval = 0, group = grpT)
 
@@ -350,6 +377,8 @@ var float e2R     = 0.0
 var float e2P     = 0.0
 var bool  e2Pend  = false
 var int   sigBar  = na
+var int   sigTime = na
+var int   e2Time  = na
 
 bool useE2      = e2Mode != "Off"
 bool e2Confirm  = e2Mode == "Retest + confirm"
@@ -372,6 +401,7 @@ if tDir != 0 and bar_index > sigBar
         bool  sane    = tDir == -1 ? fillPx < tStop : fillPx > tStop     // never fill beyond the stop
         if filled and sane
             tE2Fill      := fillPx
+            e2Time       := time
             // limit fills keep the planned risk/targets; confirm fills (at a known close) use the actual fill
             e2Risk       := e2Confirm ? math.abs(fillPx - tStop) : math.abs(tE2 - tStop)
             if perEntry and e2Confirm
@@ -400,6 +430,9 @@ if tDir != 0 and bar_index > sigBar
         if not na(tp1Fill1) and p1 < 1
             exitLabel(tp1Fill1, tDir, "E1 TP1 " + str.tostring(tp1Pct) + "%", tDir * (tp1Fill1 - tE1) / e1Risk)
         if not op1
+            float c1 = costR(tDir, tE1, e1Risk, tag1 == "" or tag1 == "TP2", sigTime)
+            e1R := e1R - c1
+            e1P := e1P - c1 * e1Risk / tE1 * 100.0
             recordTrade(tDir, 0, e1R, e1P)
             exitLabel(na(x1) ? tp1Fill1 : x1, tDir, "E1 " + (tag1 == "" ? "TP1" : tag1) + " total", e1R)
             e1Open := false
@@ -414,6 +447,9 @@ if tDir != 0 and bar_index > sigBar
         if not na(tp1Fill2) and p1 < 1
             exitLabel(tp1Fill2, tDir, "E2 TP1 " + str.tostring(tp1Pct) + "%", tDir * (tp1Fill2 - tE2Fill) / e2Risk)
         if not op2
+            float c2 = costR(tDir, tE2Fill, e2Risk, tag2 == "" or tag2 == "TP2", e2Time)
+            e2R := e2R - c2
+            e2P := e2P - c2 * e2Risk / tE2Fill * 100.0
             recordTrade(tDir, 1, e2R, e2P)
             exitLabel(na(x2) ? tp1Fill2 : x2, tDir, "E2 " + (tag2 == "" ? "TP1" : tag2) + " total", e2R)
             e2Open := false
@@ -489,6 +525,9 @@ if shortSig or longSig
         e2Open  := false
         e2Pend  := useE2
         sigBar  := bar_index
+        sigTime := time
+        if liqWarn(useE1 ? e1 : e2, stopL, d)
+            liqCount += 1
         newSig  := true
         int si = d == 1 ? 0 : 1
         array.set(aSig, si, array.get(aSig, si) + 1)
@@ -644,14 +683,14 @@ writeSide(int col, int iE1, int iE2, int rowWR, int rowR) =>
 
 if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 3, 0)
-    for row = 13 to 16
+    for row = 13 to 17
         table.merge_cells(tbl, 1, row, 3, row)
 
 if barstate.islast
     hdrBg = color.new(color.blue, 40)
     string cfg = (useE1 ? "Breakout" : "") + (useE1 and useE2 ? " + " : "") + (useE2 ? e2Mode : "") +
          (trendOn ? " | SMA" + str.tostring(trendLen) : "") + " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%) / TP2 " + str.tostring(tp2RR, "#.##") + "R" + (beOn ? " | BE after TP1" : "")
-    cellTxt(0, 0, "TT/TB v1.0 — Historical Performance  (" + cfg + ")", color.white, hdrBg)
+    cellTxt(0, 0, "TT/TB v1.1 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, hdrBg)
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Entry 1", color.silver)
     cellTxt(2, 1, "Entry 2", color.silver)
@@ -696,3 +735,5 @@ if barstate.islast
              " | E2 " + (e2Open ? (e2Done1 and p1 > 0 ? "open, TP1 hit" : "open") : e2Pend ? "pending @ " + str.tostring(tE2, format.mintick) : "closed/none")
     cellTxt(0, 16, "Current trade")
     cellTxt(1, 16, openTxt, tDir == 1 ? color.lime : tDir == -1 ? color.red : color.white)
+    cellTxt(0, 17, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 17, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

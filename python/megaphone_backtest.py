@@ -30,7 +30,7 @@ entries measure R from the planned price.
 """
 from __future__ import annotations
 
-__version__ = "1.2"  # same version as pine/megaphone.pine
+__version__ = "1.3"  # same version as pine/megaphone.pine (costs: run_btc_sweep.py --fees)
 
 import argparse
 import math

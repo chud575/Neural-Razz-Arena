@@ -23,7 +23,7 @@ the same bar; limit fills only check the stop on the fill bar; gaps fill at the 
 """
 from __future__ import annotations
 
-__version__ = "1.2"  # same version as pine/sr_flip.pine
+__version__ = "1.3"  # same version as pine/sr_flip.pine (costs: run_btc_sweep.py --fees)
 
 import argparse
 import math

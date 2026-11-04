@@ -1,6 +1,7 @@
 //@version=6
-// Megaphone – Broadening Formation   ·   v1.2
+// Megaphone – Broadening Formation   ·   v1.3
 // Changelog
+//  v1.3  Costs: maker/taker fees + funding (default Bybit VIP 3) — table is net of fees; liquidation check at your leverage
 //  v1.2  TP1 / TP2 as R multiples, % closed at TP1, optional breakeven after TP1
 //  v1.1  Tightening toggles: min expansion (× ATR), swings-on-lines fit, breakout retest entry,
 //        measured-move target, failed-breakout fade (+ Failed BO column in the table)
@@ -27,7 +28,7 @@
 //        TP1 is pulled back to TP2 if it would be beyond it. After TP1 the remainder is managed from the next bar.
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill only
 // checks its stop on the fill bar; gaps fill at the open; one trade at a time.
-indicator("Megaphone – Broadening Formation v1.2", shorttitle = "Megaphone v1.2", overlay = true,
+indicator("Megaphone – Broadening Formation v1.3", shorttitle = "Megaphone v1.3", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -55,6 +56,32 @@ tp1Pct    = input.float(50, "% of position closed at TP1", minval = 0, maxval = 
      tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
 beOn      = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
 p1        = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive; negative = the reverse). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC,
+     tooltip = "Isolated margin: liquidation ≈ (100 / leverage − maintenance margin) % against the entry. Trades whose stop is further away than that would be liquidated before the stop.")
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+// Warn when the stop is beyond the liquidation distance at the chosen leverage
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
 rr        = tp2RR
 zoneAtr   = input.float(0.1, "Fade zone inside the line (× ATR)", minval = 0.0, step = 0.05, group = grpT)
 stopAtr   = input.float(0.5, "Stop distance from the line (× ATR)", minval = 0.05, step = 0.05, group = grpT)
@@ -288,6 +315,7 @@ var bool  trDone1 = false
 var float trR    = 0.0     // running R of the open trade
 var float trRisk = na
 var int   trBar  = na
+var int   trTime = na
 
 // 1) Manage open trade
 bool exited = false
@@ -299,6 +327,7 @@ if inTr and bar_index > trBar
     if not na(t1Fill) and p1 < 1
         exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
     if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP2", trTime)
         recordExit(trD, trKind, trR)
         exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
         inTr   := false
@@ -374,6 +403,9 @@ if sOn
     trDone1 := p1 <= 0
     trR    := 0.0
     trBar  := bar_index
+    trTime := time
+    if liqWarn(trE, trS, trD)
+        liqCount += 1
     entered := true
     string kName = sKind == 0 ? "Fade" : sKind == 1 ? "BO" : "Failed BO"
     if showTrades
@@ -385,7 +417,7 @@ if sOn
          " | entry " + str.tostring(sE, format.mintick) + " | stop " + str.tostring(sS, format.mintick) +
          " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(sT, format.mintick), alert.freq_once_per_bar)
     if sLimit and (sD == 1 ? low <= sS : high >= sS)       // limit filled, then stopped in the same bar
-        exitLabel(sS, "SL", recordExit(trD, trKind, trD * (sS - trE) / trRisk))
+        exitLabel(sS, "SL", recordExit(trD, trKind, trD * (sS - trE) / trRisk - costR(trD, trE, trRisk, false, time)))
         inTr := false
     sOn := false
 bool faded = entered
@@ -487,6 +519,9 @@ if sOn
     trDone1 := p1 <= 0
     trR    := 0.0
     trBar  := bar_index
+    trTime := time
+    if liqWarn(trE, trS, trD)
+        liqCount += 1
     entered := true
     string kName = sKind == 0 ? "Fade" : sKind == 1 ? "BO" : "Failed BO"
     if showTrades
@@ -498,7 +533,7 @@ if sOn
          " | entry " + str.tostring(sE, format.mintick) + " | stop " + str.tostring(sS, format.mintick) +
          " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(sT, format.mintick), alert.freq_once_per_bar)
     if sLimit and (sD == 1 ? low <= sS : high >= sS)       // limit filled, then stopped in the same bar
-        exitLabel(sS, "SL", recordExit(trD, trKind, trD * (sS - trE) / trRisk))
+        exitLabel(sS, "SL", recordExit(trD, trKind, trD * (sS - trE) / trRisk - costR(trD, trE, trRisk, false, time)))
         inTr := false
     sOn := false
 
@@ -555,7 +590,7 @@ writeCol(int col, array<int> ids, array<int> longIds, array<int> shortIds) =>
 
 if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
-    for row = 10 to 12
+    for row = 10 to 13
         table.merge_cells(tbl, 1, row, 4, row)
 
 if barstate.islast
@@ -564,7 +599,7 @@ if barstate.islast
          (doFade ? " | fade: " + fadeEntry + " → " + fadeTgt : "") +
          (doBrk ? " | BO: " + boEntry + " → " + boTarget : "") + (failedBo ? " | failed-BO fade" : "") +
          " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%) / TP2 " + str.tostring(tp2RR, "#.##") + "R" + (beOn ? " BE" : "") + (trendOn ? " | SMA" + str.tostring(trendLen) : "")
-    cellTxt(0, 0, "Megaphone v1.2 — Historical Performance  (" + cfg + ")", color.white, color.new(color.orange, 40))
+    cellTxt(0, 0, "Megaphone v1.3 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.orange, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Edge fade", color.silver)
     cellTxt(2, 1, "Breakout", color.silver)
@@ -591,3 +626,5 @@ if barstate.islast
          patOn ? (patState == 0 ? "Megaphone live — watching edges" : "Broken — watching for retest / failure") : "Flat"
     cellTxt(0, 12, "Current")
     cellTxt(1, 12, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 13, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 13, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

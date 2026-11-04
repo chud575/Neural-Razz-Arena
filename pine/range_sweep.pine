@@ -1,6 +1,7 @@
 //@version=6
-// Range Sweep – Liquidity Sweep Reversal   ·   v1.1
+// Range Sweep – Liquidity Sweep Reversal   ·   v1.2
 // Changelog
+//  v1.2  Costs: maker/taker fees + funding (default Bybit VIP 3) — table is net of fees; liquidation check at your leverage
 //  v1.1  Default range length 120 bars (≈ 5 days on 1h) so multi-day ranges like BTC Oct 30 – Nov 4 2026 qualify
 //  v1.0  First version
 //
@@ -18,7 +19,7 @@
 //              next bar). ATR = ATR of the bar before the signal.
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
 // one trade at a time.
-indicator("Range Sweep – Liquidity Sweep Reversal v1.1", shorttitle = "Range Sweep v1.1", overlay = true,
+indicator("Range Sweep – Liquidity Sweep Reversal v1.2", shorttitle = "Range Sweep v1.2", overlay = true,
      max_bars_back = 500, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -49,6 +50,32 @@ tp1Pct  = input.float(50, "% of position closed at TP1", minval = 0, maxval = 10
      tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
 beOn    = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
 p1      = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive; negative = the reverse). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC,
+     tooltip = "Isolated margin: liquidation ≈ (100 / leverage − maintenance margin) % against the entry. Trades whose stop is further away than that would be liquidated before the stop.")
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+// Warn when the stop is beyond the liquidation distance at the chosen leverage
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
 
 grpF = "Filters"
 tradeLongs  = input.bool(true,  "Longs (sweep of the range low)", group = grpF)
@@ -180,6 +207,7 @@ var bool  trDone1 = false
 var float trR     = 0.0
 var float trRisk  = na
 var int   trBar   = na
+var int   trTime = na
 var line  trLine  = na      // solid entry line while the trade is open
 
 var bool  pendOn  = false   // "Within N bars": swept and closed outside, waiting for a close back inside
@@ -199,6 +227,7 @@ if inTr and bar_index > trBar
     if not na(t1Fill) and p1 < 1
         exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
     if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP2", trTime)
         recordExit(trD, trR)
         exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
         inTr := false
@@ -277,6 +306,9 @@ if sigOn
         trR     := 0.0
         trRisk  := risk
         trBar   := bar_index
+        trTime := time
+        if liqWarn(trE, trS, trD)
+            liqCount += 1
         if showTrades
             label.new(bar_index, d == 1 ? low : high, d == 1 ? "Sweep ↑" : "Sweep ↓",
                  style = d == 1 ? label.style_label_up : label.style_label_down,
@@ -328,7 +360,7 @@ writeCol(int col, float w, float l, float r, float gw, float gl) =>
 
 if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 3, 0)
-    for row = 8 to 10
+    for row = 8 to 11
         table.merge_cells(tbl, 1, row, 3, row)
 
 if barstate.islast
@@ -336,7 +368,7 @@ if barstate.islast
          " touches | " + reclaimMode + " | TP2: " + (tgtMode == "R:R" ? str.tostring(tp2RR, "#.##") + "R" : tgtMode) +
          (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "") +
          (trendOn ? " | SMA" + str.tostring(trendLen) : "")
-    cellTxt(0, 0, "Range Sweep v1.1 — Historical Performance  (" + cfg + ")", color.white, color.new(color.purple, 40))
+    cellTxt(0, 0, "Range Sweep v1.2 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.purple, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Longs", color.silver)
     cellTxt(2, 1, "Shorts", color.silver)
@@ -360,3 +392,5 @@ if barstate.islast
          pendOn ? "Edge swept — waiting for a close back inside" : rangeOk ? "In a tight range — watching both edges" : "Flat"
     cellTxt(0, 10, "Current")
     cellTxt(1, 10, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 11, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 11, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

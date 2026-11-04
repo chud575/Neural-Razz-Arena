@@ -32,7 +32,7 @@ from dtdb_backtest import Result, Trade, _f, fetch_yahoo, max_dd_r, stats
 from exits import make_entry, scale_step
 from srflip_backtest import atr
 
-__version__ = "1.1"  # same version as pine/range_sweep.pine
+__version__ = "1.2"  # same version as pine/range_sweep.pine (costs: run_btc_sweep.py --fees)
 
 
 @dataclass

@@ -1,6 +1,7 @@
 //@version=6
-// S/R Flip – Break & Retest   ·   v1.2
+// S/R Flip – Break & Retest   ·   v1.3
 // Changelog
+//  v1.3  Costs: maker/taker fees + funding (default Bybit VIP 3) — table is net of fees; liquidation check at your leverage
 //  v1.2  TP1 / TP2 as R multiples, % closed at TP1, optional breakeven after TP1
 //  v1.1  Levels from a higher timeframe (or both), merge nearby swings into zones, min-swings (strength) filter
 //  v1.0  First version: touch / rejection / sweep entries, multiple tries per level, stats table by attempt
@@ -24,7 +25,7 @@
 //
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; a limit fill
 // only checks its stop on the fill bar; gaps fill at the open; one trade at a time.
-indicator("S/R Flip – Break & Retest v1.2", shorttitle = "SR Flip v1.2", overlay = true,
+indicator("S/R Flip – Break & Retest v1.3", shorttitle = "SR Flip v1.3", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -61,6 +62,32 @@ tp1Pct      = input.float(50, "% of position closed at TP1", minval = 0, maxval 
      tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
 beOn        = input.bool(true, "Move stop to breakeven after TP1", group = grpE)
 p1          = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive; negative = the reverse). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC,
+     tooltip = "Isolated margin: liquidation ≈ (100 / leverage − maintenance margin) % against the entry. Trades whose stop is further away than that would be liquidated before the stop.")
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+// Warn when the stop is beyond the liquidation distance at the chosen leverage
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
 
 grpF = "Filters"
 tradeLongs  = input.bool(true,  "Longs (resistance → support)", group = grpF)
@@ -247,6 +274,7 @@ var bool  trDone1 = false
 var float trR    = 0.0     // running R of the open trade
 var float trRisk = na
 var int   trBar  = na
+var int   trTime = na
 var int   trTry  = 0
 
 // 1) Manage open trade
@@ -259,6 +287,7 @@ if inTr and bar_index > trBar
     if not na(t1Fill) and p1 < 1
         exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
     if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP2", trTime)
         recordExit(trD, trTry, trR)
         exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
         inTr   := false
@@ -304,6 +333,9 @@ if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
         trE    := entry
         trS    := stp
         trBar  := bar_index
+        trTime := time
+        if liqWarn(trE, trS, trD)
+            liqCount += 1
         trTry  := math.min(actTries, 2)
         trRisk := math.abs(ref - stp)
         trT    := ref + d * tp2RR * trRisk
@@ -322,7 +354,7 @@ if actOn and not inTr and not exited and bar_index >= actBrk + minAfter
              " | entry " + str.tostring(entry, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
              " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(trT, format.mintick), alert.freq_once_per_bar)
         if sameBar and (d == 1 ? low <= stp : high >= stp)
-            float r = recordExit(trD, trTry, trD * (stp - trE) / trRisk)
+            float r = recordExit(trD, trTry, trD * (stp - trE) / trRisk - costR(trD, trE, trRisk, false, time))
             exitLabel(stp, "SL", r)
             inTr     := false
             actTries += 1
@@ -494,7 +526,7 @@ writeCol(int col, array<int> ids, array<int> longIds, array<int> shortIds) =>
 
 if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
-    for row = 10 to 13
+    for row = 10 to 14
         table.merge_cells(tbl, 1, row, 4, row)
 
 if barstate.islast
@@ -502,7 +534,7 @@ if barstate.islast
          (trendOn ? " | SMA" + str.tostring(trendLen) : "") +
          (useHtfLv ? " | levels: " + (useChartLv ? "chart + " : "") + htfIn : "") +
          (minTouches > 1 ? " | min " + str.tostring(minTouches) + " swings" : "")
-    cellTxt(0, 0, "S/R Flip v1.2 — Historical Performance  (" + cfg + ")", color.white, color.new(color.blue, 40))
+    cellTxt(0, 0, "S/R Flip v1.3 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.blue, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Try 1", color.silver)
     cellTxt(2, 1, "Try 2", color.silver)
@@ -538,3 +570,5 @@ if barstate.islast
          " (" + str.tostring(actTries) + " tries used)" : "Flat"
     cellTxt(0, 13, "Current")
     cellTxt(1, 13, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 14, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 14, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
