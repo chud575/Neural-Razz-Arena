@@ -29,6 +29,7 @@ import pandas as pd
 
 import dtdb_backtest as DT
 import megaphone_backtest as MP
+import rangesweep_backtest as RS
 import srflip_backtest as SR
 
 COST_RT = 0.002
@@ -104,7 +105,16 @@ def grid_ttb(tf):
         yield name, dict(kw, peaks=3)
 
 
-STRATS = {"dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
+def grid_rangesweep(tf):
+    targets = [("opposite", dict(target="opposite")), ("midline", dict(target="midline")),
+               ("2R", dict(target="rr", rr=2.0)), ("3R", dict(target="rr", rr=3.0))]
+    for rl, mx, tch, rec, smax, st, (tn, tk), (en, e) in itertools.product(
+            (24, 48, 96), (6.0, 10.0, 15.0), (1, 2, 3), ("same_bar", "within_n"), (1.0, 3.0), (0.25, 0.75), targets, EXITS):
+        yield (f"range{rl} max{mx:g}ATR touches{tch} {rec} sweepMax{smax:g} stop{st:g}ATR target:{tn} exit:{en}",
+               dict(range_len=rl, max_range_atr=mx, min_touches=tch, reclaim=rec, sweep_max_atr=smax, stop_atr=st, **tk, **e))
+
+
+STRATS = {"rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
           "megaphone": (MP, MP.MPParams, grid_megaphone)}
 
 

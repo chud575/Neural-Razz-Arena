@@ -1,0 +1,361 @@
+//@version=6
+// Range Sweep – Liquidity Sweep Reversal   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Finds TIGHT RANGES and fades a LIQUIDITY SWEEP of either edge, with a built-in performance tracker.
+// Python twin: python/rangesweep_backtest.py (same rules, so the numbers should match).
+//
+//  1. Range:   over the previous N bars (current bar excluded) the highest high and lowest low are between
+//              min and max × ATR apart, and price visited each edge zone at least "min touches" separate times.
+//  2. Sweep:   a bar wicks THROUGH an edge (by at least X × ATR, at most Y × ATR — deeper = real breakout)
+//              and CLOSES back inside the range. Optionally the close back inside may come within N bars.
+//  3. Entry:   fade it at that close — sweep of the high → short, sweep of the low → long.
+//  4. Stop:    beyond the sweep's wick by X × ATR.
+//  5. Targets: TP2 = opposite side of the range, the range midline, or an R:R multiple. TP1 (R multiple) closes a
+//              chosen %, the rest rides to TP2; optional stop to breakeven after TP1 (remainder managed from the
+//              next bar). ATR = ATR of the bar before the signal.
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
+// one trade at a time.
+indicator("Range Sweep – Liquidity Sweep Reversal v1.0", shorttitle = "Range Sweep v1.0", overlay = true,
+     max_bars_back = 500, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpR = "Range"
+rangeLen     = input.int(48, "Range length (bars)", minval = 5, maxval = 400, group = grpR,
+     tooltip = "The range is the highest high / lowest low of this many bars before the current bar.")
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpR)
+minRangeAtr  = input.float(2.0, "Min range height (× ATR)", minval = 0.0, step = 0.5, group = grpR)
+maxRangeAtr  = input.float(10.0, "Max range height (× ATR) — 'tight'", minval = 0.5, step = 0.5, group = grpR)
+minTouches   = input.int(2, "Min separate touches of each edge", minval = 1, maxval = 10, group = grpR)
+touchZoneAtr = input.float(0.5, "Touch zone near each edge (× ATR)", minval = 0.0, step = 0.1, group = grpR)
+
+grpS = "Sweep entry"
+sweepMinAtr  = input.float(0.1, "Wick must pierce the edge by at least (× ATR)", minval = 0.0, step = 0.05, group = grpS)
+sweepMaxAtr  = input.float(2.0, "...and at most (× ATR, 0 = no limit)", minval = 0.0, step = 0.25, group = grpS,
+     tooltip = "A wick deeper than this is treated as a real breakout, not a sweep.")
+reclaimMode  = input.string("Same bar", "Close back inside", options = ["Same bar", "Within N bars"], group = grpS,
+     tooltip = "Same bar: the sweep candle itself must close back inside the range.\nWithin N bars: a candle may close outside first, as long as a close back inside follows within N bars.")
+reclaimBars  = input.int(3, "N bars (for 'Within N bars')", minval = 1, maxval = 20, group = grpS)
+stopAtr      = input.float(0.25, "Stop beyond the sweep wick (× ATR)", minval = 0.0, step = 0.05, group = grpS)
+
+grpT = "Targets"
+tgtMode = input.string("Opposite side of range", "TP2 target", options = ["Opposite side of range", "Range midline", "R:R"], group = grpT)
+tp1RR   = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpT,
+     tooltip = "TP1 distance as a multiple of the risk (entry → stop). Pulled back to TP2 if it would be beyond it.")
+tp2RR   = input.float(2.0, "TP2 (reward : risk) — used when TP2 target = R:R", minval = 0.1, step = 0.1, group = grpT)
+tp1Pct  = input.float(50, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
+     tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
+beOn    = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
+p1      = tp1Pct / 100.0
+
+grpF = "Filters"
+tradeLongs  = input.bool(true,  "Longs (sweep of the range low)", group = grpF)
+tradeShorts = input.bool(true,  "Shorts (sweep of the range high)", group = grpF)
+trendOn     = input.bool(false, "Trend filter (longs above SMA, shorts below)", group = grpF)
+trendLen    = input.int(200, "Trend SMA length", minval = 2, group = grpF)
+
+grpV = "Visuals"
+showRange  = input.bool(true, "Shade valid ranges", group = grpV)
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+atrV    = ta.atr(atrLen)
+atrPrev = atrV[1]
+rHi     = ta.highest(high, rangeLen)[1]     // range of the N bars BEFORE this bar
+rLo     = ta.lowest(low, rangeLen)[1]
+smaV    = ta.sma(close, trendLen)
+
+// ─────────────────────── Performance storage ───────────────────────
+// index 0 = longs, 1 = shorts
+var array<float> aWins = array.new<float>(2, 0.0)
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+var int rangeCount = 0
+
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+// Advance an open trade by one bar (TP1 / TP2 scale-out).
+// Returns [stillOpen, tp1Done, stop, totalR, tp1FillPx (na = none), finalExitPx (na = none), exitTag]
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 and p1 > 0 ? 1.0 - p1 : 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit                                            // stop (or breakeven stop) first
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false                               // everything closed at TP1
+            else if beOn
+                st := ePx                                 // remainder: stop to breakeven, managed from next bar
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP2"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        op   := false
+    [op, done1, st, accR, t1Px, xPx, tag]
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+// Number of separate visits to an edge zone over the range window (oldest → newest bar)
+countVisits(bool isHigh, float thresh) =>
+    int  cnt    = 0
+    bool prevIn = false
+    for k = rangeLen to 1
+        bool inZ = isHigh ? high[k] >= thresh : low[k] <= thresh
+        if inZ and not prevIn
+            cnt += 1
+        prevIn := inZ
+    cnt
+
+// ───────────────────────────── Range check ─────────────────────────────
+bool rangeOk = false
+if not na(rHi) and not na(rLo) and not na(atrPrev) and atrPrev > 0
+    float ht = rHi - rLo
+    if ht >= minRangeAtr * atrPrev and ht <= maxRangeAtr * atrPrev
+        float z = touchZoneAtr * atrPrev
+        rangeOk := minTouches <= 1 or (countVisits(true, rHi - z) >= minTouches and countVisits(false, rLo + z) >= minTouches)
+
+// shade the valid range
+var box  rBox    = na
+var bool boxLive = false
+if rangeOk
+    if not boxLive
+        rangeCount += 1
+        if showRange
+            rBox := box.new(bar_index - rangeLen, rHi, bar_index, rLo, border_color = color.new(color.gray, 30),
+                 bgcolor = color.new(color.gray, 88))
+        boxLive := true
+    else if showRange and not na(rBox)
+        box.set_top(rBox, rHi)
+        box.set_bottom(rBox, rLo)
+        box.set_right(rBox, bar_index)
+else
+    boxLive := false
+
+// ───────────────────────────── State ─────────────────────────────
+var bool  inTr    = false
+var int   trD     = 0
+var float trE     = na
+var float trS     = na
+var float trT     = na      // TP2
+var float trT1    = na      // TP1
+var bool  trDone1 = false
+var float trR     = 0.0
+var float trRisk  = na
+var int   trBar   = na
+var line  trLine  = na      // solid entry line while the trade is open
+
+var bool  pendOn  = false   // "Within N bars": swept and closed outside, waiting for a close back inside
+var int   pendD   = 0
+var float pendHi  = na
+var float pendLo  = na
+var float pendExt = na
+var int   pendBar = na
+var float pendA   = na
+
+// 1) Manage open trade
+if inTr and bar_index > trBar
+    [op, dn, st, ar, t1Fill, xPx, tag] = stepEntry(trD, trE, trRisk, trS, trT1, trT, trDone1, trR)
+    trDone1 := dn
+    trS     := st
+    trR     := ar
+    if not na(t1Fill) and p1 < 1
+        exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
+    if not op
+        recordExit(trD, trR)
+        exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
+        inTr := false
+if not na(trLine)
+    line.set_x2(trLine, bar_index)
+    if not inTr
+        trLine := na
+
+// 2) Find a sweep (only while flat)
+bool  sigOn  = false
+int   sigD   = 0
+float sigHi  = na
+float sigLo  = na
+float sigExt = na
+float sigA   = na
+if inTr
+    pendOn := false
+else
+    bool handled = false
+    if pendOn
+        int d = pendD
+        pendExt := d == 1 ? math.min(pendExt, low) : math.max(pendExt, high)
+        bool tooDeep = sweepMaxAtr > 0 and (d == 1 ? pendLo - pendExt : pendExt - pendHi) > sweepMaxAtr * pendA
+        bool backIn  = close > pendLo and close < pendHi
+        if tooDeep or bar_index - pendBar > reclaimBars
+            pendOn := false
+        else if backIn
+            sigOn   := true
+            sigD    := d
+            sigHi   := pendHi
+            sigLo   := pendLo
+            sigExt  := pendExt
+            sigA    := pendA
+            pendOn  := false
+            handled := true
+    if not handled and rangeOk
+        for side = 0 to 1
+            int   d       = side == 0 ? -1 : 1               // -1: sweep of the high → short, 1: sweep of the low → long
+            bool  pierced = d == -1 ? high > rHi + sweepMinAtr * atrPrev : low < rLo - sweepMinAtr * atrPrev
+            float depth   = d == -1 ? high - rHi : rLo - low
+            if pierced and not (sweepMaxAtr > 0 and depth > sweepMaxAtr * atrPrev)
+                if close > rLo and close < rHi               // closed back inside on the same bar
+                    sigOn  := true
+                    sigD   := d
+                    sigHi  := rHi
+                    sigLo  := rLo
+                    sigExt := d == -1 ? high : low
+                    sigA   := atrPrev
+                    break
+                if reclaimMode == "Within N bars" and not pendOn
+                    pendOn  := true
+                    pendD   := d
+                    pendHi  := rHi
+                    pendLo  := rLo
+                    pendExt := d == -1 ? high : low
+                    pendBar := bar_index
+                    pendA   := atrPrev
+                    break
+
+// 3) Enter at the close
+if sigOn
+    int   d    = sigD
+    bool  ok   = (d == 1 ? tradeLongs : tradeShorts) and (not trendOn or (not na(smaV) and (d == 1 ? close > smaV : close < smaV)))
+    float stp  = sigExt - d * stopAtr * sigA
+    float risk = math.abs(close - stp)
+    float tgt  = tgtMode == "Opposite side of range" ? (d == 1 ? sigHi : sigLo) : tgtMode == "Range midline" ? (sigHi + sigLo) / 2.0 : close + d * tp2RR * risk
+    if ok and risk > 0 and (close - stp) * d > 0 and (tgt - close) * d > 0
+        float t1 = close + d * tp1RR * risk
+        inTr    := true
+        trD     := d
+        trE     := close
+        trS     := stp
+        trT     := tgt
+        trT1    := (t1 - tgt) * d > 0 ? tgt : t1
+        trDone1 := p1 <= 0
+        trR     := 0.0
+        trRisk  := risk
+        trBar   := bar_index
+        if showTrades
+            label.new(bar_index, d == 1 ? low : high, d == 1 ? "Sweep ↑" : "Sweep ↓",
+                 style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = d == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor = color.white, size = size.tiny)
+            trLine := line.new(bar_index, close, bar_index, close, color = color.blue, width = 2, style = line.style_solid)
+        alert("Range SWEEP " + (d == 1 ? "LONG (low swept)" : "SHORT (high swept)") + " on " + syminfo.ticker +
+             " | entry " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+             " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(tgt, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(rangeOk and not inTr ? rHi : na, "Range high", color.new(color.gray, 20), 1, plot.style_linebr)
+plot(rangeOk and not inTr ? rLo : na, "Range low",  color.new(color.gray, 20), 1, plot.style_linebr)
+plot(inTr ? trS : na, "Stop", color.red, 1, plot.style_linebr)
+plot(inTr and p1 > 0 and not trDone1 ? trT1 : na, "TP1", color.green, 1, plot.style_linebr)
+plot(inTr and p1 < 1 ? trT : na, "TP2", color.teal, 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 13, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 8 to 10
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string cfg = "range " + str.tostring(rangeLen) + " bars ≤" + str.tostring(maxRangeAtr) + " ATR, " + str.tostring(minTouches) +
+         " touches | " + reclaimMode + " | TP2: " + (tgtMode == "R:R" ? str.tostring(tp2RR, "#.##") + "R" : tgtMode) +
+         (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "") +
+         (trendOn ? " | SMA" + str.tostring(trendLen) : "")
+    cellTxt(0, 0, "Range Sweep v1.0 — Historical Performance  (" + cfg + ")", color.white, color.new(color.purple, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Longs", color.silver)
+    cellTxt(2, 1, "Shorts", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    writeCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    writeCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    writeCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1),
+         array.get(aSumR, 0) + array.get(aSumR, 1), array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    cellTxt(0, 8, "Ranges found")
+    cellTxt(1, 8, str.tostring(rangeCount))
+    cellTxt(0, 9, "Max drawdown")
+    cellTxt(1, 9, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " | stop " + str.tostring(trS, format.mintick) +
+         (trDone1 and p1 > 0 ? " (TP1 hit)" : " | TP1 " + str.tostring(trT1, format.mintick)) + " | TP2 " + str.tostring(trT, format.mintick) :
+         pendOn ? "Edge swept — waiting for a close back inside" : rangeOk ? "In a tight range — watching both edges" : "Flat"
+    cellTxt(0, 10, "Current")
+    cellTxt(1, 10, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
