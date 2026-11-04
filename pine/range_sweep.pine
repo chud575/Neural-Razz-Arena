@@ -1,6 +1,7 @@
 //@version=6
-// Range Sweep – Liquidity Sweep Reversal   ·   v1.0
+// Range Sweep – Liquidity Sweep Reversal   ·   v1.1
 // Changelog
+//  v1.1  Default range length 120 bars (≈ 5 days on 1h) so multi-day ranges like BTC Oct 30 – Nov 4 2026 qualify
 //  v1.0  First version
 //
 // Finds TIGHT RANGES and fades a LIQUIDITY SWEEP of either edge, with a built-in performance tracker.
@@ -17,12 +18,12 @@
 //              next bar). ATR = ATR of the bar before the signal.
 // Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
 // one trade at a time.
-indicator("Range Sweep – Liquidity Sweep Reversal v1.0", shorttitle = "Range Sweep v1.0", overlay = true,
+indicator("Range Sweep – Liquidity Sweep Reversal v1.1", shorttitle = "Range Sweep v1.1", overlay = true,
      max_bars_back = 500, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpR = "Range"
-rangeLen     = input.int(48, "Range length (bars)", minval = 5, maxval = 400, group = grpR,
+rangeLen     = input.int(120, "Range length (bars)", minval = 5, maxval = 400, group = grpR,
      tooltip = "The range is the highest high / lowest low of this many bars before the current bar.")
 atrLen       = input.int(14, "ATR length", minval = 1, group = grpR)
 minRangeAtr  = input.float(2.0, "Min range height (× ATR)", minval = 0.0, step = 0.5, group = grpR)
@@ -335,7 +336,7 @@ if barstate.islast
          " touches | " + reclaimMode + " | TP2: " + (tgtMode == "R:R" ? str.tostring(tp2RR, "#.##") + "R" : tgtMode) +
          (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "") +
          (trendOn ? " | SMA" + str.tostring(trendLen) : "")
-    cellTxt(0, 0, "Range Sweep v1.0 — Historical Performance  (" + cfg + ")", color.white, color.new(color.purple, 40))
+    cellTxt(0, 0, "Range Sweep v1.1 — Historical Performance  (" + cfg + ")", color.white, color.new(color.purple, 40))
     cellTxt(0, 1, "Metric", color.silver)
     cellTxt(1, 1, "Longs", color.silver)
     cellTxt(2, 1, "Shorts", color.silver)

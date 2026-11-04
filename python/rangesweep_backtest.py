@@ -32,12 +32,12 @@ from dtdb_backtest import Result, Trade, _f, fetch_yahoo, max_dd_r, stats
 from exits import make_entry, scale_step
 from srflip_backtest import atr
 
-__version__ = "1.0"  # same version as pine/range_sweep.pine
+__version__ = "1.1"  # same version as pine/range_sweep.pine
 
 
 @dataclass
 class RSParams:
-    range_len: int = 48
+    range_len: int = 120
     atr_len: int = 14
     min_range_atr: float = 2.0
     max_range_atr: float = 10.0
@@ -208,7 +208,7 @@ def main(argv=None):
     ap.add_argument("--interval", default="1h")
     ap.add_argument("--range", default="730d")
     ap.add_argument("--csv", default=None, help="read OHLC from this CSV instead of downloading (one symbol)")
-    ap.add_argument("--range-len", type=int, default=48)
+    ap.add_argument("--range-len", type=int, default=120)
     ap.add_argument("--max-range-atr", type=float, default=10.0)
     ap.add_argument("--touches", type=int, default=2)
     ap.add_argument("--reclaim", default="same_bar", choices=["same_bar", "within_n"])
