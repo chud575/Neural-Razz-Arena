@@ -81,7 +81,9 @@ def main(argv=None):
     ap.add_argument("--out", default="results/btc_sweep.md")
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--prefix", default="btc")
+    S.add_fee_args(ap)
     a = ap.parse_args(argv)
+    S.apply_fee_args(a)
     df = pd.concat([pd.read_csv(p) for p in a.csv], ignore_index=True)
     df = df.drop_duplicates(["strategy", "tf", "config", "direction"], keep="last")
     tfs = [tf for tf in TF_ORDER if tf in set(df.tf)]
@@ -92,7 +94,7 @@ def main(argv=None):
             ("oos_n", "OOS trades", "{:.0f}"), ("oos_avg", "OOS avg R (net)", "{:+.3f}"), ("oos_sum", "OOS total R", "{:+.1f}"),
             ("oos_win", "OOS win %", "{:.0f}")]
     lines = [f"# {a.prefix.upper()} strategy sweep — 15m / 1h / 4h / 1D\n",
-             f"Costs: {S.COST_RT * 100:.2f}% round trip per trade (0.1% per side), charged in R. "
+             f"Costs: {S.fee_label()}, charged in R. "
              f"In-sample (IS) = first {int(S.SPLIT * 100)}% of each timeframe's history, out-of-sample (OOS) = last "
              f"{100 - int(S.SPLIT * 100)}%. Rankings use IS only. Data: Coinbase {a.prefix.upper()}-USD (4h resampled from 1h).\n"]
     summary = []

@@ -4,8 +4,11 @@ BTC parameter sweep for all three strategies on 15m / 1h / 4h / 1D, with an in-s
 Method
   * Each timeframe's history is split by time: first 70 % = in-sample (IS), last 30 % = out-of-sample (OOS).
   * Every configuration is backtested once over the full history; trades are assigned to IS/OOS by signal time.
-  * Costs: COST_RT (default 0.2 % round trip = 0.1 % per side) is charged on every trade, converted to R
-    (cost_R = COST_RT * entry / risk), so tight stops pay proportionally more.
+  * Costs (converted to R: cost_R = cost_fraction * entry / risk, so tight stops pay proportionally more):
+      --fees flat   : COST_RT round trip on every trade (default 0.2 % = 0.1 % per side)
+      --fees futures: taker fee on entry; exit at a target = maker fee, at a stop / breakeven = taker fee;
+                      plus funding FUNDING_8H per 8 hours held (longs pay, shorts receive).
+                      Defaults = Bybit VIP 3: taker 0.035 %, maker 0.014 %, funding 0.01 % / 8 h.
   * Configurations are ranked ONLY on IS (t-stat of net R per trade, minimum trade count). The OOS columns show
     how those picks did on data the ranking never saw. Direction (both / longs / shorts) is split from the same
     run (approximation: a longs-only run could also take trades skipped while a short was open).
@@ -33,6 +36,24 @@ import rangesweep_backtest as RS
 import srflip_backtest as SR
 
 COST_RT = 0.002
+FEE_MODEL = "flat"        # flat | futures
+TAKER = 0.00035
+MAKER = 0.00014
+FUNDING_8H = 0.0001
+
+
+def cost_fraction(direction: int, exit_at_target: bool, hours_held: float) -> float:
+    """Total trading cost as a fraction of the entry price."""
+    if FEE_MODEL == "flat":
+        return COST_RT
+    return TAKER + (MAKER if exit_at_target else TAKER) + direction * FUNDING_8H * hours_held / 8.0
+
+
+def fee_label() -> str:
+    if FEE_MODEL == "flat":
+        return f"{COST_RT * 100:.2f}% round trip per trade"
+    return (f"futures fees: taker {TAKER * 100:.3f}% on entry, exit maker {MAKER * 100:.3f}% at target / taker "
+            f"{TAKER * 100:.3f}% at stop, funding {FUNDING_8H * 100:.3f}% per 8 h (longs pay, shorts receive)")
 SPLIT = 0.70
 MIN_IS = {"1d": 15, "4h": 50, "1h": 80, "15m": 120}
 HTF_FOR = {"15m": ("4h", "D"), "1h": ("D", "W"), "4h": ("D", "W"), "1d": ("W", "ME")}
@@ -125,7 +146,9 @@ STRATS = {"rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Para
 # ───────────────────────────── evaluation ─────────────────────────────
 def net_r(t) -> float:
     risk = t.risk if not math.isnan(t.risk) and t.risk > 0 else abs(t.entry_px - t.stop_px)
-    return t.r - (COST_RT * t.entry_px / risk if risk > 0 else 0.0)
+    hours = (pd.Timestamp(t.exit_time) - pd.Timestamp(t.signal_time)).total_seconds() / 3600.0
+    cf = cost_fraction(t.direction, str(t.reason).startswith("TP"), hours)
+    return t.r - (cf * t.entry_px / risk if risk > 0 else 0.0)
 
 
 def summ(rs: list[float]) -> dict:
@@ -163,6 +186,7 @@ def random_oos_control(tf, trades, rr_of, reps=20, seed=0):
     o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
     n = len(c)
     start = int(n * SPLIT)
+    bar_h = df.index.to_series().diff().median().total_seconds() / 3600.0
     out = []
     for t in trades:
         risk = t.risk if not math.isnan(t.risk) and t.risk > 0 else abs(t.entry_px - t.stop_px)
@@ -176,15 +200,28 @@ def random_oos_control(tf, trades, rr_of, reps=20, seed=0):
             for j in range(i + 1, n):
                 if (l[j] <= stop) if d == 1 else (h[j] >= stop):
                     px = min(o[j], stop) if d == 1 else max(o[j], stop)
-                    out.append(d * (px - e) / abs(e - stop) - COST_RT / dist); break
+                    out.append(d * (px - e) / abs(e - stop) - cost_fraction(d, False, (j - i) * bar_h) / dist); break
                 if (h[j] >= tgt) if d == 1 else (l[j] <= tgt):
                     px = max(o[j], tgt) if d == 1 else min(o[j], tgt)
-                    out.append(d * (px - e) / abs(e - stop) - COST_RT / dist); break
+                    out.append(d * (px - e) / abs(e - stop) - cost_fraction(d, True, (j - i) * bar_h) / dist); break
     return float(np.mean(out)) if out else math.nan
 
 
 def fmt(v, f="{:+.3f}"):
     return "–" if v is None or (isinstance(v, float) and math.isnan(v)) else f.format(v)
+
+
+def add_fee_args(ap):
+    ap.add_argument("--fees", default="flat", choices=["flat", "futures"])
+    ap.add_argument("--cost-rt", type=float, default=COST_RT, help="flat round-trip cost (fraction)")
+    ap.add_argument("--taker", type=float, default=TAKER)
+    ap.add_argument("--maker", type=float, default=MAKER)
+    ap.add_argument("--funding8h", type=float, default=FUNDING_8H)
+
+
+def apply_fee_args(a):
+    global FEE_MODEL, COST_RT, TAKER, MAKER, FUNDING_8H
+    FEE_MODEL, COST_RT, TAKER, MAKER, FUNDING_8H = a.fees, a.cost_rt, a.taker, a.maker, a.funding8h
 
 
 def main(argv=None):
@@ -195,7 +232,9 @@ def main(argv=None):
     ap.add_argument("--strategies", default="dtdb,srflip,megaphone")
     ap.add_argument("--procs", type=int, default=os.cpu_count())
     ap.add_argument("--prefix", default="btc", help="asset prefix of the data files (btc, eth, xrp, avax)")
+    add_fee_args(ap)
     a = ap.parse_args(argv)
+    apply_fee_args(a)
     tfs = a.tfs.split(",")
     load(a.data, tfs, a.prefix)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
