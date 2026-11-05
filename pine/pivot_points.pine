@@ -1,0 +1,442 @@
+//@version=6
+// Pivot Points – Bounce & Breakout   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Trades classic pivot levels from a higher (or the same) timeframe on your chart timeframe, with a built-in
+// performance tracker that is net of futures fees and funding. Python twin: python/pivots_backtest.py.
+//
+//  Levels (from the previous COMPLETED pivot period's high H, low L, close C — they never repaint):
+//    Traditional  P=(H+L+C)/3  R1=2P−L  S1=2P−H  R2=P+(H−L)  S2=P−(H−L)  R3=H+2(P−L)  S3=L−2(H−P)
+//    Fibonacci    R/S 1-3 = P ± 0.382 / 0.618 / 1.0 × (H−L)
+//    Camarilla    R/S 1-4 = C ± 1.1(H−L) / 12, 6, 4, 2
+//    Woodie       P=(H+L+2C)/4, then as Traditional
+//  Bounce:   price comes to a support from above and holds → long; to a resistance from below → short.
+//            Entry "Rejection close" (trades through the level, closes back) or "Touch" (limit at the level).
+//  Breakout: previous close on one side, a close beyond the level by X × ATR → trade the breakout.
+//  Stop: level ∓ X × ATR.  TP2: the next pivot level (S1 → P, R1 → R2 on a breakout …) or an R:R multiple.
+//  TP1 / % at TP1 / breakeven as in the other scripts. One trade per level per pivot period; optional exit
+//  at the start of the next pivot period. Simulation: stop first if stop and target share a bar; a limit fill
+//  only checks its stop on the fill bar; gaps fill at the open; one trade at a time.
+indicator("Pivot Points – Bounce & Breakout v1.0", shorttitle = "Pivots v1.0", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpL = "Pivot levels"
+pivType = input.string("Traditional", "Pivot type", options = ["Traditional", "Fibonacci", "Camarilla", "Woodie"], group = grpL)
+pivTF   = input.timeframe("D", "Pivot period", group = grpL,
+     tooltip = "Levels come from the previous completed bar of this timeframe (D = yesterday, W = last week, M = last month). Set it equal to the chart timeframe to use the previous chart bar.")
+showLv  = input.bool(true, "Show pivot levels", group = grpL)
+
+grpE = "Trades"
+modeIn  = input.string("Bounce", "Mode", options = ["Bounce", "Breakout", "Both"], group = grpE)
+entryIn = input.string("Rejection close", "Bounce entry", options = ["Rejection close", "Touch"], group = grpE,
+     tooltip = "Rejection close: the candle trades through the level and closes back on the bounce side; enter at the close.\nTouch: limit order at the level.")
+useL1   = input.bool(true,  "Trade level 1 (S1 / R1)", group = grpE)
+useL2   = input.bool(false, "Trade level 2 (S2 / R2)", group = grpE)
+useL3   = input.bool(false, "Trade level 3 (S3 / R3)", group = grpE)
+useL4   = input.bool(false, "Trade level 4 (Camarilla S4 / R4)", group = grpE)
+atrLen  = input.int(14, "ATR length", minval = 1, group = grpE)
+stopAtr = input.float(0.5, "Stop beyond the level (× ATR)", minval = 0.05, step = 0.05, group = grpE)
+brkAtr  = input.float(0.1, "Breakout: close beyond the level by (× ATR)", minval = 0.0, step = 0.05, group = grpE)
+exitEop = input.bool(false, "Exit at the start of the next pivot period", group = grpE)
+
+grpT = "Targets"
+tgtMode = input.string("Next pivot level", "TP2 target", options = ["Next pivot level", "R:R"], group = grpT)
+tp1RR   = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpT,
+     tooltip = "TP1 distance as a multiple of the risk (entry → stop). Pulled back to TP2 if it would be beyond it.")
+tp2RR   = input.float(2.0, "TP2 (reward : risk) — used for R:R, or when there is no next level", minval = 0.1, step = 0.1, group = grpT)
+tp1Pct  = input.float(50, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
+     tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
+beOn    = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
+p1      = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven / period end = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC)
+liqDistPct = 100.0 / leverage - mmrPct
+
+grpF = "Filters & visuals"
+tradeLongs  = input.bool(true, "Longs", group = grpF)
+tradeShorts = input.bool(true, "Shorts", group = grpF)
+showTrades  = input.bool(true, "Label entries & exits", group = grpF)
+tblPosIn    = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpF)
+tblSizeIn   = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpF)
+
+if timeframe.in_seconds(pivTF) < timeframe.in_seconds(timeframe.period)
+    runtime.error("Pivot period (" + pivTF + ") must be the chart timeframe or higher.")
+
+atrV    = ta.atr(atrLen)
+atrPrev = atrV[1]
+
+// ───────────────────────────── Pivot levels ─────────────────────────────
+// [1] + lookahead_on = the last COMPLETED pivot-period bar only (no repainting)
+[pH, pL, pC] = request.security(syminfo.tickerid, pivTF, [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+bool newPeriod = timeframe.change(pivTF)
+float rng = pH - pL
+float P   = pivType == "Woodie" ? (pH + pL + 2 * pC) / 4.0 : (pH + pL + pC) / 3.0
+float R1 = na
+float S1 = na
+float R2 = na
+float S2 = na
+float R3 = na
+float S3 = na
+float R4 = na
+float S4 = na
+if pivType == "Fibonacci"
+    R1 := P + 0.382 * rng
+    S1 := P - 0.382 * rng
+    R2 := P + 0.618 * rng
+    S2 := P - 0.618 * rng
+    R3 := P + rng
+    S3 := P - rng
+else if pivType == "Camarilla"
+    float k = 1.1 * rng
+    R1 := pC + k / 12.0
+    S1 := pC - k / 12.0
+    R2 := pC + k / 6.0
+    S2 := pC - k / 6.0
+    R3 := pC + k / 4.0
+    S3 := pC - k / 4.0
+    R4 := pC + k / 2.0
+    S4 := pC - k / 2.0
+else
+    R1 := 2 * P - pL
+    S1 := 2 * P - pH
+    R2 := P + rng
+    S2 := P - rng
+    R3 := pH + 2 * (P - pL)
+    S3 := pL - 2 * (pH - P)
+int top = pivType == "Camarilla" ? 4 : 3
+
+// signed ladder position: 0 = P, +k = Rk, −k = Sk
+levelAt(int pos) =>
+    float v = na
+    if pos == 0
+        v := P
+    else if pos == 1
+        v := R1
+    else if pos == 2
+        v := R2
+    else if pos == 3
+        v := R3
+    else if pos == 4
+        v := R4
+    else if pos == -1
+        v := S1
+    else if pos == -2
+        v := S2
+    else if pos == -3
+        v := S3
+    else if pos == -4
+        v := S4
+    math.abs(pos) > top ? na : v
+
+// ─────────────────────── Performance storage ───────────────────────
+// index = (long ? 0 : 4) + level − 1
+var array<float> aWins = array.new<float>(8, 0.0)
+var array<float> aLoss = array.new<float>(8, 0.0)
+var array<float> aSumR = array.new<float>(8, 0.0)
+var array<float> aGW   = array.new<float>(8, 0.0)
+var array<float> aGL   = array.new<float>(8, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)
+var int liqCount = 0
+
+recordExit(int dir, int lvl, float r) =>
+    int idx = (dir == 1 ? 0 : 4) + lvl - 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
+
+// Advance an open trade by one bar (TP1 / TP2 scale-out).
+// Returns [stillOpen, tp1Done, stop, totalR, tp1FillPx (na = none), finalExitPx (na = none), exitTag]
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 and p1 > 0 ? 1.0 - p1 : 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false
+            else if beOn
+                st := ePx
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP2"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        op   := false
+    [op, done1, st, accR, t1Px, xPx, tag]
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── Trade state ─────────────────────────────
+var bool  inTr    = false
+var int   trD     = 0
+var int   trLvl   = 1
+var float trE     = na
+var float trS     = na
+var float trT     = na      // TP2
+var float trT1    = na      // TP1
+var bool  trDone1 = false
+var float trR     = 0.0
+var float trRisk  = na
+var int   trBar   = na
+var int   trTime  = na
+var line  trLine  = na
+var array<bool> used = array.new<bool>(16, false)   // (breakout ? 8 : 0) + (resistance ? 4 : 0) + level − 1
+
+// 0) New pivot period: reset used levels, optional exit at the open
+if newPeriod
+    for j = 0 to 15
+        array.set(used, j, false)
+    if inTr and exitEop and timeframe.in_seconds(pivTF) > timeframe.in_seconds(timeframe.period)
+        float rem = trDone1 and p1 > 0 ? 1.0 - p1 : 1.0
+        trR := trR + rem * trD * (open - trE) / trRisk
+        trR := trR - costR(trD, trE, trRisk, false, trTime)
+        recordExit(trD, trLvl, trR)
+        exitLabel(open, "Period end total", trR)
+        inTr := false
+
+// 1) Manage open trade
+if inTr and bar_index > trBar
+    [op, dn, st, ar, t1Fill, xPx, tag] = stepEntry(trD, trE, trRisk, trS, trT1, trT, trDone1, trR)
+    trDone1 := dn
+    trS     := st
+    trR     := ar
+    if not na(t1Fill) and p1 < 1
+        exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
+    if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP2", trTime)
+        recordExit(trD, trLvl, trR)
+        exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
+        inTr := false
+if not na(trLine)
+    line.set_x2(trLine, bar_index)
+    if not inTr
+        trLine := na
+
+// 2) New entries (flat only)
+bool doBounce = modeIn != "Breakout"
+bool doBrk    = modeIn != "Bounce"
+bool done     = false
+if not inTr and not na(atrPrev) and not na(P)
+    for k = 1 to 4
+        bool on = k == 1 ? useL1 : k == 2 ? useL2 : k == 3 ? useL3 : useL4
+        if done or not on or k > top
+            continue
+        // bounce: long at S_k, short at R_k ; breakout: long through R_k, short through S_k
+        for leg = 0 to 3
+            if done
+                break
+            bool isBrk = leg >= 2
+            int  d     = leg % 2 == 0 ? 1 : -1
+            int  pos   = isBrk ? d * k : -d * k             // ladder position of the level
+            int  uIdx  = (isBrk ? 8 : 0) + (pos > 0 ? 4 : 0) + k - 1
+            bool sideOk = d == 1 ? tradeLongs : tradeShorts
+            if (isBrk ? not doBrk : not doBounce) or not sideOk or array.get(used, uIdx)
+                continue
+            float lvl = levelAt(pos)
+            if na(lvl)
+                continue
+            float e     = na
+            float plan  = na
+            float stp   = lvl - d * stopAtr * atrPrev
+            if not isBrk
+                bool fromSide = d == 1 ? close[1] > lvl : close[1] < lvl
+                bool touched  = d == 1 ? low <= lvl : high >= lvl
+                if fromSide and touched
+                    if entryIn == "Touch"
+                        e    := d == 1 ? math.min(open, lvl) : math.max(open, lvl)
+                        plan := lvl
+                    else if (d == 1 ? close > lvl : close < lvl)
+                        e := close
+            else if (d == 1 ? close[1] <= lvl and close > lvl + brkAtr * atrPrev : close[1] >= lvl and close < lvl - brkAtr * atrPrev)
+                e := close
+            if na(e)
+                continue
+            array.set(used, uIdx, true)
+            float ref  = na(plan) ? e : plan
+            float risk = math.abs(ref - stp)
+            float nx   = levelAt(pos + d)
+            float tgt  = tgtMode == "Next pivot level" and not na(nx) ? nx : ref + d * tp2RR * risk
+            if isBrk and (tgt - e) * d <= 0
+                tgt := e + d * tp2RR * risk
+            if risk > 0 and (e - stp) * d > 0 and (tgt - ref) * d > 0
+                float t1 = ref + d * tp1RR * risk
+                inTr    := true
+                done    := true
+                trD     := d
+                trLvl   := k
+                trE     := e
+                trS     := stp
+                trT     := tgt
+                trT1    := (t1 - tgt) * d > 0 ? tgt : t1
+                trDone1 := p1 <= 0
+                trR     := 0.0
+                trRisk  := risk
+                trBar   := bar_index
+                trTime  := time
+                if liqWarn(trE, trS, trD)
+                    liqCount += 1
+                string nm = (pos > 0 ? "R" : "S") + str.tostring(k)
+                if showTrades
+                    label.new(bar_index, e, (isBrk ? "BO " : "Bounce ") + nm + (d == 1 ? " ↑" : " ↓"),
+                         style = d == 1 ? label.style_label_up : label.style_label_down,
+                         color = d == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor = color.white, size = size.tiny)
+                    trLine := line.new(bar_index, e, bar_index, e, color = color.blue, width = 2)
+                alert("Pivot " + (isBrk ? "BREAKOUT " : "BOUNCE ") + nm + " " + (d == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker +
+                     " | entry " + str.tostring(e, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+                     " | TP1 " + str.tostring(trT1, format.mintick) + " | TP2 " + str.tostring(tgt, format.mintick), alert.freq_once_per_bar)
+                if not na(plan) and (d == 1 ? low <= stp : high >= stp)      // limit filled, stopped in the same bar
+                    float r0 = recordExit(trD, trLvl, trD * (stp - trE) / trRisk - costR(trD, trE, trRisk, false, time))
+                    exitLabel(stp, "SL", r0)
+                    inTr := false
+
+// ───────────────────────────── Plots ─────────────────────────────
+lvlPlot(float v) => showLv and not newPeriod ? v : na
+plot(lvlPlot(P),  "P",  color.new(color.gray, 0), 2, plot.style_linebr)
+plot(lvlPlot(R1), "R1", color.new(color.red, 30), 1, plot.style_linebr)
+plot(lvlPlot(R2), "R2", color.new(color.red, 45), 1, plot.style_linebr)
+plot(lvlPlot(R3), "R3", color.new(color.red, 60), 1, plot.style_linebr)
+plot(lvlPlot(R4), "R4", color.new(color.red, 70), 1, plot.style_linebr)
+plot(lvlPlot(S1), "S1", color.new(color.green, 30), 1, plot.style_linebr)
+plot(lvlPlot(S2), "S2", color.new(color.green, 45), 1, plot.style_linebr)
+plot(lvlPlot(S3), "S3", color.new(color.green, 60), 1, plot.style_linebr)
+plot(lvlPlot(S4), "S4", color.new(color.green, 70), 1, plot.style_linebr)
+plot(inTr ? trS : na, "Stop", color.red, 1, plot.style_linebr)
+plot(inTr and p1 > 0 and not trDone1 ? trT1 : na, "TP1", color.lime, 1, plot.style_linebr)
+plot(inTr and p1 < 1 ? trT : na, "TP2", color.teal, 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 14, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+sumSet(array<float> a, array<int> ids) =>
+    float s = 0.0
+    for ix in ids
+        s += array.get(a, ix)
+    s
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, array<int> ids) =>
+    float w = sumSet(aWins, ids)
+    float l = sumSet(aLoss, ids)
+    float r = sumSet(aSumR, ids)
+    float n = w + l
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(sumSet(aGW, ids), sumSet(aGL, ids)))
+
+levelR(int k) =>
+    float w = array.get(aWins, k - 1) + array.get(aWins, 4 + k - 1)
+    float l = array.get(aLoss, k - 1) + array.get(aLoss, 4 + k - 1)
+    float r = array.get(aSumR, k - 1) + array.get(aSumR, 4 + k - 1)
+    w + l > 0 ? str.tostring(w + l, "#") + " trades, " + fmtR(r / (w + l)) + " avg" : "–"
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 8 to 13
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string lv = (useL1 ? "1" : "") + (useL2 ? "2" : "") + (useL3 ? "3" : "") + (useL4 ? "4" : "")
+    string cfg = pivType + " " + pivTF + " | " + modeIn + (modeIn != "Breakout" ? " (" + entryIn + ")" : "") + " | levels " + lv +
+         " | TP2: " + (tgtMode == "R:R" ? str.tostring(tp2RR, "#.##") + "R" : "next level") +
+         (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "") +
+         (exitEop ? " | exit at period end" : "")
+    cellTxt(0, 0, "Pivots v1.0 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.teal, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Longs", color.silver)
+    cellTxt(2, 1, "Shorts", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    writeCol(1, array.from(0, 1, 2, 3))
+    writeCol(2, array.from(4, 5, 6, 7))
+    writeCol(3, array.from(0, 1, 2, 3, 4, 5, 6, 7))
+    cellTxt(0, 8, "Level 1 (S1/R1)")
+    cellTxt(1, 8, levelR(1))
+    cellTxt(0, 9, "Level 2 (S2/R2)")
+    cellTxt(1, 9, levelR(2))
+    cellTxt(0, 10, "Level 3 (S3/R3)")
+    cellTxt(1, 10, levelR(3))
+    cellTxt(0, 11, "Max drawdown")
+    cellTxt(1, 11, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " | stop " + str.tostring(trS, format.mintick) +
+         (trDone1 and p1 > 0 ? " (TP1 hit)" : " | TP1 " + str.tostring(trT1, format.mintick)) + " | TP2 " + str.tostring(trT, format.mintick) : "Flat"
+    cellTxt(0, 12, "Current")
+    cellTxt(1, 12, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 13, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 13, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

@@ -16,7 +16,7 @@ import run_btc_sweep as S
 
 TF_ORDER = ["15m", "1h", "4h", "1d"]
 TF_NAME = {"15m": "15-minute", "1h": "1-hour", "4h": "4-hour", "1d": "Daily"}
-STRAT_NAME = {"rangesweep": "Range Sweep", "dtdb": "Double Top / Bottom", "ttb": "Triple Top / Bottom", "srflip": "S/R Flip", "megaphone": "Megaphone"}
+STRAT_NAME = {"pivots": "Pivot Points", "rangesweep": "Range Sweep", "dtdb": "Double Top / Bottom", "ttb": "Triple Top / Bottom", "srflip": "S/R Flip", "megaphone": "Megaphone"}
 
 
 def config_kwargs(strat: str, tf: str, name: str) -> dict:
@@ -58,6 +58,8 @@ def family(strat: str, cfg: str) -> str:
     tok = cfg.split()
     if strat in ("dtdb", "ttb"):
         return tok[3]                                   # B+Mid / B / Retest / RetestConf / B+Retest
+    if strat == "pivots":
+        return f"{tok[0]} {tok[1]} · {tok[2]}"        # type, pivot period · mode
     if strat == "rangesweep":
         return f"{tok[3]} · {tok[6]}"                 # reclaim mode · target
     if strat == "srflip":
@@ -102,7 +104,7 @@ def main(argv=None):
         bh_is, bh_oos, t0, tk, t1 = buy_hold(tf)
         lines.append(f"\n## {TF_NAME[tf]}  (IS {t0.date()} → {tk.date()}, OOS {tk.date()} → {t1.date()}; "
                      f"{a.prefix.upper()} buy & hold: IS {bh_is:+.0f}%, OOS {bh_oos:+.0f}%)\n")
-        for strat in ("rangesweep", "dtdb", "ttb", "srflip", "megaphone"):
+        for strat in ("pivots", "rangesweep", "dtdb", "ttb", "srflip", "megaphone"):
             sub = df[(df.tf == tf) & (df.strategy == strat)]
             if sub.empty:
                 continue

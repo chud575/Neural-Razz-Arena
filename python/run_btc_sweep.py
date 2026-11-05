@@ -32,6 +32,7 @@ import pandas as pd
 
 import dtdb_backtest as DT
 import megaphone_backtest as MP
+import pivots_backtest as PV
 import rangesweep_backtest as RS
 import srflip_backtest as SR
 
@@ -139,7 +140,23 @@ def grid_rangesweep(tf):
                dict(range_len=rl, max_range_atr=mx, min_touches=tch, reclaim=rec, sweep_max_atr=smax, stop_atr=st, **tk, **e))
 
 
-STRATS = {"rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
+PIVOT_TFS = {"15m": ("D", "W"), "1h": ("D", "W"), "4h": ("D", "W", "M"), "1d": ("chart", "W", "M")}
+
+
+def grid_pivots(tf):
+    modes = [("bounce-touch", dict(mode="bounce", entry="touch")), ("bounce-rejection", dict(mode="bounce", entry="rejection")),
+             ("breakout", dict(mode="breakout"))]
+    for ptf, kind, (mn, mk), lvl, st, tg, eop in itertools.product(
+            PIVOT_TFS[tf], ("traditional", "fibonacci", "camarilla", "woodie"), modes, (1, 2, 3), (0.5, 1.0),
+            ("next", "2R"), (False, True)):
+        if eop and ptf == "chart":
+            continue
+        yield (f"{kind} pivots:{ptf} {mn} level{lvl} stop{st:g}ATR target:{tg} exitAtPeriodEnd:{'yes' if eop else 'no'}",
+               dict(pivot_tf=ptf, pivot_type=kind, levels=(lvl,), stop_atr=st, exit_eop=eop,
+                    target="next" if tg == "next" else "rr", rr=2.0, **mk))
+
+
+STRATS = {"pivots": (PV, PV.PVParams, grid_pivots), "rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
           "megaphone": (MP, MP.MPParams, grid_megaphone)}
 
 
