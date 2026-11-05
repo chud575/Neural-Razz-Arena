@@ -1,0 +1,59 @@
+coin tf  settings                                                                        side    IS n    IS R OOS n   OOS R  random med stop liq@25x
+btc  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     269  +0.521   122  +0.045  -0.034    1.25%      5%
+btc  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs    156  +0.645    64  +0.099  -0.004    1.20%      1%
+btc  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts   113  +0.349    58  -0.014  -0.073    1.29%      9%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     238  +0.335   105  +0.084  -0.014    2.42%     27%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs    139  +0.493    56  +0.132  +0.002    2.39%     22%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts    99  +0.114    49  +0.030  -0.102    2.62%     33%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both     236  +0.341   106  +0.206  -0.020    2.41%     27%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs    138  +0.492    57  +0.197  -0.016    2.34%     21%
+btc  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts    98  +0.128    49  +0.217  -0.097    2.63%     34%
+btc  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both      64  +0.191    29  +0.208  +0.047    2.92%     37%
+btc  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs     37  +0.412    19  +0.051  -0.062    2.37%     21%
+btc  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts    27  -0.113    10  +0.505  +0.101    4.34%     59%
+btc  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noboth    1245  +0.020   592  -0.100  -0.090    1.02%      3%
+btc  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:nolongs    659  -0.117   297  -0.151  -0.082    1.07%      4%
+btc  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noshorts   586  +0.175   295  -0.048  -0.121    0.99%      2%
+eth  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     261  +0.229   110  +0.267  +0.041    1.89%     15%
+eth  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs    147  +0.081    59  +0.096  -0.071    1.76%     10%
+eth  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts   114  +0.420    51  +0.464  +0.106    2.10%     21%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     241  +0.303    96  +0.082  +0.024    3.35%     47%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs    137  +0.205    51  +0.156  +0.058    3.10%     39%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts   104  +0.432    45  -0.002  -0.010    3.92%     57%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both     237  +0.321    91  +0.227  +0.059    3.32%     47%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs    135  +0.345    49  +0.361  +0.031    3.04%     39%
+eth  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts   102  +0.290    42  +0.072  +0.058    3.80%     56%
+eth  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both      57  +0.402    29  +0.313  +0.014    3.65%     52%
+eth  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs     34  +0.383    16  +0.069  -0.050    3.49%     50%
+eth  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts    23  +0.429    13  +0.613  -0.096    3.82%     56%
+eth  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noboth    1230  -0.035   620  +0.021  -0.064    1.39%      7%
+eth  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:nolongs    679  -0.106   306  +0.025  -0.079    1.45%      9%
+eth  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noshorts   551  +0.053   314  +0.018  -0.045    1.34%      5%
+avax 1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     130  +0.104    58  -0.185  -0.003    2.09%     16%
+avax 1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs     69  -0.143    24  +0.320  +0.015    1.87%     14%
+avax 1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts    61  +0.385    34  -0.541  +0.065    2.18%     19%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both     109  +0.099    53  +0.180  +0.031    3.87%     57%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs     58  -0.024    21  +0.581  -0.073    3.49%     49%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts    51  +0.239    32  -0.084  +0.063    4.27%     65%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both     107  +0.138    52  +0.023  -0.059    3.87%     58%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs     58  +0.008    21  +0.394  -0.049    3.49%     49%
+avax 4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts    49  +0.291    31  -0.228  +0.134    4.35%     66%
+avax 4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both      33  -0.010    11  +1.437  +0.049    4.13%     59%
+avax 4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs     15  -0.224     7  +1.546  +0.078    3.48%     50%
+avax 1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noboth     752  +0.010   323  +0.044  -0.058    1.66%      9%
+avax 1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:nolongs    380  +0.002   160  -0.025  -0.111    1.70%      8%
+avax 1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noshorts   372  +0.018   163  +0.112  +0.018    1.64%     11%
+xrp  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both      86  -0.268    33  -0.427  -0.013    1.62%     12%
+xrp  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs     47  -0.057    14  -0.206  -0.089    1.78%     13%
+xrp  1h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts    39  -0.522    19  -0.590  +0.048    1.46%     10%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    both      82  +0.010    31  +0.038  +0.036    3.01%     38%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    longs     46  -0.063    13  +0.311  -0.113    3.16%     42%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:next exitAtPeriodEnd:no    shorts    36  +0.103    18  -0.160  +0.084    2.88%     33%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both      81  +0.017    31  +0.042  -0.005    3.02%     38%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      longs     46  -0.055    13  +0.115  -0.187    3.16%     42%
+xrp  4h  traditional pivots:W breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts    35  +0.112    18  -0.010  +0.116    2.89%     34%
+xrp  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      both      19  -0.224     8  +0.105  +0.093    3.07%     48%
+xrp  4h  traditional pivots:M breakout level1 stop1ATR target:2R exitAtPeriodEnd:no      shorts     9  -0.338     5  -0.419  +0.071    2.88%     43%
+xrp  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noboth     458  -0.109   201  -0.006  -0.121    1.29%      5%
+xrp  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:nolongs    243  -0.181   114  +0.038  -0.126    1.30%      6%
+xrp  1h  traditional pivots:D bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:noshorts   215  -0.027    87  -0.063  -0.018    1.27%      4%

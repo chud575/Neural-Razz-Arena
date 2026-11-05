@@ -1,7 +1,8 @@
 //@version=6
 // Pivot Points – Bounce & Breakout   ·   v1.0
 // Changelog
-//  v1.0  First version
+//  v1.0  First version. Defaults = the best cross-coin result: Traditional, weekly pivots, breakout through
+//        R1/S1, stop 1 × ATR, single 2R target (use on a 4h chart).
 //
 // Trades classic pivot levels from a higher (or the same) timeframe on your chart timeframe, with a built-in
 // performance tracker that is net of futures fees and funding. Python twin: python/pivots_backtest.py.
@@ -24,12 +25,13 @@ indicator("Pivot Points – Bounce & Breakout v1.0", shorttitle = "Pivots v1.0",
 // ───────────────────────────── Inputs ─────────────────────────────
 grpL = "Pivot levels"
 pivType = input.string("Traditional", "Pivot type", options = ["Traditional", "Fibonacci", "Camarilla", "Woodie"], group = grpL)
-pivTF   = input.timeframe("D", "Pivot period", group = grpL,
+pivTF   = input.timeframe("W", "Pivot period", group = grpL,
      tooltip = "Levels come from the previous completed bar of this timeframe (D = yesterday, W = last week, M = last month). Set it equal to the chart timeframe to use the previous chart bar.")
 showLv  = input.bool(true, "Show pivot levels", group = grpL)
 
 grpE = "Trades"
-modeIn  = input.string("Bounce", "Mode", options = ["Bounce", "Breakout", "Both"], group = grpE)
+modeIn  = input.string("Breakout", "Mode", options = ["Bounce", "Breakout", "Both"], group = grpE,
+     tooltip = "Tested on BTC/ETH/AVAX/XRP (4h chart, weekly pivots): breakouts through R1/S1 held up out-of-sample on all four coins; bounces did not.")
 entryIn = input.string("Rejection close", "Bounce entry", options = ["Rejection close", "Touch"], group = grpE,
      tooltip = "Rejection close: the candle trades through the level and closes back on the bounce side; enter at the close.\nTouch: limit order at the level.")
 useL1   = input.bool(true,  "Trade level 1 (S1 / R1)", group = grpE)
@@ -37,16 +39,16 @@ useL2   = input.bool(false, "Trade level 2 (S2 / R2)", group = grpE)
 useL3   = input.bool(false, "Trade level 3 (S3 / R3)", group = grpE)
 useL4   = input.bool(false, "Trade level 4 (Camarilla S4 / R4)", group = grpE)
 atrLen  = input.int(14, "ATR length", minval = 1, group = grpE)
-stopAtr = input.float(0.5, "Stop beyond the level (× ATR)", minval = 0.05, step = 0.05, group = grpE)
+stopAtr = input.float(1.0, "Stop beyond the level (× ATR)", minval = 0.05, step = 0.05, group = grpE)
 brkAtr  = input.float(0.1, "Breakout: close beyond the level by (× ATR)", minval = 0.0, step = 0.05, group = grpE)
 exitEop = input.bool(false, "Exit at the start of the next pivot period", group = grpE)
 
 grpT = "Targets"
-tgtMode = input.string("Next pivot level", "TP2 target", options = ["Next pivot level", "R:R"], group = grpT)
+tgtMode = input.string("R:R", "TP2 target", options = ["Next pivot level", "R:R"], group = grpT)
 tp1RR   = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpT,
      tooltip = "TP1 distance as a multiple of the risk (entry → stop). Pulled back to TP2 if it would be beyond it.")
 tp2RR   = input.float(2.0, "TP2 (reward : risk) — used for R:R, or when there is no next level", minval = 0.1, step = 0.1, group = grpT)
-tp1Pct  = input.float(50, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
+tp1Pct  = input.float(0, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
      tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
 beOn    = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
 p1      = tp1Pct / 100.0
