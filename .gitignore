@@ -15,3 +15,6 @@ hand_histories/
 
 # Strategy files (large generated data)
 *.json
+# large intermediate outputs of python/ma_study.py (regenerate with: python ma_study.py <data_dir>)
+python/results/ma_study_events.csv
+python/results/ma_study_baseline.csv
