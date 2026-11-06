@@ -1,0 +1,15 @@
+strategy coin tf period n orig_gross orig_net mirror_gross mirror_net mirror_random flip_gross flip_net flip_random
+megaphone btc 4h expand0.0 fade-touch midline trend:off exit:single bad in both periods IS 264 -0.377 -0.453 0.064 0.052 -0.057 0.732 0.633 0.086
+megaphone btc 4h expand0.0 fade-touch midline trend:off exit:single bad in both periods OOS 130 -0.388 -0.476 0.077 0.060 -0.037 0.173 0.069 -0.023
+pivots btc 1d bounce-touch level2 stop1ATR target:2R exitAtPeriodEnd:no bad in both periods IS 505 -0.388 -0.406 0.195 0.189 -0.065 0.378 0.362 0.026
+pivots btc 1d bounce-touch level2 stop1ATR target:2R exitAtPeriodEnd:no bad in both periods OOS 203 -0.303 -0.328 0.152 0.146 -0.028 0.216 0.196 -0.038
+ttb btc 1h depth2.0 B+Retest 3R trend:off exit:single bad in both periods IS 89 -0.404 -0.421 0.135 0.130 -0.047 -0.259 -0.272 0.129
+ttb btc 1h depth2.0 B+Retest 3R trend:off exit:single bad in both periods OOS 53 -0.245 -0.285 0.082 0.084 0.020 0.057 0.030 -0.006
+pivots btc 1h bounce-rejection level1 stop0.5ATR target:next exitAtPeriodEnd:no bad in-sample, good OOS IS 231 -0.422 -0.512 0.100 0.079 -0.027 0.327 0.221 0.168
+pivots btc 1h bounce-rejection level1 stop0.5ATR target:next exitAtPeriodEnd:no bad in-sample, good OOS OOS 118 0.469 0.364 -0.095 -0.114 -0.026 -0.191 -0.307 -0.072
+megaphone btc 4h expand0.0 fade-rejection midline trend:off exit:single bad in both periods IS 144 -0.265 -0.313 0.081 0.067 -0.034 0.185 0.135 0.044
+megaphone btc 4h expand0.0 fade-rejection midline trend:off exit:single bad in both periods OOS 69 -0.398 -0.467 0.044 0.023 -0.035 0.348 0.276 0.045
+pivots btc 1h bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:no typical losing family IS 1245 0.086 0.020 -0.168 -0.253 -0.137 -0.034 -0.100 -0.069
+pivots btc 1h bounce-rejection level1 stop1ATR target:next exitAtPeriodEnd:no typical losing family OOS 592 -0.016 -0.100 0.006 -0.086 -0.113 0.022 -0.060 -0.092
+eth 1h range48 same_bar sweepMax3 stop0.25ATR target:opposite exit:single typical losing family IS 353 -0.257 -0.313 0.040 0.030 -0.034 0.271 0.213 0.078
+eth 1h range48 same_bar sweepMax3 stop0.25ATR target:opposite exit:single typical losing family OOS 204 -0.133 -0.208 0.026 0.010 -0.021 0.108 0.022 -0.013
