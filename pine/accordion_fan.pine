@@ -1,0 +1,359 @@
+//@version=6
+// Accordion – EMA Fan Pullback   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// EMA 8 / 13 / 21 / 34 / 55 "accordion" (moving-average fan). Python twin: python/accordion_backtest.py.
+//  Long (shorts are the mirror image):
+//   1. Fan:     EMA8 > 13 > 21 > 34 > 55 for at least N bars in a row, and the EMA8–EMA55 gap reaches at least
+//               X × ATR (a strong trend). The widest gap of the fan is remembered.
+//   2. Folding: the gap shrinks to at most a fraction of the widest gap, within M bars of the last stacked bar.
+//   3. Entry:   limit at the previous bar's EMA55, filled when price comes down through it from above.
+//   4. Stop:    X × ATR beyond the EMA55.  Target: 2:1 by default (TP1 / % at TP1 / breakeven optional).
+//   5. One trade per fan.
+//  All fan conditions use completed bars, so nothing repaints. Results table is net of futures fees and funding.
+//  Simulation: stop first if stop and target share a bar; the fill bar only checks the stop; one trade at a time.
+indicator("Accordion – EMA Fan Pullback v1.0", shorttitle = "Accordion v1.0", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpF = "Fan"
+len1 = input.int(8,  "EMA 1", minval = 1, group = grpF, inline = "e")
+len2 = input.int(13, "EMA 2", minval = 1, group = grpF, inline = "e")
+len3 = input.int(21, "EMA 3", minval = 1, group = grpF, inline = "e")
+len4 = input.int(34, "EMA 4", minval = 1, group = grpF, inline = "e2")
+len5 = input.int(55, "EMA 5 (entry line)", minval = 1, group = grpF, inline = "e2")
+fanMinAtr   = input.float(3.0, "Fan: EMA1–EMA5 gap at least (× ATR)", minval = 0.5, step = 0.5, group = grpF,
+     tooltip = "How spread out the fan must get. Higher = only very strong trends.")
+stackedBars = input.int(10, "Fan: EMAs in perfect order for at least (bars)", minval = 1, group = grpF)
+foldFrac    = input.float(0.5, "Folding: gap shrunk to at most (× widest gap)", minval = 0.05, maxval = 1.0, step = 0.05, group = grpF)
+lookback    = input.int(100, "Setup expires this many bars after the fan was last in order", minval = 5, group = grpF)
+atrLen      = input.int(14, "ATR length", minval = 1, group = grpF)
+
+grpE = "Stop & target"
+stopAtr = input.float(1.0, "Stop beyond the EMA (× ATR)", minval = 0.1, step = 0.1, group = grpE)
+tp2RR   = input.float(2.0, "Target (reward : risk)", minval = 0.1, step = 0.1, group = grpE)
+tp1RR   = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpE)
+tp1Pct  = input.float(0, "% of position closed at TP1 (0 = single 2:1 target)", minval = 0, maxval = 100, step = 5, group = grpE)
+beOn    = input.bool(true, "Move stop to breakeven after TP1", group = grpE)
+p1      = tp1Pct / 100.0
+tradeLongs  = input.bool(true, "Longs", group = grpE)
+tradeShorts = input.bool(true, "Shorts", group = grpE)
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. The EMA entry is a limit order but is charged the taker fee (conservative). Exit at the target = maker fee, at the stop / breakeven = taker fee. Funding per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC)
+liqDistPct = 100.0 / leverage - mmrPct
+
+grpV = "Visuals"
+showEmas   = input.bool(true, "Show EMAs", group = grpV)
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+e1 = ta.ema(close, len1)
+e2 = ta.ema(close, len2)
+e3 = ta.ema(close, len3)
+e4 = ta.ema(close, len4)
+e5 = ta.ema(close, len5)
+atrV = ta.atr(atrLen)
+
+// ─────────────────────── Performance storage ───────────────────────
+var array<float> aWins = array.new<float>(2, 0.0)   // 0 = longs, 1 = shorts
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)
+var int liqCount = 0
+var int fanCount = 0
+
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = size.tiny)
+    risky
+
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 and p1 > 0 ? 1.0 - p1 : 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false
+            else if beOn
+                st := ePx
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        op   := false
+    [op, done1, st, accR, t1Px, xPx, tag]
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── Fan state (from the previous, completed bar) ─────────────────────────────
+var int   runU = 0
+var bool  armU = false
+var float peakU = 0.0
+var int   lastStkU = -1000000
+var float gapU = na
+var int   runD = 0
+var bool  armD = false
+var float peakD = 0.0
+var int   lastStkD = -1000000
+var float gapD = na
+
+if bar_index >= 56 and not na(atrV[1])
+    int   k     = bar_index - 1
+    bool  stkU  = e1[1] > e2[1] and e2[1] > e3[1] and e3[1] > e4[1] and e4[1] > e5[1]
+    bool  stkD  = e1[1] < e2[1] and e2[1] < e3[1] and e3[1] < e4[1] and e4[1] < e5[1]
+    float gu    = (e1[1] - e5[1]) / atrV[1]
+    float gd    = (e5[1] - e1[1]) / atrV[1]
+    // up fan
+    runU := stkU ? runU + 1 : 0
+    if stkU
+        lastStkU := k
+    if runU >= stackedBars and gu >= fanMinAtr and not armU
+        armU  := true
+        peakU := gu
+        fanCount += 1
+        if showTrades
+            label.new(bar_index - 1, low[1], "Fan ↑", style = label.style_label_up, color = color.new(color.teal, 40),
+                 textcolor = color.white, size = size.tiny)
+    if armU
+        if stkU
+            peakU := math.max(peakU, gu)
+        if k - lastStkU > lookback
+            armU := false
+    gapU := gu
+    // down fan
+    runD := stkD ? runD + 1 : 0
+    if stkD
+        lastStkD := k
+    if runD >= stackedBars and gd >= fanMinAtr and not armD
+        armD  := true
+        peakD := gd
+        fanCount += 1
+        if showTrades
+            label.new(bar_index - 1, high[1], "Fan ↓", style = label.style_label_down, color = color.new(color.maroon, 40),
+                 textcolor = color.white, size = size.tiny)
+    if armD
+        if stkD
+            peakD := math.max(peakD, gd)
+        if k - lastStkD > lookback
+            armD := false
+    gapD := gd
+
+// ───────────────────────────── Trade state ─────────────────────────────
+var bool  inTr    = false
+var int   trD     = 0
+var float trE     = na
+var float trS     = na
+var float trT     = na
+var float trT1    = na
+var bool  trDone1 = false
+var float trR     = 0.0
+var float trRisk  = na
+var int   trBar   = na
+var int   trTime  = na
+var line  trLine  = na
+
+// 1) Manage the open trade
+if inTr and bar_index > trBar
+    [op, dn, st, ar, t1Fill, xPx, tag] = stepEntry(trD, trE, trRisk, trS, trT1, trT, trDone1, trR)
+    trDone1 := dn
+    trS     := st
+    trR     := ar
+    if not na(t1Fill) and p1 < 1
+        exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
+    if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP", trTime)
+        recordExit(trD, trR)
+        exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
+        inTr := false
+if not na(trLine)
+    line.set_x2(trLine, bar_index)
+    if not inTr
+        trLine := na
+
+// 2) Entry: folded fan + price crossing the previous bar's EMA55 from the trend side
+bool foldU = armU and gapU <= foldFrac * peakU
+bool foldD = armD and gapD <= foldFrac * peakD
+if not inTr and not na(atrV[1])
+    for side = 0 to 1
+        int  d     = side == 0 ? 1 : -1
+        bool armed = d == 1 ? armU : armD
+        bool fold  = d == 1 ? foldU : foldD
+        bool ok    = d == 1 ? tradeLongs : tradeShorts
+        if not armed or not ok
+            continue
+        float lvl      = e5[1]
+        bool  fromSide = d == 1 ? close[1] > lvl : close[1] < lvl
+        bool  crossed  = d == 1 ? low <= lvl : high >= lvl
+        if not (fold and fromSide and crossed)
+            continue
+        float e    = d == 1 ? math.min(open, lvl) : math.max(open, lvl)
+        float stp  = lvl - d * stopAtr * atrV[1]
+        float risk = math.abs(lvl - stp)
+        if d == 1
+            armU := false
+        else
+            armD := false
+        if (e - stp) * d <= 0
+            continue
+        float tgt = lvl + d * tp2RR * risk
+        float t1  = lvl + d * tp1RR * risk
+        inTr    := true
+        trD     := d
+        trE     := e
+        trS     := stp
+        trT     := tgt
+        trT1    := (t1 - tgt) * d > 0 ? tgt : t1
+        trDone1 := p1 <= 0
+        trR     := 0.0
+        trRisk  := risk
+        trBar   := bar_index
+        trTime  := time
+        if liqWarn(trE, trS, trD)
+            liqCount += 1
+        if showTrades
+            label.new(bar_index, e, d == 1 ? "Accordion ↑" : "Accordion ↓", style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = d == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor = color.white, size = size.tiny)
+            trLine := line.new(bar_index, e, bar_index, e, color = color.blue, width = 2)
+        alert("Accordion " + (d == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker + " | entry " + str.tostring(e, format.mintick) +
+             " | stop " + str.tostring(stp, format.mintick) + " | target " + str.tostring(tgt, format.mintick), alert.freq_once_per_bar)
+        if d == 1 ? low <= stp : high >= stp                        // filled, then stopped in the same bar
+            float r0 = recordExit(trD, trD * (stp - trE) / trRisk - costR(trD, trE, trRisk, false, time))
+            exitLabel(stp, "SL", r0)
+            inTr := false
+        break
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(showEmas ? e1 : na, "EMA 8",  color.new(#4fc3f7, 0), 1)
+plot(showEmas ? e2 : na, "EMA 13", color.new(#29b6f6, 10), 1)
+plot(showEmas ? e3 : na, "EMA 21", color.new(#ab47bc, 10), 1)
+plot(showEmas ? e4 : na, "EMA 34", color.new(#ff9800, 10), 1)
+plot(showEmas ? e5 : na, "EMA 55 (entry line)", color.new(#ef5350, 0), 2)
+// highlighted entry level while a folded setup is waiting (the order sits at the previous bar's EMA55)
+plot(not inTr and (foldU or foldD) ? e5[1] : na, "Pending entry (EMA55)", color.new(color.yellow, 0), 3, plot.style_linebr)
+bgcolor(not inTr and foldU ? color.new(color.teal, 92) : not inTr and foldD ? color.new(color.maroon, 92) : na, title = "Setup waiting")
+plot(inTr ? trS : na, "Stop", color.red, 1, plot.style_linebr)
+plot(inTr and p1 > 0 and not trDone1 ? trT1 : na, "TP1", color.lime, 1, plot.style_linebr)
+plot(inTr ? trT : na, "Target", color.teal, 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 12, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 8 to 11
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string cfg = "fan ≥" + str.tostring(fanMinAtr) + " ATR, " + str.tostring(stackedBars) + " bars | fold ≤" + str.tostring(foldFrac) +
+         " | stop " + str.tostring(stopAtr) + " ATR | " + str.tostring(tp2RR, "#.##") + ":1" +
+         (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "")
+    cellTxt(0, 0, "Accordion v1.0 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.blue, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Longs", color.silver)
+    cellTxt(2, 1, "Shorts", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    writeCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    writeCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    writeCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1),
+         array.get(aSumR, 0) + array.get(aSumR, 1), array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    cellTxt(0, 8, "Fans detected")
+    cellTxt(1, 8, str.tostring(fanCount))
+    cellTxt(0, 9, "Max drawdown")
+    cellTxt(1, 9, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) :
+         foldU ? "Up fan folded — buy order at EMA55 " + str.tostring(e5, format.mintick) :
+         foldD ? "Down fan folded — sell order at EMA55 " + str.tostring(e5, format.mintick) :
+         armU ? "Up fan open — waiting for it to fold" : armD ? "Down fan open — waiting for it to fold" : "No fan"
+    cellTxt(0, 10, "Current")
+    cellTxt(1, 10, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 11, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 11, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

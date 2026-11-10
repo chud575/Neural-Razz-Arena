@@ -32,6 +32,7 @@ import pandas as pd
 
 import dtdb_backtest as DT
 import megaphone_backtest as MP
+import accordion_backtest as AC
 import pivots_backtest as PV
 import rangesweep_backtest as RS
 import srflip_backtest as SR
@@ -156,7 +157,14 @@ def grid_pivots(tf):
                     target="next" if tg == "next" else "rr", rr=2.0, **mk))
 
 
-STRATS = {"pivots": (PV, PV.PVParams, grid_pivots), "rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
+def grid_accordion(tf):
+    for fan, stk, lb, fold, st, rr in itertools.product((2.0, 3.0, 5.0), (10, 20), (50, 100), (0.3, 0.5, 0.7),
+                                                       (0.5, 1.0, 1.5, 2.0), (1.5, 2.0, 3.0)):
+        yield (f"fan{fan:g}ATR stacked{stk} lookback{lb} fold{fold:g} stop{st:g}ATR {rr:g}R",
+               dict(fan_min_atr=fan, stacked_bars=stk, lookback=lb, fold_frac=fold, stop_atr=st, rr=rr))
+
+
+STRATS = {"accordion": (AC, AC.ACParams, grid_accordion), "pivots": (PV, PV.PVParams, grid_pivots), "rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
           "megaphone": (MP, MP.MPParams, grid_megaphone)}
 
 
