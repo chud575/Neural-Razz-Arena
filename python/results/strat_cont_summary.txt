@@ -1,0 +1,18 @@
+4h, FTFC with, stop = 2-candle; avg net R per trade IS / OOS (n)
+  2-2 Cont               2R  BTC +0.16/+0.09 (2612/1174)  ETH +0.19/+0.08 (2597/1109)  AVAX +0.15/-0.01 (1312/517)  XRP +0.11/-0.07 (790/367)
+  2-2 Cont               3R  BTC +0.23/+0.16 (2612/1174)  ETH +0.28/+0.19 (2597/1109)  AVAX +0.24/-0.00 (1312/517)  XRP +0.20/-0.09 (790/367)
+  2-2-2 Cont             2R  BTC +0.22/+0.19 (1157/524)  ETH +0.20/+0.11 (1204/511)  AVAX +0.21/+0.03 (641/232)  XRP +0.14/+0.04 (359/180)
+  2-2-2 Cont             3R  BTC +0.29/+0.29 (1157/524)  ETH +0.31/+0.30 (1204/511)  AVAX +0.34/+0.08 (641/232)  XRP +0.24/-0.00 (359/180)
+  Baseline (any candle)  2R  BTC +0.10/+0.02 (2841/1221)  ETH +0.12/+0.06 (2803/1185)  AVAX +0.09/+0.01 (2497/1026)  XRP +0.03/-0.07 (1598/725)
+  Baseline (any candle)  3R  BTC +0.19/+0.04 (2841/1221)  ETH +0.20/+0.13 (2803/1185)  AVAX +0.17/-0.01 (2497/1026)  XRP +0.10/-0.10 (1598/725)
+
+Same, split longs / shorts (all coins pooled), 3R:
+  2-2 Cont     longs  IS +0.33 (4037)  OOS +0.15 (1740)
+  2-2 Cont     shorts IS +0.14 (3274)  OOS +0.07 (1427)
+  2-2-2 Cont   longs  IS +0.39 (1909)  OOS +0.26 (827)
+  2-2-2 Cont   shorts IS +0.19 (1452)  OOS +0.17 (620)
+
+Stop distance (4h, 2-candle): median 2.93%, 75th pct 4.62%, share beyond 3.5% (25x liquidation) 40%
+Trades per year (4h, FTFC with, 2-2 Cont, per coin): BTC 351, ETH 356, AVAX 359, XRP 351
+
+1D, FTFC with, 2-candle stop, 3R, per coin IS/OOS (n): BTC +0.32/+0.13 (1031)  ETH +0.42/+0.21 (921)  AVAX +0.19/-0.01 (503)  XRP +0.24/-0.29 (289)

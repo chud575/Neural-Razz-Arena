@@ -162,3 +162,25 @@ FTFC "with" vs "mixed" (before fees, 2R target; share of combo × period cells w
 5. **FTFC is real but not enough on its own:** trading only with full timeframe continuity adds ~0.06–0.09 R per trade
    on 1h/4h/1D (consistent in-sample and out-of-sample), which lifts the combos to about break-even before fees.
 6. **One small bright spot:** the daily 3-2-2 reversal was positive in both periods after fees (+0.10 R, 255 trades).
+
+## F. 2-2 continuation with FTFC (`strat_cont.py`, `strat_cont_single.py`, `strat_cont_summary.txt`)
+
+Setup: a 2u, then a break of its high on the next candle (another 2u) → long; 2d mirror → short. Only WITH full
+timeframe continuity. Stops tested: trigger candle, two candles (lowest low / highest high of the last two), 1 ATR.
+
+* On 15m it loses; on 1h it is about break-even; **on 4h it works**, best with the **two-candle stop**.
+* **One account, one trade at a time, 4h, two-candle stop** (net R per trade, in-sample / out-of-sample):
+
+| Coin | 2R target | 3R target | Trades / year |
+|---|---|---|---|
+| BTC | +0.16 / +0.09 | +0.23 / +0.12 | 72–91 |
+| ETH | +0.22 / +0.13 | +0.27 / +0.13 | 75–88 |
+| AVAX | +0.18 / +0.06 | +0.33 / +0.02 | 74–89 |
+| XRP | +0.14 / −0.03 | +0.20 / +0.12 | 73–93 |
+
+* With a 3R target it is positive on all four coins in both periods — together with the 4h pivot breakout, the most
+  consistent result found so far. Longs and shorts are both positive. It beats the "any candle + FTFC" baseline.
+* 2-2-2 (two 2s in a row first) looked stronger when trades overlap, but as one account it is less consistent.
+* Daily is positive in most cells but with too few trades to rely on.
+* Stops: median 2.9% (4h, two-candle); 40% of trades have a stop beyond the ~3.5% liquidation distance at 25x —
+  use ≲10x and size each trade by its stop distance.
