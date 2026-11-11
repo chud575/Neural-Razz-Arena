@@ -21,3 +21,4 @@ python/results/ma_study_baseline.csv
 # large Strat study trade logs (regenerate: python strat_study.py <data_dir> [nofee])
 python/results/strat_trades.csv
 python/results/strat_trades_nofee.csv
+python/results/strat_cont_trades.csv
