@@ -1,0 +1,355 @@
+//@version=6
+// The Strat – Candle Study   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Rob Smith's "The Strat": every candle is one of three types vs the previous candle —
+//   1  inside bar      (no new high, no new low)
+//   2u / 2d directional (new high only / new low only)
+//   3  outside bar     (new high AND new low)
+// This study:
+//   • numbers every candle (1 / 2u / 2d / 3)
+//   • shows the next-candle trigger levels of each setup (dashed) and labels combos when they trigger:
+//       2-1-2 Cont / Rev, 3-1-2, 1-2-2 RevStrat, 3-2-2 Rev, 2-2 Rev
+//   • stop = the other end of the trigger candle; target = magnitude (nearest earlier high/low beyond the entry,
+//     last 10 candles, 2R if none) or a fixed R:R
+//   • Full Timeframe Continuity panel: each higher timeframe's live candle type and colour (vs its open)
+//   • a results table per combo, net of futures fees and funding, optionally only trades WITH FTFC
+// Python twin: python/strat_study.py (results in python/results/strat_study.md).
+// Trades are tracked independently per combo (several can be open at once). Conservative fills: if the trigger
+// candle also takes out the stop, the trade is a loss; gaps fill at the open; max 100 candles per trade.
+indicator("The Strat – Candle Study v1.0", shorttitle = "Strat v1.0", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpL = "Candle numbers & setups"
+showNums    = input.bool(true, "Number every candle (1 / 2u / 2d / 3)", group = grpL)
+showPending = input.bool(true, "Show trigger levels of new setups (dashed)", group = grpL)
+showTrades  = input.bool(true, "Label triggered combos and exits", group = grpL)
+
+grpC = "Combos to track"
+useC0 = input.bool(true, "2-1-2 Continuation", group = grpC)
+useC1 = input.bool(true, "2-1-2 Reversal", group = grpC)
+useC2 = input.bool(true, "3-1-2", group = grpC)
+useC3 = input.bool(true, "1-2-2 RevStrat", group = grpC)
+useC4 = input.bool(true, "3-2-2 Reversal", group = grpC)
+useC5 = input.bool(true, "2-2 Reversal", group = grpC)
+
+grpT = "Targets"
+tgtMode = input.string("Magnitude", "Target", options = ["Magnitude", "R:R"], group = grpT,
+     tooltip = "Magnitude: the nearest earlier high (long) / low (short) beyond the entry within the last 10 candles; 2R if there is none.\nR:R: a fixed multiple of the risk.")
+rr      = input.float(2.0, "R:R (and magnitude fallback)", minval = 0.1, step = 0.1, group = grpT)
+maxBars = input.int(100, "Close a trade after N candles", minval = 1, group = grpT)
+
+grpF = "Full Timeframe Continuity"
+tf1 = input.timeframe("240", "Timeframe 1", group = grpF, inline = "t1")
+on1 = input.bool(true, "", group = grpF, inline = "t1")
+tf2 = input.timeframe("D", "Timeframe 2", group = grpF, inline = "t2")
+on2 = input.bool(true, "", group = grpF, inline = "t2")
+tf3 = input.timeframe("W", "Timeframe 3", group = grpF, inline = "t3")
+on3 = input.bool(true, "", group = grpF, inline = "t3")
+tf4 = input.timeframe("M", "Timeframe 4", group = grpF, inline = "t4")
+on4 = input.bool(false, "", group = grpF, inline = "t4")
+ftfcOnly = input.bool(false, "Results table: only trades WITH full timeframe continuity", group = grpF,
+     tooltip = "Tested on BTC/ETH/AVAX/XRP: trading only with FTFC improved results by ~0.06–0.09 R per trade on 1h–1D charts (not on 15m).")
+showPanel = input.bool(true, "Show FTFC panel", group = grpF)
+
+grpX = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpX,
+     tooltip = "Entry (stop order) = taker fee. Exit at the target = maker fee, at the stop / time exit = taker fee. Funding per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpX)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpX)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpX)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpX)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpX)
+liqDistPct = 100.0 / leverage - mmrPct
+
+grpV = "Tables"
+tblPosIn  = input.string("Top right", "Results table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+panPosIn  = input.string("Bottom right", "FTFC panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+
+// ───────────────────────────── Candle types ─────────────────────────────
+// 1 = inside, 2 = 2u, -2 = 2d, 3 = outside
+ctype(float h, float l, float ph, float pl) =>
+    h > ph and l < pl ? 3 : h > ph ? 2 : l < pl ? -2 : 1
+int t = bar_index > 0 ? ctype(high, low, high[1], low[1]) : 0
+typeTxt(int x) => x == 1 ? "1" : x == 2 ? "2u" : x == -2 ? "2d" : x == 3 ? "3" : "–"
+
+plotshape(showNums and t == 1,  "1",  shape.labelup, location.belowbar, color.new(color.yellow, 100), text = "1",  textcolor = color.yellow, size = size.tiny)
+plotshape(showNums and t == 2,  "2u", shape.labelup, location.belowbar, color.new(color.lime, 100),   text = "2u", textcolor = color.lime,   size = size.tiny)
+plotshape(showNums and t == -2, "2d", shape.labelup, location.belowbar, color.new(color.red, 100),    text = "2d", textcolor = color.red,    size = size.tiny)
+plotshape(showNums and t == 3,  "3",  shape.labelup, location.belowbar, color.new(color.fuchsia, 100), text = "3", textcolor = color.fuchsia, size = size.tiny)
+
+// ───────────────────────────── FTFC ─────────────────────────────
+chartSec = timeframe.in_seconds(timeframe.period)
+htfOpen(string tf) => request.security(syminfo.tickerid, tf, open, lookahead = barmerge.lookahead_on)   // open of the CURRENT htf candle
+o1 = htfOpen(tf1)
+o2 = htfOpen(tf2)
+o3 = htfOpen(tf3)
+o4 = htfOpen(tf4)
+use1 = on1 and timeframe.in_seconds(tf1) > chartSec
+use2 = on2 and timeframe.in_seconds(tf2) > chartSec
+use3 = on3 and timeframe.in_seconds(tf3) > chartSec
+use4 = on4 and timeframe.in_seconds(tf4) > chartSec
+
+// FTFC for a trade at price px in direction d: 1 = with, -1 = against, 0 = mixed (or no timeframes selected)
+ftfcState(float px, int d) =>
+    int nUse = 0
+    int nWith = 0
+    if use1
+        nUse += 1
+        nWith += (d == 1 ? px > o1 : px < o1) ? 1 : 0
+    if use2
+        nUse += 1
+        nWith += (d == 1 ? px > o2 : px < o2) ? 1 : 0
+    if use3
+        nUse += 1
+        nWith += (d == 1 ? px > o3 : px < o3) ? 1 : 0
+    if use4
+        nUse += 1
+        nWith += (d == 1 ? px > o4 : px < o4) ? 1 : 0
+    nUse == 0 ? 0 : nWith == nUse ? 1 : nWith == 0 ? -1 : 0
+
+// ───────────────────────────── Results storage ─────────────────────────────
+var array<string> cName = array.from("2-1-2 Cont", "2-1-2 Rev", "3-1-2", "1-2-2 RevStrat", "3-2-2 Rev", "2-2 Rev")
+var array<float> sN   = array.new<float>(6, 0.0)
+var array<float> sW   = array.new<float>(6, 0.0)
+var array<float> sR   = array.new<float>(6, 0.0)
+var array<float> sNf  = array.new<float>(6, 0.0)     // FTFC-with subset
+var array<float> sWf  = array.new<float>(6, 0.0)
+var array<float> sRf  = array.new<float>(6, 0.0)
+var int liqCount = 0
+
+// open trades (parallel arrays)
+var array<int>   tD    = array.new<int>()
+var array<int>   tC    = array.new<int>()
+var array<int>   tBar  = array.new<int>()
+var array<int>   tTime = array.new<int>()
+var array<int>   tF    = array.new<int>()
+var array<float> tE    = array.new<float>()
+var array<float> tS    = array.new<float>()
+var array<float> tT    = array.new<float>()
+
+record(int ci, float r, int f) =>
+    array.set(sN, ci, array.get(sN, ci) + 1)
+    array.set(sW, ci, array.get(sW, ci) + (r > 0 ? 1 : 0))
+    array.set(sR, ci, array.get(sR, ci) + r)
+    if f == 1
+        array.set(sNf, ci, array.get(sNf, ci) + 1)
+        array.set(sWf, ci, array.get(sWf, ci) + (r > 0 ? 1 : 0))
+        array.set(sRf, ci, array.get(sRf, ci) + r)
+
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R", style = label.style_label_left,
+             color = r > 0 ? color.new(color.green, 25) : color.new(color.red, 25), textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── 1) Manage open trades (from the candle after entry) ─────────────────────────────
+if array.size(tD) > 0
+    for k = array.size(tD) - 1 to 0
+        if bar_index > array.get(tBar, k)
+            int   d  = array.get(tD, k)
+            float e  = array.get(tE, k)
+            float s  = array.get(tS, k)
+            float tg = array.get(tT, k)
+            float rk = math.abs(e - s)
+            float px = na
+            bool  atT = false
+            if d == 1 ? low <= s : high >= s
+                px := d == 1 ? math.min(open, s) : math.max(open, s)
+            else if d == 1 ? high >= tg : low <= tg
+                px  := d == 1 ? math.max(open, tg) : math.min(open, tg)
+                atT := true
+            else if bar_index - array.get(tBar, k) >= maxBars
+                px := close
+            if not na(px)
+                float r = d * (px - e) / rk - costR(d, e, rk, atT, array.get(tTime, k))
+                record(array.get(tC, k), r, array.get(tF, k))
+                exitLabel(px, atT ? "TP" : px == close ? "Time" : "SL", r)
+                array.remove(tD, k)
+                array.remove(tC, k)
+                array.remove(tBar, k)
+                array.remove(tTime, k)
+                array.remove(tF, k)
+                array.remove(tE, k)
+                array.remove(tS, k)
+                array.remove(tT, k)
+
+// ───────────────────────────── 2) Triggers: setup on the previous two candles, break on this candle ─────────────────────────────
+comboOn(int ci) => ci == 0 ? useC0 : ci == 1 ? useC1 : ci == 2 ? useC2 : ci == 3 ? useC3 : ci == 4 ? useC4 : useC5
+
+// combo index for direction d given the setup candles a (older) and b (trigger candle); -1 = none
+comboFor(int a, int b, int d) =>
+    int ci = -1
+    if b == 1
+        if a == 2 or a == -2
+            ci := (d == 1) == (a == 2) ? 0 : 1
+        else if a == 3
+            ci := 2
+    else if b == -2 and d == 1 or b == 2 and d == -1
+        ci := a == 1 ? 3 : a == 3 ? 4 : (a == 2 or a == -2) ? 5 : -1
+    ci
+
+// nearest earlier high (low) beyond px among candles 2..11 back (i.e. before the trigger candle)
+magnitude(float px, int d) =>
+    float best = na
+    for k = 2 to 11
+        float v = d == 1 ? high[k] : low[k]
+        if not na(v) and (d == 1 ? v > px : v < px)
+            best := na(best) ? v : d == 1 ? math.min(best, v) : math.max(best, v)
+    best
+
+if bar_index >= 3
+    int a = t[2]
+    int b = t[1]
+    for side = 0 to 1
+        int d  = side == 0 ? 1 : -1
+        int ci = comboFor(a, b, d)
+        if ci < 0 or not comboOn(ci)
+            continue
+        float trig = d == 1 ? high[1] : low[1]
+        float stp  = d == 1 ? low[1] : high[1]
+        if not (d == 1 ? high > trig : low < trig)
+            continue
+        float e  = d == 1 ? math.max(open, trig) : math.min(open, trig)
+        float rk = math.abs(e - stp)
+        if rk <= 0
+            continue
+        float mag = magnitude(e, d)
+        float tg  = tgtMode == "Magnitude" and not na(mag) ? mag : e + d * rr * rk
+        int   f   = ftfcState(e, d)
+        if math.abs(e - stp) / e * 100.0 > liqDistPct
+            liqCount += 1
+        string nm = array.get(cName, ci) + (d == 1 ? " ↑" : " ↓") + (f == 1 ? " FTFC" : "")
+        if showTrades
+            label.new(bar_index, d == 1 ? low : high, nm, style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = d == 1 ? color.new(color.teal, 15) : color.new(color.maroon, 15), textcolor = color.white, size = size.tiny)
+        alert("Strat " + nm + " on " + syminfo.ticker + " " + timeframe.period + " | entry " + str.tostring(e, format.mintick) +
+             " | stop " + str.tostring(stp, format.mintick) + " | target " + str.tostring(tg, format.mintick), alert.freq_once_per_bar)
+        // the trigger candle itself: stop first (conservative), then target
+        bool stopNow = d == 1 ? low <= stp : high >= stp
+        bool tgtNow  = d == 1 ? high >= tg : low <= tg
+        if stopNow
+            float r = d * (stp - e) / rk - costR(d, e, rk, false, time)
+            record(ci, r, f)
+            exitLabel(stp, "SL", r)
+        else if tgtNow
+            float r = d * (tg - e) / rk - costR(d, e, rk, true, time)
+            record(ci, r, f)
+            exitLabel(tg, "TP", r)
+        else
+            array.push(tD, d)
+            array.push(tC, ci)
+            array.push(tBar, bar_index)
+            array.push(tTime, time)
+            array.push(tF, f)
+            array.push(tE, e)
+            array.push(tS, stp)
+            array.push(tT, tg)
+
+// ───────────────────────────── 3) New setups on this (completed) candle: dashed trigger levels for the next candle ─────────────────────────────
+if showPending and barstate.isconfirmed and bar_index >= 2
+    bool longSet  = comboFor(t[1], t, 1) >= 0 and comboOn(comboFor(t[1], t, 1))
+    bool shortSet = comboFor(t[1], t, -1) >= 0 and comboOn(comboFor(t[1], t, -1))
+    if longSet
+        line.new(bar_index, high, bar_index + 1, high, color = color.new(color.teal, 0), style = line.style_dashed, width = 2)
+    if shortSet
+        line.new(bar_index, low, bar_index + 1, low, color = color.new(color.maroon, 0), style = line.style_dashed, width = 2)
+
+// ───────────────────────────── Tables ─────────────────────────────
+posOf(string s) =>
+    switch s
+        "Top left"     => position.top_left
+        "Bottom right" => position.bottom_right
+        "Bottom left"  => position.bottom_left
+        "Middle right" => position.middle_right
+        => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(posOf(tblPosIn), 5, 10, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+var table pan = table.new(posOf(panPosIn), 3, 7, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellT(table tb, int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tb, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg, text_halign = c == 0 ? text.align_left : text.align_center)
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##")
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+
+// live HTF candles for the panel (current, developing candle on the realtime bar)
+[h1, l1, c1, ph1, pl1] = request.security(syminfo.tickerid, tf1, [high, low, close, high[1], low[1]])
+[h2, l2, c2, ph2, pl2] = request.security(syminfo.tickerid, tf2, [high, low, close, high[1], low[1]])
+[h3, l3, c3, ph3, pl3] = request.security(syminfo.tickerid, tf3, [high, low, close, high[1], low[1]])
+[h4, l4, c4, ph4, pl4] = request.security(syminfo.tickerid, tf4, [high, low, close, high[1], low[1]])
+
+panelRow(int r, bool on, string tf, float h, float l, float c, float ph, float pl, float op) =>
+    if on
+        int  ty  = ctype(h, l, ph, pl)
+        bool grn = c >= op
+        cellT(pan, 0, r, tf)
+        cellT(pan, 1, r, typeTxt(ty), ty == 2 ? color.lime : ty == -2 ? color.red : ty == 3 ? color.fuchsia : color.yellow)
+        cellT(pan, 2, r, grn ? "green" : "red", color.white, grn ? color.new(color.green, 40) : color.new(color.red, 40))
+    else
+        cellT(pan, 0, r, tf, color.gray)
+        cellT(pan, 1, r, "off", color.gray)
+        cellT(pan, 2, r, "", color.gray)
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 4, 0)
+    table.merge_cells(tbl, 0, 9, 4, 9)
+    table.merge_cells(pan, 0, 0, 2, 0)
+    table.merge_cells(pan, 0, 6, 2, 6)
+
+if barstate.islast
+    // results table
+    string hdr = "Strat v1.0 — " + (tgtMode == "Magnitude" ? "magnitude target" : str.tostring(rr, "#.#") + "R target") +
+         (ftfcOnly ? " | only WITH FTFC" : " | all trades") + (feesOn ? " | net of fees" : " | before fees")
+    cellT(tbl, 0, 0, hdr, color.white, color.new(color.purple, 40))
+    cellT(tbl, 0, 1, "Combo", color.silver)
+    cellT(tbl, 1, 1, "Trades", color.silver)
+    cellT(tbl, 2, 1, "Win %", color.silver)
+    cellT(tbl, 3, 1, "Avg R", color.silver)
+    cellT(tbl, 4, 1, "Total R", color.silver)
+    float TN = 0.0
+    float TW = 0.0
+    float TR = 0.0
+    for ci = 0 to 5
+        float n = ftfcOnly ? array.get(sNf, ci) : array.get(sN, ci)
+        float w = ftfcOnly ? array.get(sWf, ci) : array.get(sW, ci)
+        float r = ftfcOnly ? array.get(sRf, ci) : array.get(sR, ci)
+        TN += n
+        TW += w
+        TR += r
+        cellT(tbl, 0, ci + 2, array.get(cName, ci), comboOn(ci) ? color.white : color.gray)
+        cellT(tbl, 1, ci + 2, str.tostring(n, "#"))
+        cellT(tbl, 2, ci + 2, n > 0 ? str.tostring(w / n * 100, "#") + "%" : "–")
+        cellT(tbl, 3, ci + 2, n > 0 ? fmtR(r / n) : "–", colR(r))
+        cellT(tbl, 4, ci + 2, fmtR(r), colR(r))
+    cellT(tbl, 0, 8, "All combos", color.silver)
+    cellT(tbl, 1, 8, str.tostring(TN, "#"))
+    cellT(tbl, 2, 8, TN > 0 ? str.tostring(TW / TN * 100, "#") + "%" : "–")
+    cellT(tbl, 3, 8, TN > 0 ? fmtR(TR / TN) : "–", colR(TR))
+    cellT(tbl, 4, 8, fmtR(TR), colR(TR))
+    cellT(tbl, 0, 9, str.tostring(liqCount) + " trades had a stop beyond the ~" + str.tostring(liqDistPct, "#.##") + "% liquidation distance at " + str.tostring(leverage) + "x",
+         liqCount > 0 ? color.orange : color.gray)
+    // FTFC panel
+    if showPanel
+        cellT(pan, 0, 0, "Full Timeframe Continuity", color.white, color.new(color.blue, 40))
+        cellT(pan, 0, 1, "TF", color.silver)
+        cellT(pan, 1, 1, "Candle", color.silver)
+        cellT(pan, 2, 1, "vs open", color.silver)
+        panelRow(2, use1, tf1, h1, l1, c1, ph1, pl1, o1)
+        panelRow(3, use2, tf2, h2, l2, c2, ph2, pl2, o2)
+        panelRow(4, use3, tf3, h3, l3, c3, ph3, pl3, o3)
+        panelRow(5, use4, tf4, h4, l4, c4, ph4, pl4, o4)
+        int fl = ftfcState(close, 1)
+        cellT(pan, 0, 6, fl == 1 ? "FTFC UP — all green" : fl == -1 ? "FTFC DOWN — all red" : "Mixed — no full continuity",
+             color.white, fl == 1 ? color.new(color.green, 30) : fl == -1 ? color.new(color.red, 30) : color.new(color.gray, 50))
