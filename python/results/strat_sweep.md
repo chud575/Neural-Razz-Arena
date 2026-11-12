@@ -20,3 +20,16 @@ An earlier version that assumed the fill always came after the low of the same 1
 | 4h | 100 | -0.19 (523) | -0.17 (225) | -0.15 (529) | -0.11 (229) | 33 | 1.20% | -0.12 |
 
 A resting stop order at the 2d's close (ambiguous 15m candles counted as losses) tested worse: 1h −0.16 to −0.35R, 4h −0.08 to −0.23R.
+
+## Structure from the weekly DIA example
+
+Setup candle = a red 2d whose low is below the low of the last red candle before it (green candles in between don't matter); mirror for shorts. Next candle sweeps the low; entry at the first 15m close back above the setup candle's close; stop = sweep low; target = the setup candle's high. Max hold 10 setup candles (48 h on 1h).
+
+| Setup TF | Target high IS | OOS | Target 2R IS | OOS | Win % (high) | Median stop | Gross R (high) | Next candle sweeps the low | ...and also reaches the high |
+|---|---|---|---|---|---|---|---|---|---|
+| 1h | -0.17 (18972) | -0.22 (7720) | -0.20 (19616) | -0.22 (7984) | 46 | 0.48% | -0.01 | 58% | 14% of those |
+| 4h | -0.08 (5125) | -0.17 (2192) | -0.07 (5178) | -0.14 (2229) | 39 | 0.86% | -0.00 | 57% | 16% of those |
+| 1D | -0.04 (930) | +0.06 (400) | +0.03 (936) | +0.02 (403) | 35 | 1.99% | +0.03 | 58% | 15% of those |
+| 1W | -0.12 (132) | +0.03 (54) | +0.02 (132) | -0.17 (54) | 27 | 4.53% | -0.06 | 57% | 14% of those |
+
+Daily, target high, by coin (IS / OOS): AVAX -0.24 (246) / -0.14 (98); BTC +0.03 (274) / +0.12 (115); ETH +0.06 (282) / +0.19 (109); XRP -0.03 (128) / +0.02 (78).

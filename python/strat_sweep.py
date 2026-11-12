@@ -29,16 +29,17 @@ import pandas as pd
 import run_btc_sweep as S
 
 COINS = ["btc", "eth", "avax", "xrp"]
-SETUP_TFS = {"1h": 4, "4h": 16}                 # 15m candles per setup candle
+SETUP_TFS = {"1h": 4, "4h": 16, "1D": 96, "1W": 672}                 # 15m candles per setup candle
 MOVES = (0.5, 1.0, 1.5, 2.0, 3.0)
 TARGETS = ("high", "mid", "1R", "2R")
 MAX_HOLD = 192                                  # 15m candles = 48 h
 
 
-def run(coin, df15, tf, k, rows):
+def run(coin, df15, tf, k, rows, base):
     o, h, l, c = (df15[x].to_numpy(float) for x in ("open", "high", "low", "close"))
     n = len(c)
-    grp = df15.index.floor(tf)
+    grp = df15.index.floor(tf) if tf != "1W" else (df15.index - pd.to_timedelta(df15.index.weekday, unit="D")).floor("1D")
+    max_hold = max(MAX_HOLD, 10 * k)
     g = df15.groupby(grp).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
                               cnt=("open", "size"))
     first = pd.Series(np.arange(n), index=df15.index).groupby(grp).first().to_numpy()
@@ -61,11 +62,23 @@ def run(coin, df15, tf, k, rows):
             if (L[q] <= L[i]) if d == 1 else (H[q] >= H[i]):
                 break
             ll += 1
+        # the example structure: a red 2d whose low is below the low of the last red candle before it (mirror for 2u)
+        col = (C[i] < O[i]) if d == 1 else (C[i] > O[i])
+        pr = False
+        if col:
+            for q in range(i - 1, max(-1, i - 51), -1):
+                if (C[q] < O[q]) if d == 1 else (C[q] > O[q]):
+                    pr = (L[i] < L[q]) if d == 1 else (H[i] > H[q])
+                    break
         rng = H[i] - L[i]
         wicks = min(H[i] - max(O[i], C[i]), min(O[i], C[i]) - L[i]) / rng >= 0.05 if rng > 0 else False
         ext0 = L[i] if d == 1 else H[i]                 # level to sweep
         lvl = C[i]                                      # entry level
         s0 = first[i + 1]
+        e1 = min(n, s0 + k)
+        sw = bool((l[s0:e1] < ext0).any()) if d == 1 else bool((h[s0:e1] > ext0).any())
+        far = H[i] if d == 1 else L[i]
+        base.append(dict(coin=coin, tf=tf, d=d, pr=pr, swept=sw, reached=bool(sw and ((h[s0:e1] >= far).any() if d == 1 else (l[s0:e1] <= far).any()))))
         for window, mode in ((1, "close"), (1, "stop")):
             ext, swept, fill, lost = ext0, False, None, False
             for j in range(s0, min(n, s0 + window * k)):
@@ -91,7 +104,7 @@ def run(coin, df15, tf, k, rows):
                 continue
             if lost:
                 for tg in TARGETS:
-                    rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, wicks=wicks, window=window, mode=mode,
+                    rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, pr=pr, wicks=wicks, window=window, mode=mode,
                                      target=tg, period="IS" if j < split else "OOS", bar=j, e=e, risk_pct=risk / e * 100,
                                      rr=math.nan, gross=-1.0, r=-1.0 - S.cost_fraction(d, False, 0) * e / risk, win=False,
                                      bars=0, same_candle=(j - s0) < k))
@@ -106,7 +119,7 @@ def run(coin, df15, tf, k, rows):
                 if (tp - e) * d <= 0:
                     continue
                 px, at_t, m = None, False, j if not at_close else j + 1
-                end = min(n, j + 1 + MAX_HOLD)
+                end = min(n, j + 1 + max_hold)
                 while m < end:
                     if m > j and ((l[m] <= stop) if d == 1 else (h[m] >= stop)):
                         px = min(o[m], stop) if d == 1 else max(o[m], stop)
@@ -116,11 +129,11 @@ def run(coin, df15, tf, k, rows):
                         break
                     m += 1
                 if px is None:
-                    m = min(n - 1, j + MAX_HOLD)
+                    m = min(n - 1, j + max_hold)
                     px = c[m]
                 gross = d * (px - e) / risk
                 net = gross - S.cost_fraction(d, at_t, (m - j) * 0.25) * e / risk
-                rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, wicks=wicks, window=window, mode=mode, target=tg,
+                rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, pr=pr, wicks=wicks, window=window, mode=mode, target=tg,
                                  period="IS" if j < split else "OOS", bar=j, e=e, risk_pct=risk / e * 100,
                                  rr=abs(tp - e) / risk, gross=gross, r=net, win=at_t, bars=m - j,
                                  same_candle=(j - s0) < k))
@@ -161,14 +174,15 @@ def random_control(df15, sub, reps=10, seed=3):
 def main():
     D = sys.argv[1]
     S.FEE_MODEL = "futures"
-    rows = []
+    rows, base = [], []
     for coin in COINS:
         df = pd.read_csv(f"{D}/{coin}_15m.csv", index_col=0, parse_dates=True)[["open", "high", "low", "close"]]
         df = df[(df > 0).all(axis=1)]
         for tf, k in SETUP_TFS.items():
-            run(coin, df, tf, k, rows)
+            run(coin, df, tf, k, rows, base)
         print("done", coin, file=sys.stderr, flush=True)
     pd.DataFrame(rows).to_csv("results/strat_sweep_trades.csv", index=False)
+    pd.DataFrame(base).to_csv("results/strat_sweep_base.csv", index=False)
     print("trades", len(rows), file=sys.stderr)
 
 

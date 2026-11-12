@@ -23,3 +23,4 @@ python/results/strat_trades.csv
 python/results/strat_trades_nofee.csv
 python/results/strat_cont_trades.csv
 python/results/strat_sweep_trades.csv
+python/results/strat_sweep_base.csv
