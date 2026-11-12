@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.0
+// Trend Finder – Swing Structure   ·   v1.1
 // Changelog
+//  v1.1  Higher-timeframe overlay: pick any higher timeframe and see its swings and trend lines on this chart (own colours and thickness)
 //  v1.0  First version
 //
 // Reads the trend from consecutive swing highs and swing lows.
@@ -13,13 +14,26 @@
 //    latest swing high in a downtrend. Until the swings line up again the state is "no trend".
 //  · The same reading is shown for three other timeframes in the table (closed candles only).
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.0", shorttitle = "Trend Finder v1.0", overlay = true,
+indicator("Trend Finder – Swing Structure v1.1", shorttitle = "Trend Finder v1.1", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
 swingLen  = input.int(5, "Swing length (bars each side)", minval = 1, maxval = 50, group = grpS,
      tooltip = "Bigger = fewer, larger swings and slower trend changes.")
 breakOn   = input.bool(true, "End a trend on a close through the last swing low / high", group = grpS)
+
+grpO = "Higher-timeframe overlay"
+htfOn     = input.bool(true, "Draw a higher timeframe's swings and trend lines", group = grpO)
+htfTF     = input.timeframe("120", "Higher timeframe", group = grpO)
+htfLen    = input.int(3, "Swing length on that timeframe (candles each side)", minval = 1, maxval = 50, group = grpO)
+htfUpCol  = input.color(color.new(color.aqua, 0), "Uptrend", group = grpO, inline = "h")
+htfDnCol  = input.color(color.new(color.orange, 0), "Downtrend", group = grpO, inline = "h")
+htfNoCol  = input.color(color.new(color.silver, 0), "No trend", group = grpO, inline = "h")
+htfWidth  = input.int(3, "Line thickness", minval = 1, maxval = 10, group = grpO)
+htfStyleIn = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = grpO)
+htfLbl    = input.bool(true, "Label its swings (HH / LH / HL / LL)", group = grpO)
+htfLvl    = input.bool(true, "Show its latest swing high / low levels", group = grpO)
+htfStyle  = htfStyleIn == "Dashed" ? line.style_dashed : htfStyleIn == "Dotted" ? line.style_dotted : line.style_solid
 
 grpH = "Other timeframes (table)"
 tfA = input.timeframe("60", "Timeframe A", group = grpH)
@@ -47,7 +61,7 @@ lblSize = switch lblSizeIn
 // Swing structure of the timeframe it runs on.
 // Returns [trend (1 up, -1 down, 0 none), finished swing type (1 high, -1 low, 0 none this bar), its price, its bar,
 //          is it higher than the previous one of its kind, latest swing high, latest swing low, bar the trend started,
-//          swings since the trend started]
+//          swings since the trend started, time of the finished swing]
 structure(int L) =>
     var float lastH  = na
     var float prevH  = na
@@ -55,6 +69,8 @@ structure(int L) =>
     var float prevL  = na
     var int   lastHb = na
     var int   lastLb = na
+    var int   lastHt = na
+    var int   lastLt = na
     var int   lastT  = 0
     var int   trend  = 0
     var int   since  = na
@@ -64,6 +80,7 @@ structure(int L) =>
     int   evT = 0
     float evP = na
     int   evB = na
+    int   evTm = na
     bool  evUp = false
     bool  changed = false
     if not na(ph)
@@ -71,16 +88,19 @@ structure(int L) =>
             if ph > lastH
                 lastH   := ph
                 lastHb  := bar_index - L
+                lastHt  := time[L]
                 changed := true
         else
             if lastT == -1                    // the previous swing low is now final
                 evT  := -1
                 evP  := lastL
                 evB  := lastLb
+                evTm := lastLt
                 evUp := not na(prevL) and lastL > prevL
             prevH   := lastH
             lastH   := ph
             lastHb  := bar_index - L
+            lastHt  := time[L]
             lastT   := 1
             changed := true
     if not na(pl)
@@ -88,16 +108,19 @@ structure(int L) =>
             if pl < lastL
                 lastL   := pl
                 lastLb  := bar_index - L
+                lastLt  := time[L]
                 changed := true
         else
             if lastT == 1                     // the previous swing high is now final
                 evT  := 1
                 evP  := lastH
                 evB  := lastHb
+                evTm := lastHt
                 evUp := not na(prevH) and lastH > prevH
             prevL   := lastL
             lastL   := pl
             lastLb  := bar_index - L
+            lastLt  := time[L]
             lastT   := -1
             changed := true
     int before = trend
@@ -116,17 +139,27 @@ structure(int L) =>
         legs  := 0
     if evT != 0
         legs += 1
-    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs]
+    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm]
 
 // trend of another timeframe, last closed candle only (no repainting)
 trendClosed() =>
-    [t, a, b, c, d, e, f, g, h] = structure(swingLen)
+    [t, a, b, c, d, e, f, g, h, k] = structure(swingLen)
     t[1]
 
-[trend, evT, evP, evB, evUp, lastH, lastL, since, legs] = structure(swingLen)
+// overlay timeframe: everything from its last closed candle
+overlayClosed() =>
+    [t, eT, eP, eB, eUp, lH, lL, sn, lg, eTm] = structure(htfLen)
+    [t[1], eT[1], eP[1], eTm[1], eUp[1], lH[1], lL[1]]
+
+[trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm] = structure(swingLen)
+[hTrend, hEvT, hEvP, hEvTm, hEvUp, hLastH, hLastL] = request.security(syminfo.tickerid, htfTF, overlayClosed(), lookahead = barmerge.lookahead_on)
 int trA = request.security(syminfo.tickerid, tfA, trendClosed(), lookahead = barmerge.lookahead_on)
 int trB = request.security(syminfo.tickerid, tfB, trendClosed(), lookahead = barmerge.lookahead_on)
 int trC = request.security(syminfo.tickerid, tfC, trendClosed(), lookahead = barmerge.lookahead_on)
+
+tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
 
 // ───────────────────────────── Drawing ─────────────────────────────
 var float zPx  = na
@@ -141,6 +174,22 @@ if evT != 0
              color = color.new(evUp ? upCol : dnCol, 20), textcolor = color.white, size = lblSize)
     zPx  := evP
     zBar := evB
+
+// higher-timeframe overlay: one new swing at most per higher-timeframe candle
+var float hzPx = na
+var int   hzTm = na
+if htfOn and timeframe.change(htfTF) and hEvT != 0 and not na(hEvP)
+    color hc = hTrend == 1 ? htfUpCol : hTrend == -1 ? htfDnCol : htfNoCol
+    if not na(hzPx)
+        line.new(hzTm, hzPx, hEvTm, hEvP, xloc = xloc.bar_time, color = hc, width = htfWidth, style = htfStyle)
+    if htfLbl
+        label.new(hEvTm, hEvP, tfLabel(htfTF) + " " + (hEvT == 1 ? (hEvUp ? "HH" : "LH") : (hEvUp ? "HL" : "LL")), xloc = xloc.bar_time,
+             style = hEvT == 1 ? label.style_label_down : label.style_label_up, color = color.new(hEvUp ? htfUpCol : htfDnCol, 20),
+             textcolor = color.white, size = lblSize)
+    hzPx := hEvP
+    hzTm := hEvTm
+plot(htfOn and htfLvl ? hLastH : na, "HTF latest swing high", color.new(htfDnCol, 20), 2, plot.style_stepline)
+plot(htfOn and htfLvl ? hLastL : na, "HTF latest swing low", color.new(htfUpCol, 20), 2, plot.style_stepline)
 
 bgcolor(showBg ? (trend == 1 ? color.new(upCol, 90) : trend == -1 ? color.new(dnCol, 90) : na) : na, title = "Trend shading")
 plot(showLvl ? lastH : na, "Latest swing high", color.new(dnCol, 30), 1, plot.style_stepline)
@@ -165,14 +214,11 @@ tblSize = switch tblSizeIn
     "Small" => size.small
     "Large" => size.large
     => size.normal
-var table tbl = table.new(tblPos, 2, 9, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 2, 10, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 
 trName(int t) => t == 1 ? "UP" : t == -1 ? "DOWN" : "none"
 trCol(int t) => t == 1 ? upCol : t == -1 ? dnCol : color.silver
-tfName(string tf) =>
-    int s = timeframe.in_seconds(tf)
-    s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
 row(int r, string a, string b, color bc = color.white) =>
     table.cell(tbl, 0, r, a, text_color = color.silver, text_size = tblSize, text_halign = text.align_left)
     table.cell(tbl, 1, r, b, text_color = bc, text_size = tblSize, text_halign = text.align_right)
@@ -180,13 +226,15 @@ row(int r, string a, string b, color bc = color.white) =>
 if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 1, 0)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.0 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
-    row(1, "This chart (" + tfName(timeframe.period) + ")", trName(trend), trCol(trend))
+    table.cell(tbl, 0, 0, "Trend Finder v1.1 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    row(1, "This chart (" + tfLabel(timeframe.period) + ")", trName(trend), trCol(trend))
     row(2, "Trend age", trend != 0 and not na(since) ? str.tostring(bar_index - since) + " bars, " + str.tostring(legs) + " swings" : "–")
     row(3, "Latest swing high", str.tostring(lastH, format.mintick), trend == -1 ? dnCol : color.white)
     row(4, "Latest swing low", str.tostring(lastL, format.mintick), trend == 1 ? upCol : color.white)
     row(5, "Trend ends on a close", trend == 1 ? "below " + str.tostring(lastL, format.mintick) : trend == -1 ? "above " + str.tostring(lastH, format.mintick) : "–")
+    if htfOn
+        row(9, "Overlay " + tfLabel(htfTF), trName(hTrend), trCol(hTrend))
     if showHtf
-        row(6, tfName(tfA), trName(trA), trCol(trA))
-        row(7, tfName(tfB), trName(trB), trCol(trB))
-        row(8, tfName(tfC), trName(trC), trCol(trC))
+        row(6, tfLabel(tfA), trName(trA), trCol(trA))
+        row(7, tfLabel(tfB), trName(trB), trCol(trB))
+        row(8, tfLabel(tfC), trName(trC), trCol(trC))
