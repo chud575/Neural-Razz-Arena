@@ -1,0 +1,304 @@
+//@version=6
+// The Strat – Failed 2 Reversal   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// From Alex's Options ("if a bar fails one side of the range, it is attempting to take the other side").
+// Python twin: python/strat_failed2.py (same rules, so the numbers should match).
+//
+//  1. Signal (long; shorts mirror it), read at the close of a bar:
+//       Previous bar  the bar took out the PREVIOUS bar's low and closed back above it (still below that bar's high).
+//                     Optional: the bar must also close green.
+//       Mother bar    the last 2+ bars were all inside one earlier "mother" bar; this bar took out the mother bar's
+//                     low and closed back above it. The range to take is the mother bar.
+//  2. Higher-timeframe filter (optional): the higher-timeframe candle in progress has already traded below the
+//     previous higher-timeframe candle's low and this bar closes back above it — the same thing one level up.
+//  3. Entry at the close of the signal bar. Stop = the signal bar's low.
+//  4. Exit:  Other side       target = the other side of the range that failed (previous bar / mother bar high)
+//            HTF other side   target = the previous higher-timeframe candle's high (needs the filter)
+//            R:R              target = a multiple of the risk
+//            T1 then trail    half off at the other side, then the stop walks up under each previous bar's low
+//            Trail only       no target: the stop walks up under each previous bar's low
+//     Stops only ever move toward price. Max 200 bars in a trade.
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
+// one trade at a time. Default = the best-tested variant (daily chart, previous-bar signal, trail only).
+indicator("The Strat – Failed 2 Reversal v1.0", shorttitle = "Failed 2 v1.0", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpS = "Signal"
+sigMode   = input.string("Previous bar", "Range that fails", options = ["Previous bar", "Mother bar"], group = grpS,
+     tooltip = "Previous bar: takes out the previous bar's low/high and closes back inside.\nMother bar: 2 or more bars stuck inside one earlier bar, then a break of that bar's low/high that closes back inside.")
+needColor = input.bool(false, "Signal bar must close in the trade's direction (green for longs)", group = grpS)
+minInside = input.int(2, "Mother bar: min bars inside it", minval = 1, maxval = 20, group = grpS)
+
+grpH = "Higher timeframe"
+htfOn = input.bool(false, "Only trade when the higher timeframe has failed the same side", group = grpH,
+     tooltip = "Longs: the higher-timeframe candle in progress has traded below the previous one's low and price is back above it (and below its high).")
+htfTF = input.timeframe("W", "Higher timeframe", group = grpH)
+
+grpX = "Exit"
+exitMode = input.string("Trail only", "Exit", options = ["Other side", "HTF other side", "R:R", "T1 then trail", "Trail only"], group = grpX)
+rrMult   = input.float(2.0, "R:R multiple (for Exit = R:R)", minval = 0.1, step = 0.1, group = grpX)
+maxBars  = input.int(200, "Max bars in a trade", minval = 5, group = grpX)
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC)
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+grpF = "Filters"
+tradeLongs  = input.bool(true, "Longs (failed low)", group = grpF)
+tradeShorts = input.bool(true, "Shorts (failed high)", group = grpF)
+
+grpV = "Visuals"
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+showSkips  = input.bool(false, "Mark signals skipped while in a trade", group = grpV)
+lblSizeIn  = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// cost of a part of the position closed now, as a fraction of the entry price
+costFrac(int d, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+
+// ─────────────────────── Performance storage ───────────────────────
+var array<float> aWins = array.new<float>(2, 0.0)   // 0 = longs, 1 = shorts
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+var int sigCount = 0
+
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = lblSize)
+
+// ───────────────────────────── Levels ─────────────────────────────
+// mother bar: state BEFORE this bar
+var float mH   = na
+var float mL   = na
+var int   mCnt = 0
+float momH = mH
+float momL = mL
+int   momN = mCnt
+if na(mH) or not (high <= mH and low >= mL)
+    mH   := high
+    mL   := low
+    mCnt := 0
+else
+    mCnt += 1
+
+// higher timeframe: previous candle's high / low (no repainting) and the running high / low of the candle in progress
+[pHH, pHL] = request.security(syminfo.tickerid, htfTF, [high[1], low[1]], lookahead = barmerge.lookahead_on)
+var float runH = na
+var float runL = na
+if timeframe.change(htfTF) or na(runH)
+    runH := high
+    runL := low
+else
+    runH := math.max(runH, high)
+    runL := math.min(runL, low)
+
+// ───────────────────────────── Signals ─────────────────────────────
+float refH = sigMode == "Mother bar" ? momH : high[1]
+float refL = sigMode == "Mother bar" ? momL : low[1]
+bool  base = not na(refH) and (sigMode != "Mother bar" or momN >= minInside) and close > refL and close < refH
+bool  longSig  = base and low < refL and (not needColor or close > open) and tradeLongs
+bool  shortSig = base and high > refH and (not needColor or close < open) and tradeShorts
+if htfOn
+    bool inside = not na(pHH) and close > pHL and close < pHH
+    longSig  := longSig and inside and runL < pHL
+    shortSig := shortSig and inside and runH > pHH
+
+// ───────────────────────────── State ─────────────────────────────
+var bool  inTr     = false
+var int   trD      = 0
+var float trE      = na
+var float trS      = na
+var float trT      = na
+var float trRisk   = na
+var int   trBar    = na
+var int   trTime   = na
+var bool  trTrail  = false
+var bool  trHalf   = false
+var float trSize   = 1.0
+var float trR      = 0.0      // gross R so far
+var float trCost   = 0.0      // cost so far (fraction of entry price)
+var int   lastExit = -1
+
+// 1) Manage the open trade
+if inTr and bar_index > trBar
+    if trTrail and bar_index > trBar + 1
+        trS := trD == 1 ? math.max(trS, low[1]) : math.min(trS, high[1])
+    bool stopHit = trD == 1 ? low <= trS : high >= trS
+    bool tgtHit  = not trTrail and not na(trT) and (trD == 1 ? high >= trT : low <= trT)
+    float xPx = na
+    string tag = ""
+    if stopHit
+        xPx := trD == 1 ? math.min(open, trS) : math.max(open, trS)
+        tag := trTrail ? "Trail stop" : "SL"
+        trR    += trSize * trD * (xPx - trE) / trRisk
+        trCost += trSize * costFrac(trD, false, trTime)
+    else if tgtHit
+        float tPx = trD == 1 ? math.max(open, trT) : math.min(open, trT)
+        if exitMode == "T1 then trail"
+            trR    += 0.5 * trD * (tPx - trE) / trRisk
+            trCost += 0.5 * costFrac(trD, true, trTime)
+            trSize  := 0.5
+            trHalf  := true
+            trTrail := true
+            exitLabel(tPx, "T1 50%", trD * (tPx - trE) / trRisk)
+        else
+            xPx := tPx
+            tag := "Target"
+            trR    += trD * (xPx - trE) / trRisk
+            trCost += costFrac(trD, true, trTime)
+    if na(xPx) and bar_index >= trBar + maxBars
+        xPx := close
+        tag := "Time"
+        trR    += trSize * trD * (xPx - trE) / trRisk
+        trCost += trSize * costFrac(trD, false, trTime)
+    if not na(xPx)
+        float net = trR - trCost * trE / trRisk
+        recordExit(trD, net)
+        exitLabel(xPx, tag + " total", net)
+        inTr     := false
+        lastExit := bar_index
+
+// 2) Enter at the close of the signal bar
+if longSig or shortSig
+    int   d   = longSig ? 1 : -1
+    float stp = d == 1 ? low : high
+    float rsk = math.abs(close - stp)
+    float tgt = exitMode == "R:R" ? close + d * rrMult * rsk : exitMode == "HTF other side" ? (d == 1 ? pHH : pHL) : exitMode == "Trail only" ? na : (d == 1 ? refH : refL)
+    bool  ok  = rsk > 0 and (exitMode == "Trail only" or (not na(tgt) and (tgt - close) * d > 0)) and (exitMode != "HTF other side" or htfOn)
+    if ok and not inTr and bar_index > lastExit
+        sigCount += 1
+        inTr    := true
+        trD     := d
+        trE     := close
+        trS     := stp
+        trT     := tgt
+        trRisk  := rsk
+        trBar   := bar_index
+        trTime  := time
+        trTrail := exitMode == "Trail only"
+        trHalf  := false
+        trSize  := 1.0
+        trR     := 0.0
+        trCost  := 0.0
+        bool risky = rsk / close * 100.0 > liqDistPct
+        if risky
+            liqCount += 1
+        if showTrades
+            label.new(bar_index, d == 1 ? low : high, (d == 1 ? "Failed low ↑" : "Failed high ↓") + (risky ? "\n⚠ stop beyond " + str.tostring(leverage) + "x liq." : ""),
+                 style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = d == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor = color.white, size = lblSize)
+        alert("Failed 2 " + (d == 1 ? "LONG (failed low)" : "SHORT (failed high)") + " on " + syminfo.ticker + " " + timeframe.period +
+             " | entry " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stp, format.mintick) +
+             (na(tgt) ? " | trailing stop under each bar" : " | target " + str.tostring(tgt, format.mintick)), alert.freq_once_per_bar_close)
+    else if ok and showSkips
+        label.new(bar_index, d == 1 ? low : high, "·", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny)
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(inTr ? trE : na, "Entry", color.blue, 2, plot.style_linebr)
+plot(inTr ? trS : na, "Stop", color.red, 1, plot.style_linebr)
+plot(inTr and not trTrail ? trT : na, "Target", color.teal, 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 12, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 8 to 10
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string cfg = sigMode + (needColor ? " + colour" : "") + (htfOn ? " | HTF " + htfTF : "") + " | exit: " + (exitMode == "R:R" ? str.tostring(rrMult, "#.##") + "R" : exitMode)
+    cellTxt(0, 0, "Failed 2 v1.0 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.purple, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Longs", color.silver)
+    cellTxt(2, 1, "Shorts", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    writeCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    writeCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    writeCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1),
+         array.get(aSumR, 0) + array.get(aSumR, 1), array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    cellTxt(0, 8, "Max drawdown")
+    cellTxt(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + " | stop " + str.tostring(trS, format.mintick) +
+         (trTrail ? " (trailing)" : " | target " + str.tostring(trT, format.mintick)) : "Flat"
+    cellTxt(0, 9, "Current")
+    cellTxt(1, 9, cur, inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    cellTxt(0, 10, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 10, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)

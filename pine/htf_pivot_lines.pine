@@ -1,0 +1,101 @@
+//@version=6
+// HTF Pivot Lines   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Draws a horizontal line at every swing high and swing low ("pivot") of up to three higher timeframes.
+// Example: on a 15m chart with 1h and 4h selected you get the 1h pivots and the 4h pivots as lines.
+//  · A pivot high is a higher-timeframe candle whose high is above the highs of N candles on each side (pivot low:
+//    the mirror). It is confirmed N higher-timeframe candles later, and only closed candles are used — no repainting.
+//  · Each line starts at the pivot and runs to the right until price closes through it (or keeps running, your choice).
+indicator("HTF Pivot Lines v1.0", shorttitle = "HTF Pivots v1.0", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+grp1 = "Timeframe 1"
+on1  = input.bool(true, "Show", group = grp1, inline = "a")
+tf1  = input.timeframe("60", "", group = grp1, inline = "a")
+colH1 = input.color(color.new(color.red, 0), "Highs", group = grp1, inline = "b")
+colL1 = input.color(color.new(color.teal, 0), "Lows", group = grp1, inline = "b")
+wid1 = input.int(1, "Width", minval = 1, maxval = 5, group = grp1, inline = "b")
+
+grp2 = "Timeframe 2"
+on2  = input.bool(true, "Show", group = grp2, inline = "a")
+tf2  = input.timeframe("240", "", group = grp2, inline = "a")
+colH2 = input.color(color.new(color.orange, 0), "Highs", group = grp2, inline = "b")
+colL2 = input.color(color.new(color.blue, 0), "Lows", group = grp2, inline = "b")
+wid2 = input.int(2, "Width", minval = 1, maxval = 5, group = grp2, inline = "b")
+
+grp3 = "Timeframe 3"
+on3  = input.bool(false, "Show", group = grp3, inline = "a")
+tf3  = input.timeframe("D", "", group = grp3, inline = "a")
+colH3 = input.color(color.new(color.fuchsia, 0), "Highs", group = grp3, inline = "b")
+colL3 = input.color(color.new(color.purple, 0), "Lows", group = grp3, inline = "b")
+wid3 = input.int(3, "Width", minval = 1, maxval = 5, group = grp3, inline = "b")
+
+grpS = "Settings"
+pivLen   = input.int(3, "Pivot length (candles each side, on the higher timeframe)", minval = 1, maxval = 30, group = grpS)
+maxLines = input.int(5, "Max active lines per side, per timeframe", minval = 1, maxval = 30, group = grpS)
+endMode  = input.string("Stop when price closes through", "Lines", options = ["Stop when price closes through", "Delete when price closes through", "Keep extending"], group = grpS)
+showLbl  = input.bool(true, "Label each line (timeframe and price)", group = grpS)
+lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpS)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+tfName(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
+
+// One side (highs or lows) of one timeframe. Keeps its own lines.
+side(bool on, float pv, int pvTime, bool newBar, bool isHigh, color col, int wid, string name) =>
+    var array<line>  lines  = array.new<line>()
+    var array<label> labels = array.new<label>()
+    if on and newBar and not na(pv)
+        array.push(lines, line.new(pvTime, pv, time, pv, xloc = xloc.bar_time, color = col, width = wid))
+        array.push(labels, showLbl ? label.new(time, pv, name + (isHigh ? " high " : " low ") + str.tostring(pv, format.mintick), xloc = xloc.bar_time,
+             style = label.style_label_left, color = color.new(col, 100), textcolor = col, size = lblSize) : na)
+        if array.size(lines) > maxLines
+            line.delete(array.shift(lines))
+            label.delete(array.shift(labels))
+    if array.size(lines) > 0
+        for i = array.size(lines) - 1 to 0
+            line  ln  = array.get(lines, i)
+            label lb  = array.get(labels, i)
+            float lvl = line.get_y1(ln)
+            line.set_x2(ln, time)
+            if not na(lb)
+                label.set_x(lb, time)
+            bool broken = endMode != "Keep extending" and (isHigh ? close > lvl : close < lvl)
+            if broken
+                if endMode == "Delete when price closes through"
+                    line.delete(ln)
+                    label.delete(lb)
+                else
+                    line.set_style(ln, line.style_dotted)
+                    label.delete(lb)
+                array.remove(lines, i)
+                array.remove(labels, i)
+    array.size(lines)
+
+// Pivots of one higher timeframe, from closed candles only
+htfPivots(string tf) =>
+    [ph, pl, t] = request.security(syminfo.tickerid, tf, [ta.pivothigh(high, pivLen, pivLen)[1], ta.pivotlow(low, pivLen, pivLen)[1], time[pivLen + 1]],
+         lookahead = barmerge.lookahead_on)
+    [ph, pl, t, timeframe.change(tf)]
+
+[ph1, pl1, t1, n1] = htfPivots(tf1)
+[ph2, pl2, t2, n2] = htfPivots(tf2)
+[ph3, pl3, t3, n3] = htfPivots(tf3)
+
+side(on1, ph1, t1, n1, true,  colH1, wid1, tfName(tf1))
+side(on1, pl1, t1, n1, false, colL1, wid1, tfName(tf1))
+side(on2, ph2, t2, n2, true,  colH2, wid2, tfName(tf2))
+side(on2, pl2, t2, n2, false, colL2, wid2, tfName(tf2))
+side(on3, ph3, t3, n3, true,  colH3, wid3, tfName(tf3))
+side(on3, pl3, t3, n3, false, colL3, wid3, tfName(tf3))
+
+if barstate.islast and (timeframe.in_seconds(tf1) < timeframe.in_seconds() and on1 or timeframe.in_seconds(tf2) < timeframe.in_seconds() and on2 or timeframe.in_seconds(tf3) < timeframe.in_seconds() and on3)
+    var table warn = table.new(position.bottom_right, 1, 1)
+    table.cell(warn, 0, 0, "HTF Pivots: a selected timeframe is lower than the chart's", text_color = color.orange, text_size = size.small)
