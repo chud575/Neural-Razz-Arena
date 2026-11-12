@@ -52,17 +52,21 @@ def run(coin, df15, tf, k, rows):
             continue
         typ = "3" if (up and dn) else ("2u" if up else "2d")
         mv = (C[i] - O[i]) / O[i] * 100
-        if abs(mv) < MOVES[0]:
+        if typ == "3":
             continue
-        d = 1 if mv < 0 else -1                         # fade: long after a fall, short after a rise
-        if typ != "3" and ((typ == "2d") != (d == 1)):
-            continue                                    # a 2d that closed up / 2u that closed down: not this setup
+        d = 1 if typ == "2d" else -1                    # fade: long after a 2d, short after a 2u
+        # structure: for how many earlier candles is this the lowest low (highest high)? (capped at 100)
+        ll = 0
+        for q in range(i - 1, max(-1, i - 101), -1):
+            if (L[q] <= L[i]) if d == 1 else (H[q] >= H[i]):
+                break
+            ll += 1
         rng = H[i] - L[i]
         wicks = min(H[i] - max(O[i], C[i]), min(O[i], C[i]) - L[i]) / rng >= 0.05 if rng > 0 else False
         ext0 = L[i] if d == 1 else H[i]                 # level to sweep
         lvl = C[i]                                      # entry level
         s0 = first[i + 1]
-        for window, mode in ((1, "close"), (2, "close"), (1, "stop")):
+        for window, mode in ((1, "close"), (1, "stop")):
             ext, swept, fill, lost = ext0, False, None, False
             for j in range(s0, min(n, s0 + window * k)):
                 new_ext = (l[j] < ext) if d == 1 else (h[j] > ext)
@@ -87,7 +91,7 @@ def run(coin, df15, tf, k, rows):
                 continue
             if lost:
                 for tg in TARGETS:
-                    rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=abs(mv), wicks=wicks, window=window, mode=mode,
+                    rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, wicks=wicks, window=window, mode=mode,
                                      target=tg, period="IS" if j < split else "OOS", bar=j, e=e, risk_pct=risk / e * 100,
                                      rr=math.nan, gross=-1.0, r=-1.0 - S.cost_fraction(d, False, 0) * e / risk, win=False,
                                      bars=0, same_candle=(j - s0) < k))
@@ -116,7 +120,7 @@ def run(coin, df15, tf, k, rows):
                     px = c[m]
                 gross = d * (px - e) / risk
                 net = gross - S.cost_fraction(d, at_t, (m - j) * 0.25) * e / risk
-                rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=abs(mv), wicks=wicks, window=window, mode=mode, target=tg,
+                rows.append(dict(coin=coin, tf=tf, typ=typ, d=d, move=-d * mv, ll=ll, wicks=wicks, window=window, mode=mode, target=tg,
                                  period="IS" if j < split else "OOS", bar=j, e=e, risk_pct=risk / e * 100,
                                  rr=abs(tp - e) / risk, gross=gross, r=net, win=at_t, bars=m - j,
                                  same_candle=(j - s0) < k))
