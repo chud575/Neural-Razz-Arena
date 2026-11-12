@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 import dtdb_backtest as DT
+import hs_backtest as HS
 import megaphone_backtest as MP
 import accordion_backtest as AC
 import pivots_backtest as PV
@@ -164,7 +165,17 @@ def grid_accordion(tf):
                dict(fan_min_atr=fan, stacked_bars=stk, lookback=lb, fold_frac=fold, stop_atr=st, rr=rr))
 
 
-STRATS = {"accordion": (AC, AC.ACParams, grid_accordion), "pivots": (PV, PV.PVParams, grid_pivots), "rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
+def grid_hs(tf):
+    targets = [("measured", dict(target="measured")), ("1.5R", dict(target="rr", rr=1.5)), ("2R", dict(target="rr", rr=2.0)),
+               ("3R", dict(target="rr", rr=3.0))]
+    for piv, tol, entry, neck, stop, (tn, tk), prior, (en, e) in itertools.product(
+            (3, 5, 8), (0.25, 0.5), ("breakout", "retest", "early"), ("sloped", "flat"), ("shoulder", "head"), targets,
+            (0.0, 0.5), EXITS):
+        yield (f"piv{piv} tol{tol:g} {entry} neck:{neck} stop:{stop} target:{tn} prior:{prior:g} exit:{en}",
+               dict(piv_len=piv, sh_tol=tol, entry=entry, neck=neck, stop=stop, prior_min=prior, **tk, **e))
+
+
+STRATS = {"hs": (HS, HS.HSParams, grid_hs), "accordion": (AC, AC.ACParams, grid_accordion), "pivots": (PV, PV.PVParams, grid_pivots), "rangesweep": (RS, RS.RSParams, grid_rangesweep), "dtdb": (DT, DT.Params, grid_dtdb), "ttb": (DT, DT.Params, grid_ttb), "srflip": (SR, SR.SRParams, grid_srflip),
           "megaphone": (MP, MP.MPParams, grid_megaphone)}
 
 

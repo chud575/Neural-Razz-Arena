@@ -1,0 +1,521 @@
+//@version=6
+// Head & Shoulders (and Inverse)   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Finds HEAD & SHOULDERS tops and INVERSE head & shoulders bottoms, trades the neckline, and keeps a built-in
+// performance tracker. Python twin: python/hs_backtest.py (same rules, so the numbers should match).
+//
+//  1. Pattern: the last five swing points  LS – T1 – HEAD – T2 – RS  (left shoulder, trough, head, trough, right
+//              shoulder; mirrored for the inverse). With base = average of the two troughs and height = head − base:
+//                · height is at least X × ATR
+//                · both shoulders stand at least "min shoulder" × height above the base
+//                · the head is above the higher shoulder by at least "min head" × height
+//                · the shoulders are level and the neckline is not steep (both as a fraction of the height)
+//                · the two halves take a similar number of bars, and the whole pattern is not too wide
+//                · optional prior trend: before the left shoulder, price came from at least X × height below the base
+//              The pattern is known when the right shoulder is confirmed ("swing length" bars after it). If price
+//              already closed through the neckline before that, the pattern is skipped.
+//  2. Neckline: sloped (line through the two troughs, extended) or flat (the lower trough; higher peak for inverse).
+//  3. Entry:   Breakout = first close through the neckline  ·  Retest = limit order at the neckline after that close
+//              ·  Early = at the close of the bar that confirms the right shoulder.
+//  4. Stop:    beyond the right shoulder or the head, plus X × ATR.
+//  5. Targets: TP2 = measured move (head-to-neckline distance projected from the neckline) or an R:R multiple.
+//              TP1 (R multiple) closes a chosen %, the rest rides to TP2; optional stop to breakeven after TP1.
+//  The pattern dies on a close beyond the right shoulder, or when the wait for the breakout runs out.
+// Defaults = the best-tested variant (1h: retest of the neckline, stop beyond the right shoulder, single 3R target).
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
+// a limit entry that also touches the stop on its fill bar counts as a loss; one trade at a time.
+indicator("Head & Shoulders v1.0", shorttitle = "H&S v1.0", overlay = true,
+     max_bars_back = 1000, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpP = "Pattern"
+pivLen       = input.int(5, "Swing length (bars each side)", minval = 1, maxval = 30, group = grpP,
+     tooltip = "A swing high/low needs this many lower/higher bars on each side. Smaller = more (and smaller) patterns. The right shoulder is confirmed this many bars after it forms.")
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpP)
+minHeightAtr = input.float(2.0, "Min pattern height (× ATR)", minval = 0.0, step = 0.5, group = grpP)
+shTol        = input.float(0.5, "Shoulders level within (× height)", minval = 0.05, step = 0.05, group = grpP,
+     tooltip = "Largest allowed difference between the two shoulders, as a fraction of the pattern height. 0.25 = strict, 0.5 = loose.")
+shMin        = input.float(0.3, "Min shoulder size (× height)", minval = 0.0, maxval = 0.95, step = 0.05, group = grpP)
+headMin      = input.float(0.15, "Min head above the higher shoulder (× height)", minval = 0.0, maxval = 0.95, step = 0.05, group = grpP)
+neckTol      = input.float(0.5, "Max neckline tilt (× height)", minval = 0.0, step = 0.05, group = grpP,
+     tooltip = "Largest allowed difference between the two troughs, as a fraction of the pattern height.")
+symF         = input.float(3.0, "Time symmetry (max ratio of the two halves)", minval = 1.0, step = 0.5, group = grpP)
+maxWidth     = input.int(150, "Max pattern width (bars, shoulder to shoulder)", minval = 5, maxval = 300, group = grpP)
+priorMin     = input.float(0.5, "Prior trend: price came from at least (× height) beyond the base, 0 = off", minval = 0.0, step = 0.25, group = grpP,
+     tooltip = "Looks at the bars before the left shoulder (as many as the pattern is wide). A top needs a rise into it; an inverse needs a fall into it.")
+
+grpE = "Entry"
+neckMode   = input.string("Sloped", "Neckline", options = ["Sloped", "Flat"], group = grpE,
+     tooltip = "Sloped: the line through the two troughs, extended.\nFlat: the lower trough for a top (the higher peak for an inverse).")
+entryMode  = input.string("Retest", "Entry", options = ["Breakout", "Retest", "Early"], group = grpE,
+     tooltip = "Breakout: first close through the neckline.\nRetest: after that close, a limit order at the neckline.\nEarly: at the close of the bar that confirms the right shoulder, before any breakout.")
+retestBars = input.int(10, "Retest: bars to wait for the pullback", minval = 1, maxval = 100, group = grpE)
+waitMult   = input.float(1.0, "Wait for the breakout up to (× pattern width)", minval = 0.1, step = 0.25, group = grpE)
+stopMode   = input.string("Right shoulder", "Stop beyond", options = ["Right shoulder", "Head"], group = grpE)
+stopAtr    = input.float(0.25, "Stop buffer (× ATR)", minval = 0.0, step = 0.05, group = grpE)
+
+grpT = "Targets"
+tgtMode  = input.string("R:R", "TP2 target", options = ["Measured move", "R:R"], group = grpT)
+measMult = input.float(1.0, "Measured move multiple", minval = 0.1, step = 0.1, group = grpT)
+tp2RR    = input.float(3.0, "TP2 (reward : risk) — used when TP2 target = R:R", minval = 0.1, step = 0.1, group = grpT)
+tp1RR    = input.float(1.0, "TP1 (reward : risk)", minval = 0.1, step = 0.1, group = grpT,
+     tooltip = "TP1 distance as a multiple of the risk (entry → stop). Pulled back to TP2 if it would be beyond it.")
+tp1Pct   = input.float(0, "% of position closed at TP1", minval = 0, maxval = 100, step = 5, group = grpT,
+     tooltip = "100 = everything exits at TP1 (TP2 unused). 0 = TP1 ignored, everything rides to TP2.")
+beOn     = input.bool(true, "Move stop to breakeven after TP1", group = grpT)
+p1       = tp1Pct / 100.0
+
+grpC = "Costs (futures)"
+feesOn     = input.bool(true, "Include trading fees & funding", group = grpC,
+     tooltip = "Results in the table are net of these costs. Entry = taker fee. Exit at a target = maker fee, at a stop / breakeven = taker fee. Funding is charged per 8 hours held (longs pay, shorts receive; negative = the reverse). Defaults: Bybit VIP 3.")
+takerPct   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+makerPct   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpC)
+funding8h  = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpC)
+leverage   = input.float(25, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpC)
+mmrPct     = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpC,
+     tooltip = "Isolated margin: liquidation ≈ (100 / leverage − maintenance margin) % against the entry. Trades whose stop is further away than that would be liquidated before the stop.")
+liqDistPct = 100.0 / leverage - mmrPct
+var int liqCount = 0
+
+grpF = "Filters"
+tradeLongs  = input.bool(true, "Longs (inverse head & shoulders)", group = grpF)
+tradeShorts = input.bool(true, "Shorts (head & shoulders top)", group = grpF)
+
+grpV = "Visuals"
+showPat    = input.bool(true, "Draw patterns and necklines", group = grpV)
+showTrades = input.bool(true, "Label entries & exits", group = grpV)
+lblSizeIn  = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+tblPosIn   = input.string("Top right", "Stats table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn  = input.string("Small", "Stats table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+atrV = ta.atr(atrLen)
+
+// Trading cost of one finished trade, in R (entry taker + exit maker/taker + funding while held)
+costR(int d, float ePx, float riskU, bool atTarget, int entryTime) =>
+    float hrs = (time - entryTime) / 3600000.0
+    float cf  = feesOn ? (takerPct + (atTarget ? makerPct : takerPct) + d * funding8h * hrs / 8.0) / 100.0 : 0.0
+    riskU > 0 ? cf * ePx / riskU : 0.0
+
+// Warn when the stop is beyond the liquidation distance at the chosen leverage
+liqWarn(float ePx, float stp, int d) =>
+    bool risky = math.abs(ePx - stp) / ePx * 100.0 > liqDistPct
+    if risky
+        label.new(bar_index, ePx, "⚠ stop beyond " + str.tostring(leverage) + "x liquidation", style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 10), textcolor = color.black, size = lblSize)
+    risky
+
+// ─────────────────────── Performance storage ───────────────────────
+// index 0 = longs, 1 = shorts
+var array<float> aWins = array.new<float>(2, 0.0)
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+var int patCount = 0
+
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+// Advance an open trade by one bar (TP1 / TP2 scale-out).
+// Returns [stillOpen, tp1Done, stop, totalR, tp1FillPx (na = none), finalExitPx (na = none), exitTag]
+stepEntry(int d, float ePx, float riskU, float stp, float tp1, float tp2, bool done1In, float rIn) =>
+    bool   op    = true
+    bool   done1 = done1In
+    float  st    = stp
+    float  accR  = rIn
+    float  t1Px  = na
+    float  xPx   = na
+    string tag   = ""
+    float  rem   = done1 and p1 > 0 ? 1.0 - p1 : 1.0
+    bool stopHit = d == 1 ? low <= st : high >= st
+    if stopHit                                            // stop (or breakeven stop) first
+        xPx := d == 1 ? math.min(open, st) : math.max(open, st)
+        tag := done1 and beOn and p1 > 0 ? "BE" : "SL"
+    else
+        if not done1 and (d == 1 ? high >= tp1 : low <= tp1)
+            t1Px  := d == 1 ? math.max(open, tp1) : math.min(open, tp1)
+            accR  += p1 * d * (t1Px - ePx) / riskU
+            done1 := true
+            rem   := 1.0 - p1
+            if rem <= 0
+                op := false                               // everything closed at TP1
+            else if beOn
+                st := ePx                                 // remainder: stop to breakeven, managed from next bar
+        else if done1 and (d == 1 ? high >= tp2 : low <= tp2)
+            xPx := d == 1 ? math.max(open, tp2) : math.min(open, tp2)
+            tag := "TP2"
+    if not na(xPx)
+        accR += rem * d * (xPx - ePx) / riskU
+        op   := false
+    [op, done1, st, accR, t1Px, xPx, tag]
+
+exitLabel(float px, string txt, float r) =>
+    if showTrades
+        label.new(bar_index, px, txt + " " + (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R",
+             style = label.style_label_left, color = r > 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = lblSize)
+
+// ───────────────────────────── Swings ─────────────────────────────
+var array<int>   pvT = array.new<int>()     // 1 = high, -1 = low
+var array<float> pvP = array.new<float>()
+var array<int>   pvB = array.new<int>()
+
+// Append a swing keeping the sequence alternating (same type twice: keep the more extreme one)
+pushPivot(int tp, float price, int bar) =>
+    bool ch = false
+    int  sz = array.size(pvT)
+    if sz > 0 and array.get(pvT, sz - 1) == tp
+        float lastP = array.get(pvP, sz - 1)
+        if (tp == 1 and price > lastP) or (tp == -1 and price < lastP)
+            array.set(pvP, sz - 1, price)
+            array.set(pvB, sz - 1, bar)
+            ch := true
+    else
+        array.push(pvT, tp)
+        array.push(pvP, price)
+        array.push(pvB, bar)
+        if array.size(pvT) > 8
+            array.shift(pvT)
+            array.shift(pvP)
+            array.shift(pvB)
+        ch := true
+    ch
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+// ───────────────────────────── State ─────────────────────────────
+var bool  inTr    = false
+var int   trD     = 0
+var float trE     = na
+var float trS     = na
+var float trT     = na      // TP2
+var float trT1    = na      // TP1
+var bool  trDone1 = false
+var float trR     = 0.0
+var float trRisk  = na
+var int   trBar   = na
+var int   trTime  = na
+var line  trLine  = na      // solid entry line while the trade is open
+
+var bool  patOn     = false
+var int   patD      = 0     // trade direction: -1 = top (short), 1 = inverse (long)
+var float patN0     = na    // neckline: price at bar patNb, plus patSlope per bar
+var int   patNb     = na
+var float patSlope  = 0.0
+var float patHgt    = na    // head to neckline (measured move)
+var float patRS     = na
+var float patA      = na
+var int   patConf   = na
+var int   patExpiry = na
+var int   patBrk    = na    // bar of the close through the neckline (Retest mode)
+var float patTgt    = na
+var float patStop   = na
+var int   lastHead  = -1
+var line  nkLine    = na
+var array<line>  curLines  = array.new<line>()
+var array<label> curLabels = array.new<label>()
+
+// 1) Manage the open trade
+if inTr and bar_index > trBar
+    [op, dn, st, ar, t1Fill, xPx, tag] = stepEntry(trD, trE, trRisk, trS, trT1, trT, trDone1, trR)
+    trDone1 := dn
+    trS     := st
+    trR     := ar
+    if not na(t1Fill) and p1 < 1
+        exitLabel(t1Fill, "TP1 " + str.tostring(tp1Pct) + "%", trD * (t1Fill - trE) / trRisk)
+    if not op
+        trR := trR - costR(trD, trE, trRisk, tag == "" or tag == "TP2", trTime)
+        recordExit(trD, trR)
+        exitLabel(na(xPx) ? t1Fill : xPx, (tag == "" ? "TP1" : tag) + " total", trR)
+        inTr := false
+if not na(trLine)
+    line.set_x2(trLine, bar_index)
+    if not inTr
+        trLine := na
+
+// 2) Swings → pattern
+bool changed = false
+if not na(ph)
+    changed := pushPivot(1, ph, bar_index - pivLen) or changed
+if not na(pl)
+    changed := pushPivot(-1, pl, bar_index - pivLen) or changed
+
+bool newPat = false
+if changed and array.size(pvT) >= 5
+    int   sz  = array.size(pvT)
+    float ls  = array.get(pvP, sz - 5)
+    int   lsb = array.get(pvB, sz - 5)
+    float t1  = array.get(pvP, sz - 4)
+    int   t1b = array.get(pvB, sz - 4)
+    float hd  = array.get(pvP, sz - 3)
+    int   hb  = array.get(pvB, sz - 3)
+    float t2  = array.get(pvP, sz - 2)
+    int   t2b = array.get(pvB, sz - 2)
+    float rs  = array.get(pvP, sz - 1)
+    int   rsb = array.get(pvB, sz - 1)
+    int   s   = array.get(pvT, sz - 1)         // 1 = top, -1 = inverse
+    float A   = atrV
+    float base = (t1 + t2) / 2.0
+    float ht   = s * (hd - base)
+    int   w1   = hb - lsb
+    int   w2   = rsb - hb
+    int   W    = rsb - lsb
+    bool okP = not na(A) and A > 0 and ht > 0 and ht >= minHeightAtr * A
+    okP := okP and s * (ls - base) >= shMin * ht and s * (rs - base) >= shMin * ht
+    okP := okP and s * (hd - (s == 1 ? math.max(ls, rs) : math.min(ls, rs))) >= headMin * ht
+    okP := okP and math.abs(ls - rs) <= shTol * ht and math.abs(t1 - t2) <= neckTol * ht
+    okP := okP and W <= maxWidth and w1 <= symF * w2 and w2 <= symF * w1
+    if okP and priorMin > 0
+        int loI = math.max(0, lsb - W)
+        if loI >= lsb
+            okP := false
+        else
+            float ext = na
+            for b = loI to lsb - 1
+                int   off = bar_index - b
+                float v   = s == 1 ? low[off] : high[off]
+                ext := na(ext) ? v : s == 1 ? math.min(ext, v) : math.max(ext, v)
+            okP := s * (base - ext) >= priorMin * ht
+    float slope = neckMode == "Sloped" ? (t2 - t1) / (t2b - t1b) : 0.0
+    float n0    = neckMode == "Sloped" ? t1 : s == 1 ? math.min(t1, t2) : math.max(t1, t2)
+    float hgt   = s * (hd - (n0 + slope * (hb - t1b)))
+    okP := okP and hgt > 0
+    if okP and rsb + 1 <= bar_index - 1                     // closed through the neckline before confirmation = missed
+        for k = rsb + 1 to bar_index - 1
+            if s * (close[bar_index - k] - (n0 + slope * (k - t1b))) < 0
+                okP := false
+                break
+    if okP
+        patOn     := true
+        patD      := -s
+        patN0     := n0
+        patNb     := t1b
+        patSlope  := slope
+        patHgt    := hgt
+        patRS     := rs
+        patA      := A
+        patConf   := bar_index
+        patExpiry := bar_index + math.max(5, int(math.round(waitMult * W)))
+        patBrk    := na
+        patTgt    := na
+        patStop   := (stopMode == "Right shoulder" ? rs : hd) + s * stopAtr * A
+        newPat    := true
+        if hb != lastHead
+            patCount += 1
+        else                                                // same head, better right shoulder: redraw
+            for ln in curLines
+                line.delete(ln)
+            for lb in curLabels
+                label.delete(lb)
+        array.clear(curLines)
+        array.clear(curLabels)
+        lastHead := hb
+        if showPat
+            color pc = s == 1 ? color.new(color.red, 0) : color.new(color.teal, 0)
+            array.push(curLines, line.new(lsb, ls, t1b, t1, color = pc, width = 2))
+            array.push(curLines, line.new(t1b, t1, hb, hd, color = pc, width = 2))
+            array.push(curLines, line.new(hb, hd, t2b, t2, color = pc, width = 2))
+            array.push(curLines, line.new(t2b, t2, rsb, rs, color = pc, width = 2))
+            nkLine := line.new(t1b, n0, bar_index, n0 + slope * (bar_index - t1b), color = color.new(color.orange, 0), width = 2, style = line.style_dashed)
+            array.push(curLines, nkLine)
+            string st = s == 1 ? label.style_label_down : label.style_label_up
+            array.push(curLabels, label.new(lsb, ls, "LS", style = st, color = color.new(pc, 20), textcolor = color.white, size = lblSize))
+            array.push(curLabels, label.new(hb, hd, s == 1 ? "Head" : "Inv. head", style = st, color = color.new(pc, 20), textcolor = color.white, size = lblSize))
+            array.push(curLabels, label.new(rsb, rs, "RS", style = st, color = color.new(pc, 20), textcolor = color.white, size = lblSize))
+        alert((s == 1 ? "Head & Shoulders TOP" : "INVERSE Head & Shoulders") + " on " + syminfo.ticker + " " + timeframe.period +
+             " | neckline " + str.tostring(n0 + slope * (bar_index - t1b), format.mintick), alert.freq_once_per_bar_close)
+
+// 3) Act on the pattern
+bool  sigOn    = false
+int   sigD     = 0
+float sigE     = na      // fill price
+float sigRef   = na      // planned entry (limit price for a retest, otherwise the fill)
+float sigStop  = na
+float sigTgt   = na
+bool  sigLimit = false
+string sigName = ""
+if patOn
+    int   d  = patD
+    float nk = patN0 + patSlope * (bar_index - patNb)
+    if showPat and not na(nkLine)
+        line.set_xy2(nkLine, bar_index, nk)
+    if (close - patRS) * d < 0                              // close beyond the right shoulder: pattern failed
+        patOn := false
+    else if inTr                                            // busy: a breakout now is simply missed
+        if not na(patBrk) or (close - nk) * d > 0 or bar_index > patExpiry
+            patOn := false
+    else if na(patBrk)
+        if entryMode == "Early"
+            if bar_index == patConf
+                sigOn   := true
+                sigD    := d
+                sigE    := close
+                sigRef  := close
+                sigStop := patStop
+                sigTgt  := tgtMode == "Measured move" ? nk + d * measMult * patHgt : close + d * tp2RR * math.abs(close - patStop)
+                sigName := "Early"
+            patOn := false
+        else if (close - nk) * d > 0                        // close through the neckline
+            if entryMode == "Breakout"
+                sigOn   := true
+                sigD    := d
+                sigE    := close
+                sigRef  := close
+                sigStop := patStop
+                sigTgt  := tgtMode == "Measured move" ? nk + d * measMult * patHgt : close + d * tp2RR * math.abs(close - patStop)
+                sigName := "Breakout"
+                patOn   := false
+            else
+                patBrk := bar_index
+                patTgt := nk + d * measMult * patHgt
+        else if bar_index > patExpiry
+            patOn := false
+    else                                                    // waiting for the retest of the neckline
+        if bar_index - patBrk > retestBars
+            patOn := false
+        else if d == 1 ? low <= nk : high >= nk
+            sigOn    := true
+            sigD     := d
+            sigE     := d == 1 ? math.min(open, nk) : math.max(open, nk)
+            sigRef   := nk
+            sigStop  := patStop
+            sigTgt   := tgtMode == "Measured move" ? patTgt : nk + d * tp2RR * math.abs(nk - patStop)
+            sigLimit := true
+            sigName  := "Retest"
+            patOn    := false
+        else if d == 1 ? high >= patTgt : low <= patTgt
+            patOn := false                                  // ran to the target without a retest
+
+// 4) Enter
+if sigOn
+    int   d    = sigD
+    float risk = math.abs(sigRef - sigStop)
+    bool  ok   = risk > 0 and (sigRef - sigStop) * d > 0 and (sigTgt - sigE) * d > 0 and (sigE - sigStop) * d > 0 and (d == 1 ? tradeLongs : tradeShorts)
+    if ok
+        float t1x = sigRef + d * tp1RR * risk
+        t1x := (t1x - sigTgt) * d > 0 ? sigTgt : t1x
+        if showTrades
+            label.new(bar_index, d == 1 ? low : high, (d == 1 ? "Inv. H&S ↑ " : "H&S ↓ ") + sigName,
+                 style = d == 1 ? label.style_label_up : label.style_label_down,
+                 color = d == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor = color.white, size = lblSize)
+        if liqWarn(sigE, sigStop, d)
+            liqCount += 1
+        if sigLimit and (d == 1 ? low <= sigStop : high >= sigStop)     // filled and stopped on the same bar
+            float r = d * (sigStop - sigE) / risk - costR(d, sigE, risk, false, time)
+            recordExit(d, r)
+            exitLabel(sigStop, "SL total", r)
+        else
+            inTr    := true
+            trD     := d
+            trE     := sigE
+            trS     := sigStop
+            trT     := sigTgt
+            trT1    := t1x
+            trDone1 := p1 <= 0
+            trR     := 0.0
+            trRisk  := risk
+            trBar   := bar_index
+            trTime  := time
+            if showTrades
+                trLine := line.new(bar_index, sigE, bar_index, sigE, color = color.blue, width = 2, style = line.style_solid)
+        alert("H&S " + sigName + (d == 1 ? " LONG (inverse)" : " SHORT (top)") + " on " + syminfo.ticker +
+             " | entry " + str.tostring(sigE, format.mintick) + " | stop " + str.tostring(sigStop, format.mintick) +
+             " | TP1 " + str.tostring(t1x, format.mintick) + " | TP2 " + str.tostring(sigTgt, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(inTr ? trS : na, "Stop", color.red, 1, plot.style_linebr)
+plot(inTr and p1 > 0 and not trDone1 ? trT1 : na, "TP1", color.green, 1, plot.style_linebr)
+plot(inTr and p1 < 1 ? trT : na, "TP2", color.teal, 2, plot.style_linebr)
+
+// ─────────────────────────── Stats table ───────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table tbl = table.new(tblPos, 4, 13, bgcolor = color.new(color.black, 15),
+     border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+
+cellTxt(int c, int r, string txt, color tc = color.white, color bg = na) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, bgcolor = bg,
+         text_halign = c == 0 ? text.align_left : text.align_center)
+
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+fmtWR(float w, float l) => w + l > 0 ? str.tostring(w / (w + l) * 100.0, "#.#") + "%" : "–"
+fmtPF(float gw, float gl) => gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–"
+
+writeCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    cellTxt(col, 2, str.tostring(n, "#"))
+    cellTxt(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    cellTxt(col, 4, fmtWR(w, l))
+    cellTxt(col, 5, fmtR(r), colR(r))
+    cellTxt(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    cellTxt(col, 7, fmtPF(gw, gl))
+
+if barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for row = 8 to 11
+        table.merge_cells(tbl, 1, row, 3, row)
+
+if barstate.islast
+    string cfg = "swing " + str.tostring(pivLen) + " | " + entryMode + " | neck " + neckMode + " | stop " + stopMode + " | TP2: " +
+         (tgtMode == "R:R" ? str.tostring(tp2RR, "#.##") + "R" : "measured ×" + str.tostring(measMult, "#.##")) +
+         (p1 > 0 ? " | TP1 " + str.tostring(tp1RR, "#.##") + "R (" + str.tostring(tp1Pct) + "%)" + (beOn ? " BE" : "") : "")
+    cellTxt(0, 0, "H&S v1.0 — Historical Performance  (" + cfg + (feesOn ? " | net of fees" : " | before fees") + ")", color.white, color.new(color.purple, 40))
+    cellTxt(0, 1, "Metric", color.silver)
+    cellTxt(1, 1, "Longs (inverse)", color.silver)
+    cellTxt(2, 1, "Shorts (top)", color.silver)
+    cellTxt(3, 1, "Total", color.silver)
+    cellTxt(0, 2, "Trades")
+    cellTxt(0, 3, "Wins / Losses")
+    cellTxt(0, 4, "Win rate")
+    cellTxt(0, 5, "Net R")
+    cellTxt(0, 6, "Avg R / trade")
+    cellTxt(0, 7, "Profit factor")
+    writeCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    writeCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    writeCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1),
+         array.get(aSumR, 0) + array.get(aSumR, 1), array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    cellTxt(0, 8, "Patterns found")
+    cellTxt(1, 8, str.tostring(patCount))
+    cellTxt(0, 9, "Max drawdown")
+    cellTxt(1, 9, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    string cur = inTr ? (trD == 1 ? "LONG" : "SHORT") + " | stop " + str.tostring(trS, format.mintick) +
+         (trDone1 and p1 > 0 ? " (TP1 hit)" : " | TP1 " + str.tostring(trT1, format.mintick)) + " | TP2 " + str.tostring(trT, format.mintick) :
+         patOn ? (patD == 1 ? "Inverse H&S" : "H&S top") + (na(patBrk) ? " — waiting for a close through the neckline " : " — neckline broken, waiting for the retest at ") +
+         str.tostring(patN0 + patSlope * (bar_index - patNb), format.mintick) : "Flat"
+    cellTxt(0, 10, "Current")
+    cellTxt(1, 10, cur, inTr ? (trD == 1 ? color.lime : color.red) : patOn ? color.orange : color.white)
+    cellTxt(0, 11, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    cellTxt(1, 11, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
