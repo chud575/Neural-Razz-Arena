@@ -7,7 +7,7 @@ futures fees and funding, in R per trade. IS = first 70% of each history, OOS = 
 
 | TF | Avg R IS | Avg R OOS | Read |
 |---|---|---|---|
-| 15m | negative | negative | loses after fees (see hs_finalists_bybit.txt) |
+| 15m | -0.096 | -0.062 | loses after fees |
 | 1h | -0.026 | -0.036 | flat overall; retest entries are the only positive group |
 | 4h | -0.043 | -0.203 | loses; breakout and retest entries about -0.3R OOS |
 | 1D | +0.038 | +0.088 | positive, but only about 5 trades per setting per coin — not evidence |
