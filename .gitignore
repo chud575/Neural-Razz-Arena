@@ -27,3 +27,4 @@ python/results/strat_sweep_base.csv
 python/results/strat_failed2_trades.csv
 python/results/htf_pivot_races.csv
 python/results/htf_pivot_bounces.csv
+python/results/pivot_ftfc_trades.csv
