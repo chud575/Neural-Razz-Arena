@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.1
+// Trend Finder – Swing Structure   ·   v1.2
 // Changelog
+//  v1.2  Market structure: BOS / CHoCH marks, structure bias, and a table listing the structure of every timeframe being watched
 //  v1.1  Higher-timeframe overlay: pick any higher timeframe and see its swings and trend lines on this chart (own colours and thickness)
 //  v1.0  First version
 //
@@ -13,8 +14,12 @@
 //  · A trend ends early ("structure break") when a bar closes below the latest swing low in an uptrend, or above the
 //    latest swing high in a downtrend. Until the swings line up again the state is "no trend".
 //  · The same reading is shown for three other timeframes in the table (closed candles only).
+//  · MARKET STRUCTURE: a close above the latest swing high (or below the latest swing low) is a structure break.
+//      BOS   (break of structure)  = a break in the direction structure was already pointing — continuation.
+//      CHoCH (change of character) = the first break against it — structure flips from bullish to bearish or back.
+//    "Structure" in the table is the side of the last break; "Trend" is the stricter HH+HL / LH+LL reading.
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.1", shorttitle = "Trend Finder v1.1", overlay = true,
+indicator("Trend Finder – Swing Structure v1.2", shorttitle = "Trend Finder v1.2", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
@@ -46,6 +51,8 @@ showZig   = input.bool(true, "Draw swing lines", group = grpV)
 showLbl   = input.bool(true, "Label swings (HH / LH / HL / LL)", group = grpV)
 showBg    = input.bool(true, "Shade the background by trend", group = grpV)
 showLvl   = input.bool(true, "Show the latest swing high / low levels", group = grpV)
+showMS    = input.bool(true, "Mark structure breaks (BOS / CHoCH) on this chart", group = grpV)
+showMSH   = input.bool(true, "Mark structure breaks of the overlay timeframe", group = grpV)
 lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
 tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
 tblSizeIn = input.string("Normal", "Table text size", options = ["Tiny", "Small", "Normal", "Large"], group = grpV)
@@ -61,7 +68,8 @@ lblSize = switch lblSizeIn
 // Swing structure of the timeframe it runs on.
 // Returns [trend (1 up, -1 down, 0 none), finished swing type (1 high, -1 low, 0 none this bar), its price, its bar,
 //          is it higher than the previous one of its kind, latest swing high, latest swing low, bar the trend started,
-//          swings since the trend started, time of the finished swing]
+//          swings since the trend started, time of the finished swing, structure bias, break this bar (1 BOS up, 2 CHoCH up,
+//          -1 BOS down, -2 CHoCH down), broken level, its bar, its time, last break, latest high vs previous (1 / -1), latest low vs previous]
 structure(int L) =>
     var float lastH  = na
     var float prevH  = na
@@ -75,6 +83,10 @@ structure(int L) =>
     var int   trend  = 0
     var int   since  = na
     var int   legs   = 0
+    var bool  hBrk   = false
+    var bool  lBrk   = false
+    var int   ms     = 0        // structure bias: side of the last break
+    var int   lastEv = 0        // last break: 1 BOS up, 2 CHoCH up, -1 BOS down, -2 CHoCH down
     float ph = ta.pivothigh(high, L, L)
     float pl = ta.pivotlow(low, L, L)
     int   evT = 0
@@ -89,6 +101,7 @@ structure(int L) =>
                 lastH   := ph
                 lastHb  := bar_index - L
                 lastHt  := time[L]
+                hBrk    := false
                 changed := true
         else
             if lastT == -1                    // the previous swing low is now final
@@ -101,6 +114,7 @@ structure(int L) =>
             lastH   := ph
             lastHb  := bar_index - L
             lastHt  := time[L]
+            hBrk    := false
             lastT   := 1
             changed := true
     if not na(pl)
@@ -109,6 +123,7 @@ structure(int L) =>
                 lastL   := pl
                 lastLb  := bar_index - L
                 lastLt  := time[L]
+                lBrk    := false
                 changed := true
         else
             if lastT == 1                     // the previous swing high is now final
@@ -121,6 +136,7 @@ structure(int L) =>
             lastL   := pl
             lastLb  := bar_index - L
             lastLt  := time[L]
+            lBrk    := false
             lastT   := -1
             changed := true
     int before = trend
@@ -139,27 +155,51 @@ structure(int L) =>
         legs  := 0
     if evT != 0
         legs += 1
-    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm]
+    // structure breaks
+    int   sEv  = 0
+    float sLvl = na
+    int   sB   = na
+    int   sTm  = na
+    if not na(lastH) and not hBrk and close > lastH
+        sEv    := ms == -1 ? 2 : 1
+        ms     := 1
+        hBrk   := true
+        sLvl   := lastH
+        sB     := lastHb
+        sTm    := lastHt
+        lastEv := sEv
+    else if not na(lastL) and not lBrk and close < lastL
+        sEv    := ms == 1 ? -2 : -1
+        ms     := -1
+        lBrk   := true
+        sLvl   := lastL
+        sB     := lastLb
+        sTm    := lastLt
+        lastEv := sEv
+    int hiUp = na(prevH) or na(lastH) ? 0 : lastH > prevH ? 1 : -1
+    int loUp = na(prevL) or na(lastL) ? 0 : lastL > prevL ? 1 : -1
+    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp]
 
-// trend of another timeframe, last closed candle only (no repainting)
-trendClosed() =>
-    [t, a, b, c, d, e, f, g, h, k] = structure(swingLen)
-    t[1]
+// another timeframe, last closed candle only (no repainting): [trend, structure bias, last break, high vs previous, low vs previous, swing high, swing low]
+tfClosed() =>
+    [t, a1, a2, a3, a4, lH, lL, a5, a6, a7, m, a8, a9, a10, a11, lE, hU, lU] = structure(swingLen)
+    [t[1], m[1], lE[1], hU[1], lU[1], lH[1], lL[1]]
 
 // overlay timeframe: everything from its last closed candle
 overlayClosed() =>
-    [t, eT, eP, eB, eUp, lH, lL, sn, lg, eTm] = structure(htfLen)
-    [t[1], eT[1], eP[1], eTm[1], eUp[1], lH[1], lL[1]]
+    [t, eT, eP, eB, eUp, lH, lL, sn, lg, eTm, m, sE, sLv, sBr, sT, lE, hU, lU] = structure(htfLen)
+    [t[1], eT[1], eP[1], eTm[1], eUp[1], lH[1], lL[1], m[1], sE[1], sLv[1], sT[1], lE[1], hU[1], lU[1]]
 
-[trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm] = structure(swingLen)
-[hTrend, hEvT, hEvP, hEvTm, hEvUp, hLastH, hLastL] = request.security(syminfo.tickerid, htfTF, overlayClosed(), lookahead = barmerge.lookahead_on)
-int trA = request.security(syminfo.tickerid, tfA, trendClosed(), lookahead = barmerge.lookahead_on)
-int trB = request.security(syminfo.tickerid, tfB, trendClosed(), lookahead = barmerge.lookahead_on)
-int trC = request.security(syminfo.tickerid, tfC, trendClosed(), lookahead = barmerge.lookahead_on)
+[trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp] = structure(swingLen)
+[hTrend, hEvT, hEvP, hEvTm, hEvUp, hLastH, hLastL, hMs, hSEv, hSLvl, hSTm, hLastEv, hHiUp, hLoUp] = request.security(syminfo.tickerid, htfTF, overlayClosed(), lookahead = barmerge.lookahead_on)
+[trA, msA, evA, hiA, loA, shA, slA] = request.security(syminfo.tickerid, tfA, tfClosed(), lookahead = barmerge.lookahead_on)
+[trB, msB, evB2, hiB, loB, shB, slB] = request.security(syminfo.tickerid, tfB, tfClosed(), lookahead = barmerge.lookahead_on)
+[trC, msC, evC, hiC, loC, shC, slC] = request.security(syminfo.tickerid, tfC, tfClosed(), lookahead = barmerge.lookahead_on)
 
 tfLabel(string tf) =>
     int s = timeframe.in_seconds(tf)
     s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
+evName(int e) => e == 1 ? "BOS ↑" : e == 2 ? "CHoCH ↑" : e == -1 ? "BOS ↓" : e == -2 ? "CHoCH ↓" : "–"
 
 // ───────────────────────────── Drawing ─────────────────────────────
 var float zPx  = na
@@ -174,6 +214,18 @@ if evT != 0
              color = color.new(evUp ? upCol : dnCol, 20), textcolor = color.white, size = lblSize)
     zPx  := evP
     zBar := evB
+
+// structure breaks on this chart
+if showMS and sEv != 0
+    color mc = sEv > 0 ? upCol : dnCol
+    line.new(sB, sLvl, bar_index, sLvl, color = mc, width = 1, style = line.style_dashed)
+    label.new(math.round((sB + bar_index) / 2), sLvl, math.abs(sEv) == 2 ? "CHoCH" : "BOS", style = label.style_none, textcolor = mc, size = lblSize)
+// structure breaks of the overlay timeframe
+if htfOn and showMSH and timeframe.change(htfTF) and hSEv != 0 and not na(hSLvl)
+    color mc = hSEv > 0 ? htfUpCol : htfDnCol
+    line.new(hSTm, hSLvl, time, hSLvl, xloc = xloc.bar_time, color = mc, width = 2, style = line.style_dashed)
+    label.new(time, hSLvl, tfLabel(htfTF) + (math.abs(hSEv) == 2 ? " CHoCH" : " BOS"), xloc = xloc.bar_time, style = label.style_label_left,
+         color = color.new(mc, 100), textcolor = mc, size = lblSize)
 
 // higher-timeframe overlay: one new swing at most per higher-timeframe candle
 var float hzPx = na
@@ -202,6 +254,9 @@ if trend != trend[1]
     alert("Trend Finder " + syminfo.ticker + " " + timeframe.period + ": " + (trend == 1 ? "UPTREND started" : trend == -1 ? "DOWNTREND started" : "trend ended (structure break)") +
          " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
 
+if sEv != 0
+    alert("Trend Finder " + syminfo.ticker + " " + timeframe.period + ": " + evName(sEv) + " through " + str.tostring(sLvl, format.mintick), alert.freq_once_per_bar_close)
+
 // ───────────────────────────── Table ─────────────────────────────
 tblPos = switch tblPosIn
     "Top left"     => position.top_left
@@ -214,27 +269,43 @@ tblSize = switch tblSizeIn
     "Small" => size.small
     "Large" => size.large
     => size.normal
-var table tbl = table.new(tblPos, 2, 10, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 7, 8, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 
 trName(int t) => t == 1 ? "UP" : t == -1 ? "DOWN" : "none"
 trCol(int t) => t == 1 ? upCol : t == -1 ? dnCol : color.silver
-row(int r, string a, string b, color bc = color.white) =>
-    table.cell(tbl, 0, r, a, text_color = color.silver, text_size = tblSize, text_halign = text.align_left)
-    table.cell(tbl, 1, r, b, text_color = bc, text_size = tblSize, text_halign = text.align_right)
+cell(int c, int r, string txt, color tc = color.white) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+// one timeframe per row: trend, structure bias, latest swings, last break, swing high, swing low
+tfRow(int r, string name, int t, int m, int e, int hU, int lU, float sh, float sl) =>
+    cell(0, r, name, color.silver)
+    cell(1, r, trName(t), trCol(t))
+    cell(2, r, m == 1 ? "Bullish" : m == -1 ? "Bearish" : "–", trCol(m))
+    cell(3, r, (hU == 1 ? "HH" : hU == -1 ? "LH" : "–") + " · " + (lU == 1 ? "HL" : lU == -1 ? "LL" : "–"), hU == 1 and lU == 1 ? upCol : hU == -1 and lU == -1 ? dnCol : color.white)
+    cell(4, r, evName(e), e > 0 ? upCol : e < 0 ? dnCol : color.white)
+    cell(5, r, str.tostring(sh, format.mintick))
+    cell(6, r, str.tostring(sl, format.mintick))
 
 if barstate.isfirst
-    table.merge_cells(tbl, 0, 0, 1, 0)
+    table.merge_cells(tbl, 0, 0, 6, 0)
+    table.merge_cells(tbl, 0, 7, 6, 7)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.1 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
-    row(1, "This chart (" + tfLabel(timeframe.period) + ")", trName(trend), trCol(trend))
-    row(2, "Trend age", trend != 0 and not na(since) ? str.tostring(bar_index - since) + " bars, " + str.tostring(legs) + " swings" : "–")
-    row(3, "Latest swing high", str.tostring(lastH, format.mintick), trend == -1 ? dnCol : color.white)
-    row(4, "Latest swing low", str.tostring(lastL, format.mintick), trend == 1 ? upCol : color.white)
-    row(5, "Trend ends on a close", trend == 1 ? "below " + str.tostring(lastL, format.mintick) : trend == -1 ? "above " + str.tostring(lastH, format.mintick) : "–")
+    table.cell(tbl, 0, 0, "Trend Finder v1.2 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    cell(0, 1, "Timeframe", color.silver)
+    cell(1, 1, "Trend", color.silver)
+    cell(2, 1, "Structure", color.silver)
+    cell(3, 1, "Swings", color.silver)
+    cell(4, 1, "Last break", color.silver)
+    cell(5, 1, "Swing high", color.silver)
+    cell(6, 1, "Swing low", color.silver)
+    tfRow(2, tfLabel(timeframe.period) + " (chart)", trend, ms, lastEv, hiUp, loUp, lastH, lastL)
     if htfOn
-        row(9, "Overlay " + tfLabel(htfTF), trName(hTrend), trCol(hTrend))
+        tfRow(3, tfLabel(htfTF) + " (overlay)", hTrend, hMs, hLastEv, hHiUp, hLoUp, hLastH, hLastL)
     if showHtf
-        row(6, tfLabel(tfA), trName(trA), trCol(trA))
-        row(7, tfLabel(tfB), trName(trB), trCol(trB))
-        row(8, tfLabel(tfC), trName(trC), trCol(trC))
+        tfRow(4, tfLabel(tfA), trA, msA, evA, hiA, loA, shA, slA)
+        tfRow(5, tfLabel(tfB), trB, msB, evB2, hiB, loB, shB, slB)
+        tfRow(6, tfLabel(tfC), trC, msC, evC, hiC, loC, shC, slC)
+    string foot = trend == 1 ? "Chart uptrend: " + str.tostring(bar_index - since) + " bars, " + str.tostring(legs) + " swings · ends on a close below " + str.tostring(lastL, format.mintick) :
+         trend == -1 ? "Chart downtrend: " + str.tostring(bar_index - since) + " bars, " + str.tostring(legs) + " swings · ends on a close above " + str.tostring(lastH, format.mintick) :
+         "Chart: no trend · next break above " + str.tostring(lastH, format.mintick) + " or below " + str.tostring(lastL, format.mintick)
+    table.cell(tbl, 0, 7, foot, text_color = trCol(trend), text_size = tblSize, text_halign = text.align_left)
