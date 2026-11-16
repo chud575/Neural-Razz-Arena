@@ -1,6 +1,7 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.3
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.4
 // Changelog
+//  v1.4  Labels sit directly under the box they describe
 //  v1.3  Table: how many head fakes still reached the ORIGINAL target (before the opposite one)
 //  v1.2  Narrower table (the long footnote moved into a hover tooltip)
 //  v1.1  Head fakes: when a break fails (price returns to the far side of the box before the target), track whether it then
@@ -27,7 +28,7 @@
 //               script tracks the opposite target (one box-height beyond the far edge) and counts how often price
 //               reaches it before returning to the edge it first broke.
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.3", shorttitle = "Box Finder v1.3", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.4", shorttitle = "Box Finder v1.4", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -202,8 +203,8 @@ if inBox
         if not na(lb)
             label.delete(lb)
         if showLbl
-            label.new(bar_index, d == 1 ? top : bot, catName(c) + (d == 1 ? " ↑" : " ↓") + "\n" + str.tostring(bar_index - startBar) + " bars · buying " + str.tostring(leanPct(), "#") + "%",
-                 style = d == 1 ? label.style_label_lower_right : label.style_label_upper_right, color = color.new(cc, 15), textcolor = color.white, size = lblSize)
+            label.new(math.round((startBar + bar_index) / 2), bot, catName(c) + (d == 1 ? " ↑" : " ↓") + "\n" + str.tostring(bar_index - startBar) + " bars · buying " + str.tostring(leanPct(), "#") + "%",
+                 style = label.style_label_up, color = color.new(cc, 15), textcolor = color.white, size = lblSize)
         if extBars > 0
             line.new(bar_index, top, bar_index + extBars, top, color = color.new(cc, 30), style = line.style_dotted)
             line.new(bar_index, bot, bar_index + extBars, bot, color = color.new(cc, 30), style = line.style_dotted)
@@ -268,10 +269,10 @@ if inBox and showLbl
     string lean = prior == -1 ? "possible accumulation" : prior == 1 ? "possible distribution" : "direction open"
     string txt  = "Consolidation · " + priorTxt(prior) + "\n" + lean + " · buying " + str.tostring(leanPct(), "#") + "%"
     if na(lb)
-        lb := label.new(startBar, top, txt, style = label.style_label_lower_left, color = color.new(colForm, 30), textcolor = color.white, size = lblSize)
+        lb := label.new(math.round((startBar + bar_index) / 2), bot, txt, style = label.style_label_up, color = color.new(colForm, 30), textcolor = color.white, size = lblSize)
     else
         label.set_text(lb, txt)
-        label.set_y(lb, top)
+        label.set_xy(lb, math.round((startBar + bar_index) / 2), bot)
 
 // ───────────────────────────── Alerts ─────────────────────────────
 if newBox
@@ -308,7 +309,7 @@ if showTbl and barstate.isfirst
         table.merge_cells(tbl, 1, r, 5, r)
     table.merge_cells(tbl, 0, 11, 5, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.3 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.4 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
     cell(1, 1, inBox ? "In a box · " + priorTxt(prior) : "No box", inBox ? color.yellow : color.white)

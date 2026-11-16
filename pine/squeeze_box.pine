@@ -1,6 +1,7 @@
 //@version=6
-// Squeeze + Range Box   ·   v1.0
+// Squeeze + Range Box   ·   v1.1
 // Changelog
+//  v1.1  Labels sit directly under the box they describe
 //  v1.0  First version
 //
 // A TTM-Squeeze-style indicator (three compression levels, like "Squeeze Pro"), written from the public formulas,
@@ -19,7 +20,7 @@
 //               squeeze fires. When it fires the box is coloured by the momentum's direction, labelled, and its
 //               edges can be extended to the right.
 // The histogram and dots are in this pane; the boxes are drawn on the main price chart.
-indicator("Squeeze + Range Box v1.0", shorttitle = "Squeeze Box v1.0", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+indicator("Squeeze + Range Box v1.1", shorttitle = "Squeeze Box v1.1", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpS = "Squeeze"
@@ -127,8 +128,8 @@ else if inBox                                              // the squeeze has fi
                 line.set_color(midLn, color.new(fc, 40))
             if showLbl
                 string lv = peak == 3 ? "high" : peak == 2 ? "mid" : "low"
-                label.new(bar_index, firedUp ? top : bot, "Squeeze fired " + (firedUp ? "↑" : "↓") + "\n" + str.tostring(bars) + " bars · " + lv + " compression · range " +
-                     str.tostring((top - bot) / bot * 100.0, "#.##") + "%", style = firedUp ? label.style_label_lower_left : label.style_label_upper_left,
+                label.new(math.round((start + bar_index) / 2), bot, "Squeeze fired " + (firedUp ? "↑" : "↓") + "\n" + str.tostring(bars) + " bars · " + lv + " compression · range " +
+                     str.tostring((top - bot) / bot * 100.0, "#.##") + "%", style = label.style_label_up,
                      color = color.new(fc, 15), textcolor = color.white, size = lblSize, force_overlay = true)
             if extBars > 0
                 line.new(bar_index, top, bar_index + extBars, top, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
