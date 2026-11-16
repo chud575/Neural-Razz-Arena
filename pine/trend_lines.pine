@@ -1,0 +1,333 @@
+//@version=6
+// Auto Trend Lines – multi-scale, validated, scored   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Draws the trend lines a careful chartist would draw, and keeps them honest.
+//  · Lines connect swing lows (support) or swing highs (resistance) on up to three scales at once
+//    (short / medium / long swing lengths), each with its own on/off switch, colour and thickness.
+//  · A line is only drawn if it is VALID: between its two anchor swings no bar may cut through it (by close, or by
+//    wick if you prefer), allowing a small tolerance.
+//  · Every line is SCORED by its touches: the two anchors plus every other swing that sits on it. When a new swing
+//    could anchor several lines, the one with the most touches (then the longest) is drawn. Later swings that tag
+//    a line add to its count, and you can demand 3+ touches before a line is shown.
+//  · A line is BROKEN when a bar closes beyond it (plus an optional buffer). It then stops extending, turns dotted,
+//    and is watched for a RETEST from the other side.
+//  · "Classic" direction keeps rising support and falling resistance only; "Any" also keeps the others.
+//  · Log option: lines are straight on a log-scale chart instead of a linear one.
+//  · Table: nearest support and resistance line on each scale — price right now, distance, touches — and counts of
+//    breaks and retests. Alerts for new lines, touches, breaks and retests.
+// A swing is confirmed N bars after it forms, so a line appears N bars after its second anchor. Nothing repaints.
+indicator("Auto Trend Lines v1.0", shorttitle = "Trend Lines v1.0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 2000)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpA = "Scales (swing length = bars each side)"
+on1  = input.bool(true, "Short", group = grpA, inline = "s1")
+len1 = input.int(5, "", minval = 2, maxval = 100, group = grpA, inline = "s1")
+wid1 = input.int(1, "width", minval = 1, maxval = 6, group = grpA, inline = "s1")
+on2  = input.bool(true, "Medium", group = grpA, inline = "s2")
+len2 = input.int(12, "", minval = 2, maxval = 100, group = grpA, inline = "s2")
+wid2 = input.int(2, "width", minval = 1, maxval = 6, group = grpA, inline = "s2")
+on3  = input.bool(true, "Long", group = grpA, inline = "s3")
+len3 = input.int(30, "", minval = 2, maxval = 100, group = grpA, inline = "s3")
+wid3 = input.int(3, "width", minval = 1, maxval = 6, group = grpA, inline = "s3")
+
+grpL = "Lines"
+showSup   = input.bool(true, "Support lines (through swing lows)", group = grpL)
+showRes   = input.bool(true, "Resistance lines (through swing highs)", group = grpL)
+dirMode   = input.string("Classic", "Direction", options = ["Classic", "Any"], group = grpL,
+     tooltip = "Classic: rising support and falling resistance only.\nAny: also falling support and rising resistance (channel edges, wedges).")
+minTouch  = input.int(2, "Min touches to draw a line", minval = 2, maxval = 6, group = grpL,
+     tooltip = "2 = any valid line through two swings. 3 = only lines a third swing also sits on.")
+maxLines  = input.int(3, "Max active lines per side, per scale", minval = 1, maxval = 10, group = grpL)
+tolAtr    = input.float(0.25, "Tolerance (× ATR)", minval = 0.0, step = 0.05, group = grpL,
+     tooltip = "How close a swing must be to count as touching a line, and how far a bar may poke through a line between its anchors.")
+wickMode  = input.bool(false, "Wicks may not cut the line either (stricter)", group = grpL,
+     tooltip = "Off: only closes are checked between the anchors. On: highs / lows are checked too.")
+minSpan   = input.int(10, "Min bars between the two anchors", minval = 2, group = grpL)
+maxSpan   = input.int(500, "Max bars between the two anchors", minval = 10, maxval = 1500, group = grpL)
+maxPairs  = input.int(8, "Earlier swings to try as the first anchor", minval = 1, maxval = 20, group = grpL)
+useLog    = input.bool(false, "Log scale (turn on if your chart is on log scale)", group = grpL)
+extendOn  = input.bool(true, "Extend active lines to the right", group = grpL)
+
+grpK = "Breaks and retests"
+brkAtr    = input.float(0.1, "Break needs a close beyond the line by (× ATR)", minval = 0.0, step = 0.05, group = grpK)
+keepBroken = input.bool(true, "Keep broken lines on the chart (dotted)", group = grpK)
+markBreak = input.bool(true, "Mark breaks", group = grpK)
+retestOn  = input.bool(true, "Watch broken lines for a retest", group = grpK)
+retestBars = input.int(30, "…for this many bars after the break", minval = 1, maxval = 500, group = grpK)
+markRetest = input.bool(true, "Mark retests", group = grpK)
+
+grpV = "Visuals"
+colSup  = input.color(color.new(color.teal, 0), "Support", group = grpV, inline = "c")
+colRes  = input.color(color.new(color.red, 0), "Resistance", group = grpV, inline = "c")
+showCnt = input.bool(true, "Show each line's touch count", group = grpV)
+showDot = input.bool(true, "Mark touches", group = grpV)
+lblSizeIn = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+tblOn    = input.bool(true, "Show the table", group = grpV)
+tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal", "Large"], group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+    => size.small
+
+grpN = "Alerts"
+alNew    = input.bool(false, "New line", group = grpN, inline = "a")
+alTouch  = input.bool(true, "Touch", group = grpN, inline = "a")
+alBreak  = input.bool(true, "Break", group = grpN, inline = "a")
+alRetest = input.bool(true, "Retest", group = grpN, inline = "a")
+
+atrV = ta.atr(14)
+fwd(float p) => useLog ? math.log(p) : p
+inv(float v) => useLog ? math.exp(v) : v
+
+// One side (support or resistance) of one scale. Keeps its own swings and lines.
+// Returns [nearest active line's price now, its touches, active lines, broke this bar, touched this bar, retest this bar, new line this bar]
+engine(bool on, int L, bool isHigh, color col, int wid) =>
+    var array<float> pP = array.new<float>()        // recent swings: price, bar
+    var array<int>   pB = array.new<int>()
+    var array<int>   lX = array.new<int>()          // active lines: first anchor bar, its value (calc space), slope, touches, last touch bar
+    var array<float> lY = array.new<float>()
+    var array<float> lS = array.new<float>()
+    var array<int>   lT = array.new<int>()
+    var array<int>   lLast = array.new<int>()
+    var array<line>  lLn = array.new<line>()
+    var array<label> lLb = array.new<label>()
+    var array<int>   bX = array.new<int>()          // broken lines watched for a retest
+    var array<float> bY = array.new<float>()
+    var array<float> bS = array.new<float>()
+    var array<int>   bBar = array.new<int>()
+    float pv  = isHigh ? ta.pivothigh(high, L, L) : ta.pivotlow(low, L, L)
+    int   pb  = bar_index - L
+    float tol = na(atrV) ? 0.0 : tolAtr * atrV
+    float buf = na(atrV) ? 0.0 : brkAtr * atrV
+    int   s   = isHigh ? 1 : -1                      // +1: price above the line breaks it
+    bool brk = false
+    bool tch = false
+    bool rts = false
+    bool nw  = false
+    bool onLine = false                              // the new swing sits on an existing line
+    if on
+        // 1) active lines: break? touch?
+        if array.size(lX) > 0
+            for i = array.size(lX) - 1 to 0
+                int   x1 = array.get(lX, i)
+                float v  = inv(array.get(lY, i) + array.get(lS, i) * (bar_index - x1))
+                line  ln = array.get(lLn, i)
+                label lb = array.get(lLb, i)
+                if (close - v) * s > buf
+                    brk := true
+                    line.set_extend(ln, extend.none)
+                    line.set_xy2(ln, bar_index, v)
+                    if keepBroken
+                        line.set_style(ln, line.style_dotted)
+                    else
+                        line.delete(ln)
+                    if not na(lb)
+                        label.delete(lb)
+                    if markBreak
+                        label.new(bar_index, v, isHigh ? "Break ↑" : "Break ↓", style = isHigh ? label.style_label_up : label.style_label_down,
+                             color = color.new(isHigh ? color.lime : color.red, 20), textcolor = color.white, size = lblSize)
+                    if retestOn
+                        array.push(bX, x1)
+                        array.push(bY, array.get(lY, i))
+                        array.push(bS, array.get(lS, i))
+                        array.push(bBar, bar_index)
+                    array.remove(lX, i)
+                    array.remove(lY, i)
+                    array.remove(lS, i)
+                    array.remove(lT, i)
+                    array.remove(lLast, i)
+                    array.remove(lLn, i)
+                    array.remove(lLb, i)
+                else if not na(pv) and pb > array.get(lLast, i)
+                    float vp = inv(array.get(lY, i) + array.get(lS, i) * (pb - x1))
+                    if math.abs(pv - vp) <= tol
+                        tch    := true
+                        onLine := true
+                        array.set(lT, i, array.get(lT, i) + 1)
+                        array.set(lLast, i, pb)
+                        if not na(lb)
+                            label.set_text(lb, str.tostring(array.get(lT, i)))
+                        if showDot
+                            label.new(pb, pv, "●", style = isHigh ? label.style_label_down : label.style_label_up, color = color.new(col, 100), textcolor = col, size = size.small)
+        // 2) broken lines: retest from the other side?
+        if array.size(bX) > 0
+            for i = array.size(bX) - 1 to 0
+                float v = inv(array.get(bY, i) + array.get(bS, i) * (bar_index - array.get(bX, i)))
+                bool done = bar_index - array.get(bBar, i) > retestBars or (close - v) * s < -buf
+                if not done and bar_index > array.get(bBar, i) and (isHigh ? low <= v + tol and close > v : high >= v - tol and close < v)
+                    rts  := true
+                    done := true
+                    if markRetest
+                        label.new(bar_index, v, "Retest", style = isHigh ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.orange, 20), textcolor = color.white, size = lblSize)
+                if done
+                    array.remove(bX, i)
+                    array.remove(bY, i)
+                    array.remove(bS, i)
+                    array.remove(bBar, i)
+        // 3) a new swing: can it anchor a new line?
+        if not na(pv)
+            if not onLine and array.size(pP) > 0
+                int   bestJ = -1
+                int   bestT = 0
+                float bestS = na
+                int   n     = array.size(pP)
+                int   tries = 0
+                for j = n - 1 to 0
+                    tries += 1
+                    if tries > maxPairs
+                        break
+                    int   xj = array.get(pB, j)
+                    float yj = array.get(pP, j)
+                    int   dx = pb - xj
+                    if dx < minSpan or dx > maxSpan
+                        continue
+                    float sl = (fwd(pv) - fwd(yj)) / dx
+                    if dirMode == "Classic" and (isHigh ? sl >= 0 : sl <= 0)
+                        continue
+                    // valid? nothing cuts the line between the anchors, or since the second anchor
+                    bool ok = true
+                    for b = xj + 1 to bar_index
+                        if b == pb
+                            continue
+                        int   off = bar_index - b
+                        float v   = inv(fwd(yj) + sl * (b - xj))
+                        float px  = wickMode and b < pb ? (isHigh ? high[off] : low[off]) : close[off]
+                        if (px - v) * s > tol
+                            ok := false
+                            break
+                    if not ok
+                        continue
+                    // score: swings between the anchors that sit on the line
+                    int t = 2
+                    if j < n - 1
+                        for m = j + 1 to n - 1
+                            float vm = inv(fwd(yj) + sl * (array.get(pB, m) - xj))
+                            if math.abs(array.get(pP, m) - vm) <= tol
+                                t += 1
+                    if t > bestT
+                        bestT := t
+                        bestJ := j
+                        bestS := sl
+                if bestJ >= 0 and bestT >= minTouch
+                    nw := true
+                    int   xj = array.get(pB, bestJ)
+                    float yj = array.get(pP, bestJ)
+                    line  ln = line.new(xj, yj, pb, pv, color = col, width = wid, extend = extendOn ? extend.right : extend.none)
+                    label lb = showCnt ? label.new(pb, pv, str.tostring(bestT), style = isHigh ? label.style_label_down : label.style_label_up,
+                         color = color.new(col, 30), textcolor = color.white, size = lblSize) : na
+                    array.push(lX, xj)
+                    array.push(lY, fwd(yj))
+                    array.push(lS, bestS)
+                    array.push(lT, bestT)
+                    array.push(lLast, pb)
+                    array.push(lLn, ln)
+                    array.push(lLb, lb)
+                    if array.size(lX) > maxLines                 // drop the weakest (fewest touches, then oldest)
+                        int w = 0
+                        for i = 1 to array.size(lX) - 1
+                            if array.get(lT, i) < array.get(lT, w)
+                                w := i
+                        line.delete(array.get(lLn, w))
+                        label.delete(array.get(lLb, w))
+                        array.remove(lX, w)
+                        array.remove(lY, w)
+                        array.remove(lS, w)
+                        array.remove(lT, w)
+                        array.remove(lLast, w)
+                        array.remove(lLn, w)
+                        array.remove(lLb, w)
+            array.push(pP, pv)
+            array.push(pB, pb)
+            if array.size(pP) > 30
+                array.shift(pP)
+                array.shift(pB)
+        // lines that are not extended still need their right end moved along
+        if not extendOn and array.size(lX) > 0
+            for i = 0 to array.size(lX) - 1
+                line.set_xy2(array.get(lLn, i), bar_index, inv(array.get(lY, i) + array.get(lS, i) * (bar_index - array.get(lX, i))))
+    // nearest active line right now
+    float nearV = na
+    int   nearT = 0
+    if array.size(lX) > 0
+        for i = 0 to array.size(lX) - 1
+            float v = inv(array.get(lY, i) + array.get(lS, i) * (bar_index - array.get(lX, i)))
+            if na(nearV) or math.abs(v - close) < math.abs(nearV - close)
+                nearV := v
+                nearT := array.get(lT, i)
+    [nearV, nearT, array.size(lX), brk, tch, rts, nw]
+
+[s1V, s1T, s1N, s1B, s1H, s1R, s1W] = engine(on1 and showSup, len1, false, colSup, wid1)
+[r1V, r1T, r1N, r1B, r1H, r1R, r1W] = engine(on1 and showRes, len1, true,  colRes, wid1)
+[s2V, s2T, s2N, s2B, s2H, s2R, s2W] = engine(on2 and showSup, len2, false, colSup, wid2)
+[r2V, r2T, r2N, r2B, r2H, r2R, r2W] = engine(on2 and showRes, len2, true,  colRes, wid2)
+[s3V, s3T, s3N, s3B, s3H, s3R, s3W] = engine(on3 and showSup, len3, false, colSup, wid3)
+[r3V, r3T, r3N, r3B, r3H, r3R, r3W] = engine(on3 and showRes, len3, true,  colRes, wid3)
+
+// ───────────────────────────── Counters and alerts ─────────────────────────────
+var int nBrkUp = 0
+var int nBrkDn = 0
+var int nRetest = 0
+bool brkUp = r1B or r2B or r3B
+bool brkDn = s1B or s2B or s3B
+bool anyRetest = s1R or r1R or s2R or r2R or s3R or r3R
+bool anyTouch  = s1H or r1H or s2H or r2H or s3H or r3H
+bool anyNew    = s1W or r1W or s2W or r2W or s3W or r3W
+nBrkUp  += (r1B ? 1 : 0) + (r2B ? 1 : 0) + (r3B ? 1 : 0)
+nBrkDn  += (s1B ? 1 : 0) + (s2B ? 1 : 0) + (s3B ? 1 : 0)
+nRetest += (s1R ? 1 : 0) + (r1R ? 1 : 0) + (s2R ? 1 : 0) + (r2R ? 1 : 0) + (s3R ? 1 : 0) + (r3R ? 1 : 0)
+scaleTxt(bool a, bool b, bool c) => (a ? "short " : "") + (b ? "medium " : "") + (c ? "long " : "")
+string who = syminfo.ticker + " " + timeframe.period
+if alBreak and brkUp
+    alert("Trend line BREAK UP (" + scaleTxt(r1B, r2B, r3B) + "resistance) on " + who + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if alBreak and brkDn
+    alert("Trend line BREAK DOWN (" + scaleTxt(s1B, s2B, s3B) + "support) on " + who + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if alRetest and anyRetest
+    alert("Trend line RETEST on " + who + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if alTouch and anyTouch
+    alert("Trend line TOUCH confirmed on " + who + " (" + scaleTxt(s1H or r1H, s2H or r2H, s3H or r3H) + "scale)", alert.freq_once_per_bar_close)
+if alNew and anyNew
+    alert("New trend line on " + who + " (" + scaleTxt(s1W or r1W, s2W or r2W, s3W or r3W) + "scale)", alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Table ─────────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+var table tbl = table.new(tblPos, 3, 6, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.gray, frame_width = 1)
+cell(int c, int r, string txt, color tc = color.white) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+lineTxt(float v, int t, int n) =>
+    na(v) ? "–" : str.tostring(v, format.mintick) + " (" + (v >= close ? "+" : "") + str.tostring((v - close) / close * 100.0, "#.##") + "%)\n" + str.tostring(t) + " touches · " + str.tostring(n) + " active"
+if tblOn and barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 2, 0)
+    table.merge_cells(tbl, 0, 5, 2, 5)
+if tblOn and barstate.islast
+    table.cell(tbl, 0, 0, "Trend Lines v1.0 — nearest line on each scale", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    cell(0, 1, "Scale", color.silver)
+    cell(1, 1, "Support", colSup)
+    cell(2, 1, "Resistance", colRes)
+    cell(0, 2, "Short (" + str.tostring(len1) + ")", color.silver)
+    cell(1, 2, on1 and showSup ? lineTxt(s1V, s1T, s1N) : "off")
+    cell(2, 2, on1 and showRes ? lineTxt(r1V, r1T, r1N) : "off")
+    cell(0, 3, "Medium (" + str.tostring(len2) + ")", color.silver)
+    cell(1, 3, on2 and showSup ? lineTxt(s2V, s2T, s2N) : "off")
+    cell(2, 3, on2 and showRes ? lineTxt(r2V, r2T, r2N) : "off")
+    cell(0, 4, "Long (" + str.tostring(len3) + ")", color.silver)
+    cell(1, 4, on3 and showSup ? lineTxt(s3V, s3T, s3N) : "off")
+    cell(2, 4, on3 and showRes ? lineTxt(r3V, r3T, r3N) : "off")
+    table.cell(tbl, 0, 5, "Breaks up " + str.tostring(nBrkUp) + " · breaks down " + str.tostring(nBrkDn) + " · retests " + str.tostring(nRetest), text_color = color.silver, text_size = tblSize,
+         text_halign = text.align_left)
