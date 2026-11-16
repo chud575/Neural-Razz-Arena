@@ -1,6 +1,7 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.1
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.2
 // Changelog
+//  v1.2  Narrower table (the long footnote moved into a hover tooltip)
 //  v1.1  Head fakes: when a break fails (price returns to the far side of the box before the target), track whether it then
 //        reaches the target on the OTHER side; marked on the chart, counted in the table, with an alert
 //  v1.0  First version
@@ -25,7 +26,7 @@
 //               script tracks the opposite target (one box-height beyond the far edge) and counts how often price
 //               reaches it before returning to the edge it first broke.
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.1", shorttitle = "Box Finder v1.1", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.2", shorttitle = "Box Finder v1.2", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -293,7 +294,7 @@ if showTbl and barstate.isfirst
         table.merge_cells(tbl, 1, r, 4, r)
     table.merge_cells(tbl, 0, 11, 4, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.1 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.2 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
     cell(1, 1, inBox ? "In a box · " + priorTxt(prior) : "No box", inBox ? color.yellow : color.white)
@@ -307,9 +308,9 @@ if showTbl and barstate.islast
     cell(1, 5, str.tostring(nBoxes))
     cell(0, 6, "Break type", color.silver)
     cell(1, 6, "Count", color.silver)
-    cell(2, 6, "Reached target", color.silver)
-    cell(3, 6, "Head fakes", color.silver)
-    cell(4, 6, "…then reached the other target", color.silver)
+    cell(2, 6, "Reached\ntarget", color.silver)
+    cell(3, 6, "Head\nfakes", color.silver)
+    cell(4, 6, "…then other\ntarget", color.silver)
     for c = 0 to 3
         int done = array.get(nDone, c)
         cell(0, 7 + c, catName(c) + (c < 2 ? " ↑" : " ↓"), catCol(c))
@@ -319,6 +320,6 @@ if showTbl and barstate.islast
         int d2    = array.get(nF2Done, c)
         cell(3, 7 + c, done > 0 ? str.tostring(fakes) + " (" + str.tostring(fakes / done * 100.0, "#") + "%)" : "–")
         cell(4, 7 + c, d2 > 0 ? str.tostring(array.get(nF2Hit, c) / d2 * 100.0, "#") + "% of " + str.tostring(d2) : "–", d2 > 0 ? (c < 2 ? colDis : colAcc) : color.white)
-    table.cell(tbl, 0, 11, "Target = " + str.tostring(tgtMult, "#.##") + " box height beyond the edge, reached before price returns to the far side of the box. Head fake = it returned first; " +
-         "the other target = the same distance beyond the far edge, reached before price gets back to the edge it first broke. No-edge rate for both ≈ " +
-         str.tostring(100.0 / (1.0 + tgtMult), "#") + "%", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tbl, 0, 11, "Target: " + str.tostring(tgtMult, "#.##") + " box height past the edge.\nHead fake: back to the far side first.\nNo-edge rate ≈ " +
+         str.tostring(100.0 / (1.0 + tgtMult), "#") + "%. Hover for details.", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left,
+         tooltip = "Reached target: price travelled the target distance beyond the broken edge before returning to the far side of the box.\nHead fake: it returned to the far side first.\nThen reached the other target: after a head fake, price travelled the same distance beyond the far edge before getting back to the edge it first broke.\nNo-edge rate: what a coin flip would give for these distances.")
