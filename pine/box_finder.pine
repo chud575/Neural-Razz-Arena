@@ -1,6 +1,8 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.0
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.1
 // Changelog
+//  v1.1  Head fakes: when a break fails (price returns to the far side of the box before the target), track whether it then
+//        reaches the target on the OTHER side; marked on the chart, counted in the table, with an alert
 //  v1.0  First version
 //
 // Finds CONSOLIDATION BOXES (tight sideways ranges) and names each one by how price came in and how it left.
@@ -19,8 +21,11 @@
 //  4. Volume lean: share of the box's volume that traded on up-closing bars (above 50% = more buying).
 //  5. Table:    the open box, plus how often each kind of break went on to travel one box-height beyond the edge
 //               before coming back to the far side of the box.
+//  6. Head fake: a break that comes back to the far side of the box before reaching its target. From there the
+//               script tracks the opposite target (one box-height beyond the far edge) and counts how often price
+//               reaches it before returning to the edge it first broke.
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.0", shorttitle = "Box Finder v1.0", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.1", shorttitle = "Box Finder v1.1", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -43,6 +48,7 @@ extBars  = input.int(30, "Extend the box edges to the right (bars, 0 = off)", mi
      tooltip = "The old edges often get retested.")
 tgtMult  = input.float(1.0, "Target = box heights beyond the edge", minval = 0.1, step = 0.25, group = grpO)
 showTgt  = input.bool(true, "Draw the target line", group = grpO)
+showFake = input.bool(true, "Mark head fakes and draw the opposite target", group = grpO)
 
 grpV = "Visuals"
 colForm = input.color(color.new(color.gray, 0), "Consolidation", group = grpV, inline = "c0")
@@ -90,6 +96,11 @@ var array<int>   pCat  = array.new<int>()
 var array<int>   pDir  = array.new<int>()
 var array<float> pTgt  = array.new<float>()
 var array<float> pFail = array.new<float>()
+var array<int>   pStage = array.new<int>()      // 1 = first break, 2 = after a head fake (now tracking the other side)
+var array<float> pTop   = array.new<float>()
+var array<float> pBot   = array.new<float>()
+var array<int> nF2Done = array.new<int>(4, 0)   // head fakes whose second leg is decided
+var array<int> nF2Hit  = array.new<int>(4, 0)   // ...and reached the opposite target
 var int nBoxes = 0
 
 catName(int c) => c == 0 ? "Accumulation" : c == 1 ? "Re-accumulation" : c == 2 ? "Distribution" : "Re-distribution"
@@ -97,23 +108,53 @@ catCol(int c)  => c == 0 ? colAcc : c == 1 ? colRea : c == 2 ? colDis : colRed
 priorTxt(int p) => p == 1 ? "after an advance" : p == -1 ? "after a decline" : "no clear move before"
 leanPct() => upVol + dnVol > 0 ? upVol / (upVol + dnVol) * 100.0 : 50.0
 
-// 1) follow earlier breakouts: target first, or back to the far side of the box first?
+// 1) follow earlier breakouts: target first, or back to the far side of the box first (head fake)?
+//    after a head fake: opposite target first, or back to the edge that was first broken?
+bool   fakeNow = false
+int    fakeDir = 0
 if array.size(pCat) > 0
     for i = array.size(pCat) - 1 to 0
         int   d   = array.get(pDir, i)
         float tg  = array.get(pTgt, i)
         float fl  = array.get(pFail, i)
+        int   c   = array.get(pCat, i)
+        int   stg = array.get(pStage, i)
         bool failed = d == 1 ? low <= fl : high >= fl
         bool hit    = d == 1 ? high >= tg : low <= tg
         if failed or hit
-            int c = array.get(pCat, i)
-            array.set(nDone, c, array.get(nDone, c) + 1)
-            if hit and not failed
-                array.set(nHit, c, array.get(nHit, c) + 1)
-            array.remove(pCat, i)
-            array.remove(pDir, i)
-            array.remove(pTgt, i)
-            array.remove(pFail, i)
+            bool done = true
+            if stg == 1
+                array.set(nDone, c, array.get(nDone, c) + 1)
+                if hit and not failed
+                    array.set(nHit, c, array.get(nHit, c) + 1)
+                else                                        // head fake: now watch the other side
+                    float bt = array.get(pTop, i)
+                    float bb = array.get(pBot, i)
+                    float t2 = d == 1 ? bb - tgtMult * (bt - bb) : bt + tgtMult * (bt - bb)
+                    array.set(pStage, i, 2)
+                    array.set(pDir, i, -d)
+                    array.set(pTgt, i, t2)
+                    array.set(pFail, i, d == 1 ? bt : bb)
+                    done    := false
+                    fakeNow := true
+                    fakeDir := -d
+                    if showFake
+                        color fc = d == 1 ? colDis : colAcc
+                        label.new(bar_index, fl, "Head fake " + (d == 1 ? "↑" : "↓") + " (" + catName(c) + ")\nnow watching " + str.tostring(t2, format.mintick),
+                             style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(fc, 25), textcolor = color.white, size = lblSize)
+                        line.new(bar_index, t2, bar_index + math.max(extBars, 10), t2, color = fc, style = line.style_dashed)
+            else
+                array.set(nF2Done, c, array.get(nF2Done, c) + 1)
+                if hit and not failed
+                    array.set(nF2Hit, c, array.get(nF2Hit, c) + 1)
+            if done
+                array.remove(pCat, i)
+                array.remove(pDir, i)
+                array.remove(pTgt, i)
+                array.remove(pFail, i)
+                array.remove(pStage, i)
+                array.remove(pTop, i)
+                array.remove(pBot, i)
 
 // 2) the open box
 bool newBox   = false
@@ -133,6 +174,9 @@ if inBox
         array.push(pDir, d)
         array.push(pTgt, d == 1 ? top + tgtMult * ht : bot - tgtMult * ht)
         array.push(pFail, d == 1 ? bot : top)
+        array.push(pStage, 1)
+        array.push(pTop, top)
+        array.push(pBot, bot)
         color cc = catCol(c)
         box.set_right(bx, bar_index)
         box.set_border_color(bx, cc)
@@ -221,6 +265,8 @@ if newBox
 if brokeUp or brokeDn
     alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": " + catName(brokeCat) + (brokeUp ? " — broke UP through " + str.tostring(top, format.mintick) : " — broke DOWN through " + str.tostring(bot, format.mintick)),
          alert.freq_once_per_bar_close)
+if fakeNow
+    alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": HEAD FAKE — the break failed, now watching the " + (fakeDir == 1 ? "upside" : "downside") + " target", alert.freq_once_per_bar_close)
 plotshape(brokeUp, "Box broke up", shape.triangleup, location.belowbar, color.lime, size = size.small)
 plotshape(brokeDn, "Box broke down", shape.triangledown, location.abovebar, color.red, size = size.small)
 
@@ -236,18 +282,18 @@ tblSize = switch tblSizeIn
     "Normal" => size.normal
     "Large"  => size.large
     => size.small
-var table tbl = table.new(tblPos, 3, 12, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 5, 12, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 cell(int c, int r, string txt, color tc = color.white) =>
     table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
 
 if showTbl and barstate.isfirst
-    table.merge_cells(tbl, 0, 0, 2, 0)
+    table.merge_cells(tbl, 0, 0, 4, 0)
     for r = 1 to 5
-        table.merge_cells(tbl, 1, r, 2, r)
-    table.merge_cells(tbl, 0, 11, 2, 11)
+        table.merge_cells(tbl, 1, r, 4, r)
+    table.merge_cells(tbl, 0, 11, 4, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.0 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.1 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
     cell(1, 1, inBox ? "In a box · " + priorTxt(prior) : "No box", inBox ? color.yellow : color.white)
@@ -262,10 +308,17 @@ if showTbl and barstate.islast
     cell(0, 6, "Break type", color.silver)
     cell(1, 6, "Count", color.silver)
     cell(2, 6, "Reached target", color.silver)
+    cell(3, 6, "Head fakes", color.silver)
+    cell(4, 6, "…then reached the other target", color.silver)
     for c = 0 to 3
         int done = array.get(nDone, c)
         cell(0, 7 + c, catName(c) + (c < 2 ? " ↑" : " ↓"), catCol(c))
         cell(1, 7 + c, str.tostring(array.get(nBox, c)))
         cell(2, 7 + c, done > 0 ? str.tostring(array.get(nHit, c) / done * 100.0, "#") + "% of " + str.tostring(done) : "–")
-    table.cell(tbl, 0, 11, "Target = " + str.tostring(tgtMult, "#.##") + " box height beyond the edge, reached before price returns to the far side of the box. No-edge rate ≈ " +
+        int fakes = done - array.get(nHit, c)
+        int d2    = array.get(nF2Done, c)
+        cell(3, 7 + c, done > 0 ? str.tostring(fakes) + " (" + str.tostring(fakes / done * 100.0, "#") + "%)" : "–")
+        cell(4, 7 + c, d2 > 0 ? str.tostring(array.get(nF2Hit, c) / d2 * 100.0, "#") + "% of " + str.tostring(d2) : "–", d2 > 0 ? (c < 2 ? colDis : colAcc) : color.white)
+    table.cell(tbl, 0, 11, "Target = " + str.tostring(tgtMult, "#.##") + " box height beyond the edge, reached before price returns to the far side of the box. Head fake = it returned first; " +
+         "the other target = the same distance beyond the far edge, reached before price gets back to the edge it first broke. No-edge rate for both ≈ " +
          str.tostring(100.0 / (1.0 + tgtMult), "#") + "%", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
