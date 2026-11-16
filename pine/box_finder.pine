@@ -1,6 +1,7 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.2
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.3
 // Changelog
+//  v1.3  Table: how many head fakes still reached the ORIGINAL target (before the opposite one)
 //  v1.2  Narrower table (the long footnote moved into a hover tooltip)
 //  v1.1  Head fakes: when a break fails (price returns to the far side of the box before the target), track whether it then
 //        reaches the target on the OTHER side; marked on the chart, counted in the table, with an alert
@@ -26,7 +27,7 @@
 //               script tracks the opposite target (one box-height beyond the far edge) and counts how often price
 //               reaches it before returning to the edge it first broke.
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.2", shorttitle = "Box Finder v1.2", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.3", shorttitle = "Box Finder v1.3", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -97,11 +98,13 @@ var array<int>   pCat  = array.new<int>()
 var array<int>   pDir  = array.new<int>()
 var array<float> pTgt  = array.new<float>()
 var array<float> pFail = array.new<float>()
-var array<int>   pStage = array.new<int>()      // 1 = first break, 2 = after a head fake (now tracking the other side)
+var array<int>   pStage = array.new<int>()      // 1 = first break, 2 = after a head fake (other side vs first-broken edge), 3 = after a head fake (original vs opposite target)
 var array<float> pTop   = array.new<float>()
 var array<float> pBot   = array.new<float>()
 var array<int> nF2Done = array.new<int>(4, 0)   // head fakes whose second leg is decided
 var array<int> nF2Hit  = array.new<int>(4, 0)   // ...and reached the opposite target
+var array<int> nF3Done = array.new<int>(4, 0)   // head fakes decided between the original and the opposite target
+var array<int> nF3Hit  = array.new<int>(4, 0)   // ...and the original target came first
 var int nBoxes = 0
 
 catName(int c) => c == 0 ? "Accumulation" : c == 1 ? "Re-accumulation" : c == 2 ? "Distribution" : "Re-distribution"
@@ -136,6 +139,13 @@ if array.size(pCat) > 0
                     array.set(pDir, i, -d)
                     array.set(pTgt, i, t2)
                     array.set(pFail, i, d == 1 ? bt : bb)
+                    array.push(pCat, c)                     // second watcher: original target vs opposite target
+                    array.push(pDir, d)
+                    array.push(pTgt, tg)
+                    array.push(pFail, t2)
+                    array.push(pStage, 3)
+                    array.push(pTop, bt)
+                    array.push(pBot, bb)
                     done    := false
                     fakeNow := true
                     fakeDir := -d
@@ -144,10 +154,14 @@ if array.size(pCat) > 0
                         label.new(bar_index, fl, "Head fake " + (d == 1 ? "↑" : "↓") + " (" + catName(c) + ")\nnow watching " + str.tostring(t2, format.mintick),
                              style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(fc, 25), textcolor = color.white, size = lblSize)
                         line.new(bar_index, t2, bar_index + math.max(extBars, 10), t2, color = fc, style = line.style_dashed)
-            else
+            else if stg == 2
                 array.set(nF2Done, c, array.get(nF2Done, c) + 1)
                 if hit and not failed
                     array.set(nF2Hit, c, array.get(nF2Hit, c) + 1)
+            else
+                array.set(nF3Done, c, array.get(nF3Done, c) + 1)
+                if hit and not failed
+                    array.set(nF3Hit, c, array.get(nF3Hit, c) + 1)
             if done
                 array.remove(pCat, i)
                 array.remove(pDir, i)
@@ -283,18 +297,18 @@ tblSize = switch tblSizeIn
     "Normal" => size.normal
     "Large"  => size.large
     => size.small
-var table tbl = table.new(tblPos, 5, 12, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 6, 12, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 cell(int c, int r, string txt, color tc = color.white) =>
     table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
 
 if showTbl and barstate.isfirst
-    table.merge_cells(tbl, 0, 0, 4, 0)
+    table.merge_cells(tbl, 0, 0, 5, 0)
     for r = 1 to 5
-        table.merge_cells(tbl, 1, r, 4, r)
-    table.merge_cells(tbl, 0, 11, 4, 11)
+        table.merge_cells(tbl, 1, r, 5, r)
+    table.merge_cells(tbl, 0, 11, 5, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.2 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.3 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
     cell(1, 1, inBox ? "In a box · " + priorTxt(prior) : "No box", inBox ? color.yellow : color.white)
@@ -311,6 +325,7 @@ if showTbl and barstate.islast
     cell(2, 6, "Reached\ntarget", color.silver)
     cell(3, 6, "Head\nfakes", color.silver)
     cell(4, 6, "…then other\ntarget", color.silver)
+    cell(5, 6, "…or original\ntarget first", color.silver)
     for c = 0 to 3
         int done = array.get(nDone, c)
         cell(0, 7 + c, catName(c) + (c < 2 ? " ↑" : " ↓"), catCol(c))
@@ -319,7 +334,10 @@ if showTbl and barstate.islast
         int fakes = done - array.get(nHit, c)
         int d2    = array.get(nF2Done, c)
         cell(3, 7 + c, done > 0 ? str.tostring(fakes) + " (" + str.tostring(fakes / done * 100.0, "#") + "%)" : "–")
+        int d3 = array.get(nF3Done, c)
+        int h3 = array.get(nF3Hit, c)
+        cell(5, 7 + c, d3 > 0 ? str.tostring(h3) + " of " + str.tostring(d3) + " (" + str.tostring(h3 / d3 * 100.0, "#") + "%)" : "–", d3 > 0 ? catCol(c) : color.white)
         cell(4, 7 + c, d2 > 0 ? str.tostring(array.get(nF2Hit, c) / d2 * 100.0, "#") + "% of " + str.tostring(d2) : "–", d2 > 0 ? (c < 2 ? colDis : colAcc) : color.white)
     table.cell(tbl, 0, 11, "Target: " + str.tostring(tgtMult, "#.##") + " box height past the edge.\nHead fake: back to the far side first.\nNo-edge rate ≈ " +
          str.tostring(100.0 / (1.0 + tgtMult), "#") + "%. Hover for details.", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left,
-         tooltip = "Reached target: price travelled the target distance beyond the broken edge before returning to the far side of the box.\nHead fake: it returned to the far side first.\nThen reached the other target: after a head fake, price travelled the same distance beyond the far edge before getting back to the edge it first broke.\nNo-edge rate: what a coin flip would give for these distances.")
+         tooltip = "Reached target: price travelled the target distance beyond the broken edge before returning to the far side of the box.\nHead fake: it returned to the far side first.\nThen reached the other target: after a head fake, price travelled the same distance beyond the far edge before getting back to the edge it first broke.\nOr original target first: after a head fake, price reached the ORIGINAL target before the opposite one (no-edge rate ≈ " + str.tostring(tgtMult / (1.0 + 2.0 * tgtMult) * 100.0, "#") + "%, because it is further away).\nNo-edge rate: what a coin flip would give for these distances.")
