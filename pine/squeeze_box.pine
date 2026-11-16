@@ -1,59 +1,66 @@
 //@version=6
-// Squeeze + Range Box   ·   v1.2
+// Squeeze Pro + Range Box (MTF)   ·   v2.0
 // Changelog
-//  v1.2  Two higher timeframes: their squeeze dots in the pane, and a separate colour when every timeframe is squeezed at once (in sync)
+//  v2.0  Rebuilt on the "(JS) Squeeze Pro 2" calculation (source and average-type choices, EMA-based momentum, six colour
+//        formats, white / red / yellow dots, divergence, its alerts), keeping the range box, two higher timeframes and sync colour
+//  v1.2  Two higher timeframes and a separate colour when every timeframe is squeezed at once
 //  v1.1  Labels sit directly under the box they describe
 //  v1.0  First version
 //
-// A TTM-Squeeze-style indicator (three compression levels, like "Squeeze Pro"), written from the public formulas,
-// plus a RANGE BOX drawn on the price chart around all the price action that happens while the squeeze is on.
+// Squeeze and momentum follow the open-source "(JS) Squeeze Pro 2" study (Pine v4), ported to Pine v6, with a RANGE BOX
+// on the price chart and MULTI-TIMEFRAME squeeze rows added.
 //
-//  · Squeeze:   the Bollinger Bands (length 20, 2 standard deviations) are INSIDE the Keltner Channels
-//               (length 20, a multiple of the average true range). Three Keltner widths give three levels:
-//                 Low  compression  = inside the wide channel   (2.0 ×)   black dot
-//                 Mid  compression  = inside the medium channel (1.5 ×)   red dot      ← the classic TTM Squeeze
-//                 High compression  = inside the narrow channel (1.0 ×)   orange dot
-//               Green dot = no squeeze. The squeeze "fires" when the dots turn green again.
-//  · Momentum:  histogram = linear regression of (close − the average of the 20-bar midrange and the 20-bar SMA).
-//               Above zero: light blue while rising, dark blue while falling.
-//               Below zero: red while falling, yellow while rising.
-//  · Range box: opens when the squeeze reaches the level you choose and grows to cover every high and low until the
-//               squeeze fires. When it fires the box is coloured by the momentum's direction, labelled, and its
-//               edges can be extended to the right.
-//  · Higher timeframes: up to two. Their squeeze dots are the rows at the bottom (timeframe 1) and top (timeframe 2)
-//               of this pane. IN SYNC = this chart and every enabled higher timeframe are squeezed at the same
-//               time: the dots, the pane background, the price-chart background and the open box switch to the
-//               sync colour, and a box that was in sync keeps a sync-coloured border after it fires.
-// The histogram and dots are in this pane; the boxes are drawn on the main price chart.
-indicator("Squeeze + Range Box v1.2", shorttitle = "Squeeze Box v1.2", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+//  · Squeeze:   Bollinger Bands (length 20, 2 standard deviations) inside the Keltner Channels (length 20):
+//                 white dot  (or black)  = early squeeze   (inside the 2.0 × channel)
+//                 red dot                = squeeze         (inside the 1.5 × channel)
+//                 yellow dot             = power squeeze   (inside the 1.0 × channel)
+//               No dot = no squeeze.
+//  · Momentum:  columns = linear regression of (source − the average of the 20-bar midrange and the 20-bar EMA of the
+//               close). Six colour formats; optional divergence marks.
+//  · Dot rows:  bottom = this chart · top = higher timeframe 1 · zero line = higher timeframe 2.
+//  · In sync:   this chart and every enabled higher timeframe are squeezed at once → dots, backgrounds and the open
+//               box switch to the sync colour; a box that was in sync keeps a sync-coloured border after it fires.
+//  · Range box: drawn on the price chart around all the price action while the squeeze is on; coloured by the
+//               momentum's direction when the squeeze ends; label directly under the box.
+indicator("Squeeze Pro + Range Box (MTF) v2.0", shorttitle = "Squeeze Box v2.0", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpS = "Squeeze"
-len     = input.int(20, "Length", minval = 2, group = grpS)
-bbMult  = input.float(2.0, "Bollinger Bands width (standard deviations)", minval = 0.1, step = 0.1, group = grpS)
-kcHigh  = input.float(1.0, "Keltner width — high compression", minval = 0.1, step = 0.1, group = grpS)
-kcMid   = input.float(1.5, "Keltner width — mid compression (classic)", minval = 0.1, step = 0.1, group = grpS)
-kcLow   = input.float(2.0, "Keltner width — low compression", minval = 0.1, step = 0.1, group = grpS)
-classic = input.bool(false, "Classic mode (one level only: red = squeeze, green = none)", group = grpS)
+src       = input.source(close, "Squeeze input", group = grpS)
+length    = input.int(20, "Length", minval = 1, group = grpS)
+bbmatype  = input.string("SMA", "Bollinger Bands calculation type", options = ["SMA", "EMA", "WMA", "VWMA", "RMA"], group = grpS)
+kcmatype  = input.string("SMA", "Keltner Channel calculation type", options = ["SMA", "EMA", "WMA", "VWMA", "RMA"], group = grpS)
+mult       = input.float(2.0, "Bollinger Bands multiplier", minval = 0.1, step = 0.1, group = grpS)
+multlowKC  = input.float(2.0, "Keltner multiplier — early squeeze (white)", minval = 0.1, step = 0.1, group = grpS)
+multmidKC  = input.float(1.5, "Keltner multiplier — squeeze (red)", minval = 0.1, step = 0.1, group = grpS)
+multhighKC = input.float(1.0, "Keltner multiplier — power squeeze (yellow)", minval = 0.1, step = 0.1, group = grpS)
+
+grpC = "Colours"
+colorFmt  = input.int(2, "Colour format", minval = 1, maxval = 6, group = grpC)
+drdiv     = input.bool(false, "Draw divergence", group = grpC)
+bgoff     = input.bool(false, "Background off", group = grpC)
+darkm     = input.bool(true, "Gray background for dark mode", group = grpC)
+lowsqzwht = input.bool(true, "Early squeeze dots white (off = black)", group = grpC)
 
 grpH = "Higher timeframes"
-htf1On  = input.bool(true, "Timeframe 1", group = grpH, inline = "h1")
+htf1On  = input.bool(true, "Timeframe 1 (top row)", group = grpH, inline = "h1")
 htf1    = input.timeframe("60", "", group = grpH, inline = "h1")
-htf2On  = input.bool(true, "Timeframe 2", group = grpH, inline = "h2")
+htf2On  = input.bool(true, "Timeframe 2 (zero line)", group = grpH, inline = "h2")
 htf2    = input.timeframe("240", "", group = grpH, inline = "h2")
 closedOnly = input.bool(true, "Use closed higher-timeframe candles only (no repainting)", group = grpH,
      tooltip = "On: a higher timeframe's squeeze state changes only when its candle closes — steady, but up to one candle late.\nOff: uses the candle in progress — earlier, but it can flip back before that candle closes.")
 syncCol = input.color(color.new(color.fuchsia, 0), "In-sync colour", group = grpH)
 syncBg  = input.bool(true, "Shade the background while in sync (pane and price chart)", group = grpH)
+showLegend = input.bool(true, "Show the timeframe legend", group = grpH)
 
 grpB = "Range box (on the price chart)"
 boxOn    = input.bool(true, "Draw a box around price while the squeeze is on", group = grpB)
-boxLevel = input.string("Low or tighter", "Box starts when the squeeze is", options = ["Low or tighter", "Mid or tighter", "High"], group = grpB,
-     tooltip = "Low or tighter = any black, red or orange dot. Mid or tighter = red or orange (the classic squeeze). High = orange only.")
+boxLevel = input.string("Early or tighter", "Box starts when the squeeze is", options = ["Early or tighter", "Squeeze or tighter", "Power squeeze"], group = grpB,
+     tooltip = "Early or tighter = any white, red or yellow dot. Squeeze or tighter = red or yellow. Power squeeze = yellow only.\nThe same level decides whether a higher timeframe counts as squeezed for the sync colour.")
 minBars  = input.int(3, "Ignore squeezes shorter than (bars)", minval = 1, group = grpB)
-extBars  = input.int(20, "After it fires, extend the box edges (bars, 0 = off)", minval = 0, maxval = 400, group = grpB)
+extBars  = input.int(20, "After it ends, extend the box edges (bars, 0 = off)", minval = 0, maxval = 400, group = grpB)
 showMid  = input.bool(true, "Draw the box midline", group = grpB)
-showLbl  = input.bool(true, "Label boxes", group = grpB)
+showLbl  = input.bool(true, "Label boxes (under the box)", group = grpB)
 colOn    = input.color(color.new(color.gray, 0), "Squeeze on", group = grpB, inline = "c")
 colUp    = input.color(color.new(color.lime, 0), "Fired up", group = grpB, inline = "c")
 colDn    = input.color(color.new(color.red, 0), "Fired down", group = grpB, inline = "c")
@@ -67,44 +74,102 @@ lblSize = switch lblSizeIn
     => size.normal
 
 // ───────────────────────────── Squeeze ─────────────────────────────
-basis = ta.sma(close, len)
-dev   = ta.stdev(close, len)
-rng   = ta.sma(ta.tr(true), len)
-bbU   = basis + bbMult * dev
-bbL   = basis - bbMult * dev
-inside(float m) => bbU < basis + m * rng and bbL > basis - m * rng
-bool sqHigh = inside(kcHigh)
-bool sqMid  = inside(kcMid)
-bool sqLow  = inside(kcLow)
-// 0 = none, 1 = low, 2 = mid, 3 = high compression
-int level = classic ? (sqMid ? 2 : 0) : sqHigh ? 3 : sqMid ? 2 : sqLow ? 1 : 0
+ma(string kind, float x, int len) =>
+    float s = ta.sma(x, len)
+    float e = ta.ema(x, len)
+    float w = ta.wma(x, len)
+    float v = ta.vwma(x, len)
+    float r = ta.rma(x, len)
+    kind == "SMA" ? s : kind == "EMA" ? e : kind == "WMA" ? w : kind == "VWMA" ? v : r
+
+basis   = ma(bbmatype, src, length)
+basiskc = ma(kcmatype, src, length)
+rangema = ma(kcmatype, ta.tr, length)
+dev     = mult * ta.stdev(src, length)
+upperBB = basis + dev
+lowerBB = basis - dev
+bool lowsqz  = lowerBB > basiskc - rangema * multlowKC  and upperBB < basiskc + rangema * multlowKC
+bool midsqz  = lowerBB > basiskc - rangema * multmidKC  and upperBB < basiskc + rangema * multmidKC
+bool highsqz = lowerBB > basiskc - rangema * multhighKC and upperBB < basiskc + rangema * multhighKC
+// 0 = none, 1 = early (white), 2 = squeeze (red), 3 = power squeeze (yellow)
+int level = highsqz ? 3 : midsqz ? 2 : lowsqz ? 1 : 0
 
 // ───────────────────────────── Momentum ─────────────────────────────
-mom = ta.linreg(close - math.avg(math.avg(ta.highest(high, len), ta.lowest(low, len)), basis), len, 0)
-color momCol = mom >= 0 ? (mom > nz(mom[1]) ? color.aqua : color.blue) : (mom < nz(mom[1]) ? color.red : color.yellow)
-plot(mom, "Momentum", momCol, 4, plot.style_histogram)
+sz  = ta.linreg(src - math.avg(math.avg(ta.highest(high, length), ta.lowest(low, length)), ta.ema(close, length)), length, 0)
+sc1 = sz >= 0
+sc2 = sz < 0
+sc3 = sz >= sz[1]
+sc4 = sz < sz[1]
+sc5 = sz < 1
+sc6 = sz > -1
+color clr1 = sc1 and sc3 ? #00eeff : sc1 and sc4 ? #000eff : sc2 and sc4 ? #ff0000 : sc2 and sc3 ? #ffe500 : color.gray
+color clr2 = sc1 and sc3 ? #00bcd4 : sc1 and sc4 ? #0d47a1 : sc2 and sc4 ? #ba68c8 : sc2 and sc3 ? #9c27b0 : #673ab7
+color clr3 = sc1 and sc3 ? #15ff00 : sc1 and sc4 ? #388e3c : sc2 and sc4 ? #f44336 : sc2 and sc3 ? #b71c1c : color.gray
+color clr4 = sc1 and sc3 ? #fff59d : sc1 and sc4 ? #ffd600 : sc2 and sc4 ? #ffcc80 : sc2 and sc3 ? #ff9800 : #702700
+color clr5 = sc1 and sc3 ? #2196f3 : sc1 and sc4 ? #0d47a1 : sc2 and sc4 ? #ef9a9a : sc2 and sc3 ? #d32f2f : #ce93d8
+color clr6 = sc5 and sc1 ? #ef6c00 : sc6 and sc2 ? #ef6c00 : sc1 and sc3 ? #fff176 : sc1 and sc4 ? #ffd600 : sc2 and sc4 ? #ef9a9a : sc2 and sc3 ? #d32f2f : #ffb74d
+color choice = colorFmt == 1 ? clr1 : colorFmt == 2 ? clr2 : colorFmt == 3 ? clr3 : colorFmt == 4 ? clr4 : colorFmt == 5 ? clr5 : clr6
+color bgc    = colorFmt == 1 ? color.gray : colorFmt == 2 ? #673ab7 : colorFmt == 3 ? color.gray : colorFmt == 4 ? #ffd600 : colorFmt == 5 ? #ce93d8 : #ffb74d
 
 // ───────────────────────── Higher timeframes ─────────────────────────
 lvl1c = request.security(syminfo.tickerid, htf1, level[1], lookahead = barmerge.lookahead_on)
 lvl1l = request.security(syminfo.tickerid, htf1, level)
 lvl2c = request.security(syminfo.tickerid, htf2, level[1], lookahead = barmerge.lookahead_on)
 lvl2l = request.security(syminfo.tickerid, htf2, level)
-int lvl1 = closedOnly ? lvl1c : lvl1l
-int lvl2 = closedOnly ? lvl2c : lvl2l
-lvlCol(int l) => l == 3 ? color.orange : l == 2 ? color.red : l == 1 ? color.black : color.green
+int lvl1 = nz(closedOnly ? lvl1c : lvl1l)
+int lvl2 = nz(closedOnly ? lvl2c : lvl2l)
+lvlCol(int l) => l == 3 ? #ffe500 : l == 2 ? #ff0000 : lowsqzwht ? color.white : #000000
+
+int  need   = boxLevel == "Power squeeze" ? 3 : boxLevel == "Squeeze or tighter" ? 2 : 1
+bool sqOn   = level >= need
+bool inSync = sqOn and (htf1On or htf2On) and (not htf1On or lvl1 >= need) and (not htf2On or lvl2 >= need)
+
+// ───────────────────────────── Plots ─────────────────────────────
+bgcolor(darkm and not bgoff ? color.new(bgc, 95) : na, title = "Dark-mode background")
+bgcolor(bgoff ? na : color.new(choice, 90), title = "Momentum background")
+bgcolor(syncBg and inSync ? color.new(syncCol, 75) : na, title = "In sync (pane)")
+bgcolor(syncBg and inSync ? color.new(syncCol, 88) : na, title = "In sync (price chart)", force_overlay = true)
+plot(sz, "Squeeze momentum", choice, 1, plot.style_columns)
+plotshape(level > 0, "Squeeze dots — this chart (bottom)", shape.circle, location.bottom, inSync ? syncCol : lvlCol(level))
+plotshape(htf1On and lvl1 > 0, "Squeeze dots — timeframe 1 (top)", shape.circle, location.top, inSync ? syncCol : lvlCol(lvl1))
+plot(htf2On and lvl2 > 0 ? 0 : na, "Squeeze dots — timeframe 2 (zero line)", inSync ? syncCol : lvlCol(lvl2), 4, plot.style_circles)
+
+// divergence (fractal method, as in the original study)
+ftf(float x) => x[4] < x[2] and x[3] < x[2] and x[2] > x[1] and x[2] > x[0]
+fbf(float x) => x[4] > x[2] and x[3] > x[2] and x[2] < x[1] and x[2] < x[0]
+bool  isTop     = ftf(sz)
+bool  isBot     = fbf(sz) and not isTop
+float highPrev  = ta.valuewhen(isTop, sz[2], 1)
+float highPrice = ta.valuewhen(isTop, high[2], 1)
+float lowPrev   = ta.valuewhen(isBot, sz[2], 1)
+float lowPrice  = ta.valuewhen(isBot, low[2], 1)
+bool regbeardiv = isTop and high[2] > highPrice and sz[2] < highPrev
+bool regbulldiv = isBot and low[2] < lowPrice and sz[2] > lowPrev
+plot(drdiv and isTop ? sz[2] : na, "Bearish fractal", regbeardiv ? choice : na, 2, offset = -2)
+plot(drdiv and isBot ? sz[2] : na, "Bullish fractal", regbulldiv ? choice : na, 2, offset = -2)
+plot(drdiv and isTop ? sz[2] : na, "Bearish divergence", regbeardiv ? choice : na, 3, plot.style_circles, offset = -2)
+plot(drdiv and isBot ? sz[2] : na, "Bullish divergence", regbulldiv ? choice : na, 3, plot.style_circles, offset = -2)
+
+// legend: which row is which timeframe, and its squeeze right now
+tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
+lvlName(int l) => l == 3 ? "power squeeze" : l == 2 ? "squeeze" : l == 1 ? "early squeeze" : "none"
+var table lg = table.new(position.top_right, 3, 4, bgcolor = color.new(color.black, 30), border_color = color.new(color.gray, 70), border_width = 1)
+legRow(int r, string row, string tf, int l) =>
+    table.cell(lg, 0, r, row, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(lg, 1, r, tf, text_color = color.white, text_size = size.small)
+    table.cell(lg, 2, r, lvlName(l), text_color = l > 0 ? (inSync ? syncCol : lvlCol(l)) : color.gray, text_size = size.small)
+if showLegend and barstate.islast
+    if htf1On
+        legRow(0, "Top row", tfLabel(htf1), lvl1)
+    if htf2On
+        legRow(1, "Zero line", tfLabel(htf2), lvl2)
+    legRow(2, "Bottom row", tfLabel(timeframe.period) + " (chart)", level)
+    table.merge_cells(lg, 0, 3, 2, 3)
+    table.cell(lg, 0, 3, inSync ? "IN SYNC — all squeezed" : "not in sync", text_color = inSync ? syncCol : color.gray, text_size = size.small)
 
 // ───────────────────────────── Range box ─────────────────────────────
-int  need  = boxLevel == "High" ? 3 : boxLevel == "Mid or tighter" ? 2 : 1
-int  need2 = classic ? math.min(need, 2) : need
-bool sqOn  = level >= need2
-bool sq1   = not htf1On or nz(lvl1) >= need2
-bool sq2   = not htf2On or nz(lvl2) >= need2
-bool inSync = sqOn and (htf1On or htf2On) and sq1 and sq2
-plot(0, "Squeeze dots", inSync ? syncCol : lvlCol(level), 3, plot.style_circles)
-plotshape(htf1On, "Timeframe 1 squeeze", shape.circle, location.bottom, inSync ? syncCol : lvlCol(nz(lvl1)), size = size.tiny)
-plotshape(htf2On, "Timeframe 2 squeeze", shape.circle, location.top, inSync ? syncCol : lvlCol(nz(lvl2)), size = size.tiny)
-bgcolor(syncBg and inSync ? color.new(syncCol, 85) : na, title = "In sync (pane)")
-bgcolor(syncBg and inSync ? color.new(syncCol, 90) : na, title = "In sync (price chart)", force_overlay = true)
 var bool  inBox = false
 var float top   = na
 var float bot   = na
@@ -119,15 +184,15 @@ bool firedDn = false
 
 if sqOn
     if not inBox
-        inBox   := true
-        started := true
-        top     := high
-        bot     := low
-        start   := bar_index
-        peak    := level
+        inBox    := true
+        started  := true
+        top      := high
+        bot      := low
+        start    := bar_index
+        peak     := level
         syncBars := inSync ? 1 : 0
         if boxOn
-            bx := box.new(bar_index, top, bar_index, bot, border_color = colOn, bgcolor = color.new(colOn, fillT), force_overlay = true)
+            bx := box.new(bar_index, top, bar_index, bot, border_color = inSync ? syncCol : colOn, bgcolor = color.new(inSync ? syncCol : colOn, fillT), force_overlay = true)
             midLn := showMid ? line.new(bar_index, (top + bot) / 2, bar_index, (top + bot) / 2, color = color.new(colOn, 40), style = line.style_dotted, force_overlay = true) : na
     else
         top  := math.max(top, high)
@@ -144,7 +209,7 @@ if sqOn
             if not na(midLn)
                 line.set_xy1(midLn, start, (top + bot) / 2)
                 line.set_xy2(midLn, bar_index, (top + bot) / 2)
-else if inBox                                              // the squeeze has fired on this bar
+else if inBox                                              // the squeeze has ended on this bar
     inBox := false
     int bars = bar_index - start
     if bars < minBars
@@ -153,8 +218,8 @@ else if inBox                                              // the squeeze has fi
         if not na(midLn)
             line.delete(midLn)
     else
-        firedUp := mom >= 0
-        firedDn := mom < 0
+        firedUp := sz >= 0
+        firedDn := sz < 0
         color fc = firedUp ? colUp : colDn
         if boxOn and not na(bx)
             box.set_right(bx, bar_index)
@@ -165,23 +230,34 @@ else if inBox                                              // the squeeze has fi
                 line.set_x2(midLn, bar_index)
                 line.set_color(midLn, color.new(fc, 40))
             if showLbl
-                string lv = peak == 3 ? "high" : peak == 2 ? "mid" : "low"
-                label.new(math.round((start + bar_index) / 2), bot, "Squeeze fired " + (firedUp ? "↑" : "↓") + "\n" + str.tostring(bars) + " bars · " + lv + " compression · range " +
-                     str.tostring((top - bot) / bot * 100.0, "#.##") + "%" + (syncBars > 0 ? "\nin sync with higher timeframes for " + str.tostring(syncBars) + " bars" : ""), style = label.style_label_up,
-                     color = color.new(fc, 15), textcolor = color.white, size = lblSize, force_overlay = true)
+                label.new(math.round((start + bar_index) / 2), bot, "Squeeze fired " + (firedUp ? "↑" : "↓") + "\n" + str.tostring(bars) + " bars · " + lvlName(peak) + " · range " +
+                     str.tostring((top - bot) / bot * 100.0, "#.##") + "%" + (syncBars > 0 ? "\nin sync with higher timeframes for " + str.tostring(syncBars) + " bars" : ""),
+                     style = label.style_label_up, color = color.new(fc, 15), textcolor = color.white, size = lblSize, force_overlay = true)
             if extBars > 0
                 line.new(bar_index, top, bar_index + extBars, top, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
                 line.new(bar_index, bot, bar_index + extBars, bot, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
     bx    := na
     midLn := na
 
-// markers in this pane and alerts
-plotshape(firedUp ? 0 : na, "Fired up", shape.triangleup, location.absolute, color.lime, size = size.small)
-plotshape(firedDn ? 0 : na, "Fired down", shape.triangledown, location.absolute, color.red, size = size.small)
-if inSync and not inSync[1]
-    alert("Squeeze IN SYNC — " + syminfo.ticker + ": " + timeframe.period + (htf1On ? ", " + htf1 : "") + (htf2On ? ", " + htf2 : "") + " are all squeezed", alert.freq_once_per_bar_close)
-if started
-    alert("Squeeze ON — " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
-if firedUp or firedDn
-    alert("Squeeze FIRED " + (firedUp ? "UP" : "DOWN") + " — " + syminfo.ticker + " " + timeframe.period + " | box " + str.tostring(bot, format.mintick) + " – " + str.tostring(top, format.mintick),
-         alert.freq_once_per_bar_close)
+// ───────────────────────────── Alerts ─────────────────────────────
+// the original study's alerts
+lsf = not lowsqz
+msf = not midsqz
+hsf = not highsqz
+alertcondition(ta.barssince(lsf) == 6, "6th White Dot", "Early Squeeze - 6th White Dot")
+alertcondition(ta.barssince(msf) == 6, "6th Red Dot", "Squeeze - 6th Red Dot")
+alertcondition(ta.barssince(hsf) == 6, "6th Yellow Dot", "Power Squeeze - 6th Yellow Dot")
+alertcondition(ta.barssince(lsf) == 12, "12th White Dot", "Early Squeeze - 12th White Dot")
+alertcondition(ta.barssince(msf) == 12, "12th Red Dot", "Squeeze - 12th Red Dot")
+alertcondition(ta.barssince(hsf) == 12, "12th Yellow Dot", "Power Squeeze - 12th Yellow Dot")
+alertcondition(ta.barssince(lowsqz) == 1, "White Dot - End of Squeeze", "White Dot - End of Early Squeeze")
+alertcondition(ta.barssince(midsqz) == 1, "Red Dot - End of Squeeze", "Red Dot - End of Squeeze")
+alertcondition(ta.barssince(highsqz) == 1, "Yellow Dot - End of Squeeze", "Yellow Dot - End of Power Squeeze")
+alertcondition(ta.barssince(lsf) == 1, "Early Squeeze Started", "White Dot - Early Squeeze Started")
+alertcondition(ta.barssince(msf) == 1, "Squeeze Started", "Red Dot - Squeeze Started")
+alertcondition(ta.barssince(hsf) == 1, "Power Squeeze Started", "Yellow Dot - Power Squeeze Started")
+alertcondition(sz[1] < 0 and sz > 0, "Zero Line Cross Bullish", "Zero Line Cross Bullish")
+alertcondition(sz[1] > 0 and sz < 0, "Zero Line Cross Bearish", "Zero Line Cross Bearish")
+alertcondition(inSync and not inSync[1], "Timeframes In Sync", "All timeframes are squeezed (in sync)")
+alertcondition(firedUp, "Range Box Fired Up", "Squeeze ended with momentum up")
+alertcondition(firedDn, "Range Box Fired Down", "Squeeze ended with momentum down")
