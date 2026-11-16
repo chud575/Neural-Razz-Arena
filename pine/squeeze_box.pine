@@ -1,6 +1,7 @@
 //@version=6
-// Squeeze Pro + Range Box (MTF)   ·   v2.0
+// Squeeze Pro + Range Box (MTF)   ·   v2.1
 // Changelog
+//  v2.1  Strategy tracker: enter when the squeeze fires, stop one range away (or the far box edge), target 2 × the range; results table net of fees
 //  v2.0  Rebuilt on the "(JS) Squeeze Pro 2" calculation (source and average-type choices, EMA-based momentum, six colour
 //        formats, white / red / yellow dots, divergence, its alerts), keeping the range box, two higher timeframes and sync colour
 //  v1.2  Two higher timeframes and a separate colour when every timeframe is squeezed at once
@@ -22,7 +23,11 @@
 //               box switch to the sync colour; a box that was in sync keeps a sync-coloured border after it fires.
 //  · Range box: drawn on the price chart around all the price action while the squeeze is on; coloured by the
 //               momentum's direction when the squeeze ends; label directly under the box.
-indicator("Squeeze Pro + Range Box (MTF) v2.0", shorttitle = "Squeeze Box v2.0", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+//  · Strategy (tracker): when the squeeze ends, enter at that close in the direction of the momentum. "Range" = the
+//               height of the box. Stop = one range from the entry (or the far edge of the box); target = 2 × the
+//               range from the entry. One trade at a time; stop wins if stop and target are touched in the same bar;
+//               gaps fill at the open; max 300 bars. Results table and trade lines are on the price chart.
+indicator("Squeeze Pro + Range Box (MTF) v2.1", shorttitle = "Squeeze Box v2.1", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpS = "Squeeze"
@@ -52,6 +57,26 @@ closedOnly = input.bool(true, "Use closed higher-timeframe candles only (no repa
 syncCol = input.color(color.new(color.fuchsia, 0), "In-sync colour", group = grpH)
 syncBg  = input.bool(true, "Shade the background while in sync (pane and price chart)", group = grpH)
 showLegend = input.bool(true, "Show the timeframe legend", group = grpH)
+
+grpT = "Strategy (tracker)"
+stratOn   = input.bool(true, "Track the squeeze-fire strategy", group = grpT,
+     tooltip = "When the squeeze ends (after at least the minimum number of bars), enter at that close in the direction of the momentum.")
+stopMode  = input.string("One range from entry", "Stop", options = ["One range from entry", "Far edge of the box"], group = grpT)
+tgtMult   = input.float(2.0, "Target (× the box range, from the entry)", minval = 0.1, step = 0.25, group = grpT)
+syncOnly  = input.bool(false, "Only trade squeezes that were in sync with the higher timeframes", group = grpT)
+maxBars   = input.int(300, "Max bars in a trade", minval = 5, group = grpT)
+tradeLongs  = input.bool(true, "Longs", group = grpT, inline = "ls")
+tradeShorts = input.bool(true, "Shorts", group = grpT, inline = "ls")
+feesOn    = input.bool(true, "Include trading fees & funding", group = grpT,
+     tooltip = "Entry = taker fee. Exit at the target = maker fee, at the stop = taker fee. Funding per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+takerPct  = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpT)
+makerPct  = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpT)
+funding8h = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpT)
+leverage  = input.float(10, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpT)
+mmrPct    = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpT)
+showTrades = input.bool(true, "Label entries & exits on the price chart", group = grpT)
+resPosIn  = input.string("Bottom right", "Results table position (price chart)", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpT)
+resSizeIn = input.string("Small", "Results table text size", options = ["Tiny", "Small", "Normal"], group = grpT)
 
 grpB = "Range box (on the price chart)"
 boxOn    = input.bool(true, "Draw a box around price while the squeeze is on", group = grpB)
@@ -181,6 +206,9 @@ var line  midLn = na
 bool started = false
 bool firedUp = false
 bool firedDn = false
+float firedTop = na
+float firedBot = na
+bool  firedSync = false
 
 if sqOn
     if not inBox
@@ -220,6 +248,9 @@ else if inBox                                              // the squeeze has en
     else
         firedUp := sz >= 0
         firedDn := sz < 0
+        firedTop := top
+        firedBot := bot
+        firedSync := syncBars > 0
         color fc = firedUp ? colUp : colDn
         if boxOn and not na(bx)
             box.set_right(bx, bar_index)
@@ -238,6 +269,143 @@ else if inBox                                              // the squeeze has en
                 line.new(bar_index, bot, bar_index + extBars, bot, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
     bx    := na
     midLn := na
+
+// ───────────────────────── Strategy tracker ─────────────────────────
+liqDistPct = 100.0 / leverage - mmrPct
+var array<float> aWins = array.new<float>(2, 0.0)   // 0 = longs, 1 = shorts
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)   // [cum R, peak R, max DD R]
+var int liqCount = 0
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+var bool  inTr     = false
+var int   trD      = 0
+var float trE      = na
+var float trS      = na
+var float trT      = na
+var float trRisk   = na
+var int   trBar    = na
+var int   trTime   = na
+var int   lastExit = -1
+
+if stratOn and inTr and bar_index > trBar
+    float xPx = na
+    bool  atT = false
+    string tag = ""
+    if trD == 1 ? low <= trS : high >= trS
+        xPx := trD == 1 ? math.min(open, trS) : math.max(open, trS)
+        tag := "SL"
+    else if trD == 1 ? high >= trT : low <= trT
+        xPx := trD == 1 ? math.max(open, trT) : math.min(open, trT)
+        atT := true
+        tag := "TP"
+    else if bar_index >= trBar + maxBars
+        xPx := close
+        tag := "Time"
+    if not na(xPx)
+        float hrs  = (time - trTime) / 3600000.0
+        float cf   = feesOn ? (takerPct + (atT ? makerPct : takerPct) + trD * funding8h * hrs / 8.0) / 100.0 : 0.0
+        float netR = trD * (xPx - trE) / trRisk - cf * trE / trRisk
+        recordExit(trD, netR)
+        if showTrades
+            label.new(bar_index, xPx, tag + " " + (netR >= 0 ? "+" : "") + str.tostring(netR, "#.##") + "R", style = label.style_label_left,
+                 color = netR > 0 ? color.new(color.green, 20) : color.new(color.red, 20), textcolor = color.white, size = lblSize, force_overlay = true)
+        inTr     := false
+        lastExit := bar_index
+
+int sigD = firedUp ? 1 : firedDn ? -1 : 0
+if stratOn and sigD != 0 and not inTr and bar_index > lastExit and (sigD == 1 ? tradeLongs : tradeShorts) and (not syncOnly or firedSync)
+    float R   = firedTop - firedBot
+    float stp = stopMode == "One range from entry" ? close - sigD * R : (sigD == 1 ? firedBot : firedTop)
+    if R > 0 and (close - stp) * sigD > 0
+        inTr   := true
+        trD    := sigD
+        trE    := close
+        trS    := stp
+        trRisk := math.abs(close - stp)
+        trT    := close + sigD * tgtMult * R
+        trBar  := bar_index
+        trTime := time
+        bool risky = trRisk / close * 100.0 > liqDistPct
+        if risky
+            liqCount += 1
+        if showTrades
+            label.new(bar_index, sigD == 1 ? low : high, (sigD == 1 ? "Long" : "Short") + (risky ? "\n⚠ stop beyond " + str.tostring(leverage) + "x liq." : ""),
+                 style = sigD == 1 ? label.style_label_up : label.style_label_down,
+                 color = sigD == 1 ? color.new(color.teal, 0) : color.new(color.maroon, 0), textcolor = color.white, size = lblSize, force_overlay = true)
+        alert("Squeeze fired " + (sigD == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker + " " + timeframe.period + " | entry " + str.tostring(close, format.mintick) +
+             " | stop " + str.tostring(stp, format.mintick) + " (" + str.tostring(trRisk / close * 100.0, "#.##") + "%) | target " + str.tostring(trT, format.mintick),
+             alert.freq_once_per_bar_close)
+
+plot(stratOn and inTr ? trE : na, "Trade entry", color.blue, 2, plot.style_linebr, force_overlay = true)
+plot(stratOn and inTr ? trS : na, "Trade stop", color.red, 2, plot.style_linebr, force_overlay = true)
+plot(stratOn and inTr ? trT : na, "Trade target", color.green, 2, plot.style_linebr, force_overlay = true)
+
+resPos = switch resPosIn
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.bottom_right
+resSize = resSizeIn == "Tiny" ? size.tiny : resSizeIn == "Normal" ? size.normal : size.small
+var table res = table.new(resPos, 4, 11, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.gray, frame_width = 1, force_overlay = true)
+rc(int c, int r, string txt, color tc = color.white) =>
+    table.cell(res, c, r, txt, text_color = tc, text_size = resSize, text_halign = c == 0 ? text.align_left : text.align_center)
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+resCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    rc(col, 2, str.tostring(n, "#"))
+    rc(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    rc(col, 4, n > 0 ? str.tostring(w / n * 100.0, "#.#") + "%" : "–")
+    rc(col, 5, fmtR(r), colR(r))
+    rc(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    rc(col, 7, gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–")
+if stratOn and barstate.isfirst
+    table.merge_cells(res, 0, 0, 3, 0)
+    for r = 8 to 10
+        table.merge_cells(res, 1, r, 3, r)
+if stratOn and barstate.islast
+    table.cell(res, 0, 0, "Squeeze fire — stop: " + (stopMode == "One range from entry" ? "1 range" : "box edge") + ", target " + str.tostring(tgtMult, "#.##") + " × range" +
+         (syncOnly ? ", in-sync only" : "") + (feesOn ? ", net of fees" : ", before fees"), text_color = color.white, text_size = resSize, bgcolor = color.new(color.purple, 40))
+    rc(0, 1, "Metric", color.silver)
+    rc(1, 1, "Longs", color.silver)
+    rc(2, 1, "Shorts", color.silver)
+    rc(3, 1, "Total", color.silver)
+    rc(0, 2, "Trades")
+    rc(0, 3, "Wins / Losses")
+    rc(0, 4, "Win rate")
+    rc(0, 5, "Net R")
+    rc(0, 6, "Avg R / trade")
+    rc(0, 7, "Profit factor")
+    resCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    resCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    resCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1), array.get(aSumR, 0) + array.get(aSumR, 1),
+         array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    rc(0, 8, "Max drawdown")
+    rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    rc(0, 9, "Current")
+    rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat",
+         inTr ? (trD == 1 ? color.lime : color.red) : color.white)
+    rc(0, 10, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    rc(1, 10, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
 
 // ───────────────────────────── Alerts ─────────────────────────────
 // the original study's alerts
