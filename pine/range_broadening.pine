@@ -1,0 +1,388 @@
+//@version=6
+// Range Box + Broadening Formation Finder   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Two pattern finders built on swing highs and swing lows, each with its own on/off switch.
+//
+//  RANGEBOUND BOX — an area that has set an upper bound at least twice and a lower bound at least twice.
+//    · The last four swings alternate high / low / high / low (either order).
+//    · The two swing highs are level with each other, and the two swing lows are level with each other
+//      (each pair within "level tolerance" × the range height).
+//    · Box top = the higher of the two highs, bottom = the lower of the two lows. The box stays open, counting
+//      every further touch of either bound, until a bar CLOSES outside it.
+//
+//  BROADENING FORMATION — a megaphone: the range keeps widening.
+//    · The last four swings alternate, the second high is HIGHER than the first and the second low is LOWER than
+//      the first (each by at least "min widening" × the formation height).
+//    · An upper line through the two highs and a lower line through the two lows are extended to the right. The
+//      formation stays open, counting further touches, until a bar CLOSES beyond either line (or it gets too old).
+//
+// A swing is confirmed N bars after it forms, so a pattern appears N bars after its fourth swing. Nothing repaints.
+// Labels sit directly under the pattern they describe.
+indicator("Range Box + Broadening Formation Finder v1.0", shorttitle = "Range + Broadening v1.0", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpS = "Swings"
+swingLen = input.int(5, "Swing length (bars each side)", minval = 1, maxval = 50, group = grpS,
+     tooltip = "A swing high needs this many lower highs on each side. Bigger = fewer, larger patterns.")
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpS)
+minHAtr  = input.float(2.0, "Min pattern height (× ATR)", minval = 0.0, step = 0.5, group = grpS)
+maxWidth = input.int(300, "Max bars from the first to the fourth swing", minval = 10, group = grpS)
+
+grpR = "Rangebound box"
+rOnIn    = input.bool(true, "Find rangebound boxes", group = grpR)
+rTol     = input.float(0.15, "Level tolerance (× range height)", minval = 0.01, maxval = 0.5, step = 0.01, group = grpR,
+     tooltip = "How far apart the two highs (and the two lows) may be and still count as the same bound. 0.15 = within 15% of the range height.")
+rBufAtr  = input.float(0.0, "Break needs a close beyond the bound by (× ATR)", minval = 0.0, step = 0.1, group = grpR)
+rStretch = input.bool(true, "Stretch the box when a later touch goes slightly further", group = grpR)
+rFill    = input.bool(true, "Fill the box", group = grpR)
+rMidOn   = input.bool(true, "Draw the midline", group = grpR)
+rLblOn   = input.bool(true, "Label the box (under it)", group = grpR)
+rDotsOn  = input.bool(true, "Mark each touch of a bound", group = grpR)
+rExt     = input.int(30, "After a break, extend the bounds (bars, 0 = off)", minval = 0, maxval = 500, group = grpR)
+rAlertNew = input.bool(true, "Alert: new range", group = grpR, inline = "ra")
+rAlertBrk = input.bool(true, "Alert: range broken", group = grpR, inline = "ra")
+rCol     = input.color(color.new(color.blue, 0), "Open", group = grpR, inline = "rc")
+rColUp   = input.color(color.new(color.lime, 0), "Broke up", group = grpR, inline = "rc")
+rColDn   = input.color(color.new(color.red, 0), "Broke down", group = grpR, inline = "rc")
+
+grpB = "Broadening formation"
+bOnIn    = input.bool(true, "Find broadening formations", group = grpB)
+bMin     = input.float(0.15, "Min widening per side (× formation height)", minval = 0.01, maxval = 2.0, step = 0.01, group = grpB,
+     tooltip = "The second high must be above the first, and the second low below the first, by at least this share of the formation height.")
+bTouchTol = input.float(0.1, "Touch tolerance (× current width)", minval = 0.01, maxval = 0.5, step = 0.01, group = grpB)
+bMaxBars = input.int(300, "Give up after (bars since the fourth swing)", minval = 10, group = grpB)
+bFill    = input.bool(true, "Fill between the lines", group = grpB)
+bLblOn   = input.bool(true, "Label the formation (under it)", group = grpB)
+bDotsOn  = input.bool(true, "Mark each touch of a line", group = grpB)
+bAlertNew = input.bool(true, "Alert: new formation", group = grpB, inline = "ba")
+bAlertBrk = input.bool(true, "Alert: formation broken", group = grpB, inline = "ba")
+bCol     = input.color(color.new(color.orange, 0), "Open", group = grpB, inline = "bc")
+bColUp   = input.color(color.new(color.lime, 0), "Broke up", group = grpB, inline = "bc")
+bColDn   = input.color(color.new(color.red, 0), "Broke down", group = grpB, inline = "bc")
+
+grpV = "Visuals"
+fillT    = input.int(88, "Fill transparency", minval = 0, maxval = 100, group = grpV)
+lineW    = input.int(2, "Line width", minval = 1, maxval = 5, group = grpV)
+lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+showSw   = input.bool(false, "Show every swing high / low", group = grpV)
+tblOn    = input.bool(true, "Show the table", group = grpV)
+tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal", "Large"], group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ───────────────────────────── Swings ─────────────────────────────
+atrV = ta.atr(atrLen)
+ph   = ta.pivothigh(high, swingLen, swingLen)
+pl   = ta.pivotlow(low, swingLen, swingLen)
+var array<int>   pvT = array.new<int>()     // 1 = high, -1 = low
+var array<float> pvP = array.new<float>()
+var array<int>   pvB = array.new<int>()
+
+// keep the swings alternating (same kind twice in a row: keep the more extreme one)
+pushPivot(int tp, float price, int bar) =>
+    bool ch = false
+    int  sz = array.size(pvT)
+    if sz > 0 and array.get(pvT, sz - 1) == tp
+        float lastP = array.get(pvP, sz - 1)
+        if (tp == 1 and price > lastP) or (tp == -1 and price < lastP)
+            array.set(pvP, sz - 1, price)
+            array.set(pvB, sz - 1, bar)
+            ch := true
+    else
+        array.push(pvT, tp)
+        array.push(pvP, price)
+        array.push(pvB, bar)
+        if array.size(pvT) > 10
+            array.shift(pvT)
+            array.shift(pvP)
+            array.shift(pvB)
+        ch := true
+    ch
+
+bool changed = false
+if not na(ph)
+    changed := pushPivot(1, ph, bar_index - swingLen) or changed
+if not na(pl)
+    changed := pushPivot(-1, pl, bar_index - swingLen) or changed
+plotshape(showSw and not na(ph), "Swing high", shape.triangledown, location.abovebar, color.new(color.gray, 30), offset = -swingLen, size = size.tiny)
+plotshape(showSw and not na(pl), "Swing low", shape.triangleup, location.belowbar, color.new(color.gray, 30), offset = -swingLen, size = size.tiny)
+
+// the last four swings: older / newer high and low
+float hA = na
+float hB = na
+float lA = na
+float lB = na
+int   hAb = na
+int   hBb = na
+int   lAb = na
+int   lBb = na
+int   firstBar = na
+bool  four = false
+if changed and array.size(pvT) >= 4
+    int sz = array.size(pvT)
+    four := true
+    firstBar := array.get(pvB, sz - 4)
+    if array.get(pvT, sz - 1) == 1                 // … low, high, low, HIGH
+        hB  := array.get(pvP, sz - 1)
+        hBb := array.get(pvB, sz - 1)
+        lB  := array.get(pvP, sz - 2)
+        lBb := array.get(pvB, sz - 2)
+        hA  := array.get(pvP, sz - 3)
+        hAb := array.get(pvB, sz - 3)
+        lA  := array.get(pvP, sz - 4)
+        lAb := array.get(pvB, sz - 4)
+    else                                           // … high, low, high, LOW
+        lB  := array.get(pvP, sz - 1)
+        lBb := array.get(pvB, sz - 1)
+        hB  := array.get(pvP, sz - 2)
+        hBb := array.get(pvB, sz - 2)
+        lA  := array.get(pvP, sz - 3)
+        lAb := array.get(pvB, sz - 3)
+        hA  := array.get(pvP, sz - 4)
+        hAb := array.get(pvB, sz - 4)
+float ht = four ? (hA + hB) / 2 - (lA + lB) / 2 : na
+bool  sizeOk = four and not na(atrV) and ht > 0 and ht >= minHAtr * atrV and bar_index - swingLen - firstBar <= maxWidth
+
+dot(int bar, float price, color c, bool above) =>
+    label.new(bar, price, "●", style = above ? label.style_label_down : label.style_label_up, color = color.new(c, 100), textcolor = c, size = size.small)
+
+// ───────────────────────────── Rangebound box ─────────────────────────────
+var bool  rOn    = false
+var float rTop   = na
+var float rBot   = na
+var float rTolA  = na        // tolerance in price
+var float rBuf   = 0.0
+var int   rStart = na
+var int   rEnd   = -1
+var int   rTH    = 0
+var int   rTL    = 0
+var box   rBox   = na
+var line  rMid   = na
+var label rLb    = na
+var int nRange = 0
+var int nRangeUp = 0
+var int nRangeDn = 0
+bool rNew = false
+int  rBrk = 0
+
+if rOnIn
+    if rOn
+        if close > rTop + rBuf or close < rBot - rBuf
+            rBrk := close > rTop ? 1 : -1
+            color c = rBrk == 1 ? rColUp : rColDn
+            box.set_right(rBox, bar_index)
+            box.set_border_color(rBox, c)
+            box.set_bgcolor(rBox, rFill ? color.new(c, fillT) : na)
+            if not na(rMid)
+                line.set_x2(rMid, bar_index)
+                line.set_color(rMid, color.new(c, 40))
+            if not na(rLb)
+                label.set_xy(rLb, math.round((rStart + bar_index) / 2), rBot)
+                label.set_text(rLb, "Range broke " + (rBrk == 1 ? "↑" : "↓") + "\n" + str.tostring(bar_index - rStart) + " bars · " + str.tostring(rTH) + " highs / " + str.tostring(rTL) + " lows")
+                label.set_color(rLb, color.new(c, 15))
+            if rExt > 0
+                line.new(bar_index, rTop, bar_index + rExt, rTop, color = color.new(c, 30), style = line.style_dotted)
+                line.new(bar_index, rBot, bar_index + rExt, rBot, color = color.new(c, 30), style = line.style_dotted)
+            if rBrk == 1
+                nRangeUp += 1
+            else
+                nRangeDn += 1
+            rOn  := false
+            rEnd := bar_index
+            rLb  := na
+        else
+            // further touches of the bounds
+            if not na(ph) and math.abs(ph - rTop) <= rTolA
+                rTH += 1
+                if rStretch
+                    rTop := math.max(rTop, ph)
+                if rDotsOn
+                    dot(bar_index - swingLen, ph, rCol, true)
+            if not na(pl) and math.abs(pl - rBot) <= rTolA
+                rTL += 1
+                if rStretch
+                    rBot := math.min(rBot, pl)
+                if rDotsOn
+                    dot(bar_index - swingLen, pl, rCol, false)
+            box.set_top(rBox, rTop)
+            box.set_bottom(rBox, rBot)
+            box.set_right(rBox, bar_index)
+            if not na(rMid)
+                line.set_xy1(rMid, rStart, (rTop + rBot) / 2)
+                line.set_xy2(rMid, bar_index, (rTop + rBot) / 2)
+            if not na(rLb)
+                label.set_xy(rLb, math.round((rStart + bar_index) / 2), rBot)
+                label.set_text(rLb, "Range · " + str.tostring(rTH) + " highs / " + str.tostring(rTL) + " lows\n" + str.tostring(rBot, format.mintick) + " – " + str.tostring(rTop, format.mintick))
+    else if sizeOk and firstBar > rEnd and math.abs(hA - hB) <= rTol * ht and math.abs(lA - lB) <= rTol * ht
+        float t = math.max(hA, hB)
+        float b = math.min(lA, lB)
+        if close <= t and close >= b
+            rOn    := true
+            rNew   := true
+            rTop   := t
+            rBot   := b
+            rTolA  := rTol * ht
+            rBuf   := rBufAtr * atrV
+            rStart := firstBar
+            rTH    := 2
+            rTL    := 2
+            nRange += 1
+            rBox := box.new(rStart, rTop, bar_index, rBot, border_color = rCol, border_width = lineW, bgcolor = rFill ? color.new(rCol, fillT) : na)
+            rMid := rMidOn ? line.new(rStart, (rTop + rBot) / 2, bar_index, (rTop + rBot) / 2, color = color.new(rCol, 40), style = line.style_dotted) : na
+            rLb  := rLblOn ? label.new(math.round((rStart + bar_index) / 2), rBot, "Range · 2 highs / 2 lows\n" + str.tostring(rBot, format.mintick) + " – " + str.tostring(rTop, format.mintick),
+                 style = label.style_label_up, color = color.new(rCol, 15), textcolor = color.white, size = lblSize) : na
+            if rDotsOn
+                dot(hAb, hA, rCol, true)
+                dot(hBb, hB, rCol, true)
+                dot(lAb, lA, rCol, false)
+                dot(lBb, lB, rCol, false)
+
+// ───────────────────────────── Broadening formation ─────────────────────────────
+var bool  bOn    = false
+var float bUy    = na        // upper line: price at bar bUx, slope bUs per bar
+var int   bUx    = na
+var float bUs    = 0.0
+var float bLy    = na        // lower line
+var int   bLx    = na
+var float bLs    = 0.0
+var int   bStart = na
+var int   bBorn  = na
+var int   bEnd   = -1
+var int   bTH    = 0
+var int   bTL    = 0
+var line  bUp    = na
+var line  bLo    = na
+var linefill bLf = na
+var label bLb    = na
+var int nBroad = 0
+var int nBroadUp = 0
+var int nBroadDn = 0
+bool bNew = false
+int  bBrk = 0
+
+if bOnIn
+    if bOn
+        float uv = bUy + bUs * (bar_index - bUx)
+        float lv = bLy + bLs * (bar_index - bLx)
+        bool  old = bar_index - bBorn > bMaxBars
+        if close > uv or close < lv or old
+            bBrk := close > uv ? 1 : close < lv ? -1 : 0
+            color c = bBrk == 1 ? bColUp : bBrk == -1 ? bColDn : color.gray
+            line.set_xy2(bUp, bar_index, uv)
+            line.set_xy2(bLo, bar_index, lv)
+            line.set_color(bUp, c)
+            line.set_color(bLo, c)
+            if not na(bLf)
+                linefill.set_color(bLf, color.new(c, fillT))
+            if not na(bLb)
+                label.set_xy(bLb, math.round((bStart + bar_index) / 2), math.min(lv, bLy + bLs * (bStart - bLx)))
+                label.set_text(bLb, (bBrk == 0 ? "Broadening ended" : "Broadening broke " + (bBrk == 1 ? "↑" : "↓")) + "\n" + str.tostring(bar_index - bStart) + " bars · " +
+                     str.tostring(bTH) + " highs / " + str.tostring(bTL) + " lows")
+                label.set_color(bLb, color.new(c, 15))
+            if bBrk == 1
+                nBroadUp += 1
+            else if bBrk == -1
+                nBroadDn += 1
+            bOn  := false
+            bEnd := bar_index
+            bLb  := na
+        else
+            float wd = uv - lv
+            if not na(ph)
+                float uAt = bUy + bUs * (bar_index - swingLen - bUx)
+                if math.abs(ph - uAt) <= bTouchTol * wd and bar_index - swingLen > bUx
+                    bTH += 1
+                    if bDotsOn
+                        dot(bar_index - swingLen, ph, bCol, true)
+            if not na(pl)
+                float lAt = bLy + bLs * (bar_index - swingLen - bLx)
+                if math.abs(pl - lAt) <= bTouchTol * wd and bar_index - swingLen > bLx
+                    bTL += 1
+                    if bDotsOn
+                        dot(bar_index - swingLen, pl, bCol, false)
+            line.set_xy2(bUp, bar_index, uv)
+            line.set_xy2(bLo, bar_index, lv)
+            if not na(bLb)
+                label.set_xy(bLb, math.round((bStart + bar_index) / 2), math.min(lv, bLy + bLs * (bStart - bLx)))
+                label.set_text(bLb, "Broadening · " + str.tostring(bTH) + " highs / " + str.tostring(bTL) + " lows\n" + str.tostring(lv, format.mintick) + " – " + str.tostring(uv, format.mintick))
+    else if sizeOk and firstBar > bEnd and hB - hA >= bMin * ht and lA - lB >= bMin * ht
+        float us = (hB - hA) / (hBb - hAb)
+        float ls = (lB - lA) / (lBb - lAb)
+        float uv = hB + us * (bar_index - hBb)
+        float lv = lB + ls * (bar_index - lBb)
+        if close <= uv and close >= lv
+            bOn    := true
+            bNew   := true
+            bUy    := hB
+            bUx    := hBb
+            bUs    := us
+            bLy    := lB
+            bLx    := lBb
+            bLs    := ls
+            bStart := firstBar
+            bBorn  := bar_index
+            bTH    := 2
+            bTL    := 2
+            nBroad += 1
+            bUp := line.new(hAb, hA, bar_index, uv, color = bCol, width = lineW)
+            bLo := line.new(lAb, lA, bar_index, lv, color = bCol, width = lineW)
+            bLf := bFill ? linefill.new(bUp, bLo, color.new(bCol, fillT)) : na
+            bLb := bLblOn ? label.new(math.round((bStart + bar_index) / 2), math.min(lv, lA), "Broadening · 2 highs / 2 lows", style = label.style_label_up,
+                 color = color.new(bCol, 15), textcolor = color.white, size = lblSize) : na
+            if bDotsOn
+                dot(hAb, hA, bCol, true)
+                dot(hBb, hB, bCol, true)
+                dot(lAb, lA, bCol, false)
+                dot(lBb, lB, bCol, false)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+if rNew and rAlertNew
+    alert("New RANGE on " + syminfo.ticker + " " + timeframe.period + ": " + str.tostring(rBot, format.mintick) + " – " + str.tostring(rTop, format.mintick), alert.freq_once_per_bar_close)
+if rBrk != 0 and rAlertBrk
+    alert("RANGE broken " + (rBrk == 1 ? "UP" : "DOWN") + " on " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if bNew and bAlertNew
+    alert("New BROADENING formation on " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+if bBrk != 0 and bAlertBrk
+    alert("BROADENING formation broken " + (bBrk == 1 ? "UP" : "DOWN") + " on " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Table ─────────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+var table tbl = table.new(tblPos, 3, 5, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.gray, frame_width = 1)
+cell(int c, int r, string txt, color tc = color.white) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+if tblOn and barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 2, 0)
+if tblOn and barstate.islast
+    table.cell(tbl, 0, 0, "Range + Broadening v1.0 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    cell(0, 1, "", color.silver)
+    cell(1, 1, "Range box", rCol)
+    cell(2, 1, "Broadening", bCol)
+    cell(0, 2, "Now", color.silver)
+    cell(1, 2, not rOnIn ? "off" : rOn ? str.tostring(rBot, format.mintick) + " – " + str.tostring(rTop, format.mintick) + "\n" + str.tostring(rTH) + " highs / " + str.tostring(rTL) + " lows" : "none", rOn ? color.yellow : color.white)
+    cell(2, 2, not bOnIn ? "off" : bOn ? str.tostring(bLy + bLs * (bar_index - bLx), format.mintick) + " – " + str.tostring(bUy + bUs * (bar_index - bUx), format.mintick) + "\n" +
+         str.tostring(bTH) + " highs / " + str.tostring(bTL) + " lows" : "none", bOn ? color.yellow : color.white)
+    cell(0, 3, "Found", color.silver)
+    cell(1, 3, str.tostring(nRange))
+    cell(2, 3, str.tostring(nBroad))
+    cell(0, 4, "Broke up / down", color.silver)
+    cell(1, 4, str.tostring(nRangeUp) + " / " + str.tostring(nRangeDn))
+    cell(2, 4, str.tostring(nBroadUp) + " / " + str.tostring(nBroadDn))
