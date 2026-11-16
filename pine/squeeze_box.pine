@@ -1,0 +1,146 @@
+//@version=6
+// Squeeze + Range Box   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// A TTM-Squeeze-style indicator (three compression levels, like "Squeeze Pro"), written from the public formulas,
+// plus a RANGE BOX drawn on the price chart around all the price action that happens while the squeeze is on.
+//
+//  · Squeeze:   the Bollinger Bands (length 20, 2 standard deviations) are INSIDE the Keltner Channels
+//               (length 20, a multiple of the average true range). Three Keltner widths give three levels:
+//                 Low  compression  = inside the wide channel   (2.0 ×)   black dot
+//                 Mid  compression  = inside the medium channel (1.5 ×)   red dot      ← the classic TTM Squeeze
+//                 High compression  = inside the narrow channel (1.0 ×)   orange dot
+//               Green dot = no squeeze. The squeeze "fires" when the dots turn green again.
+//  · Momentum:  histogram = linear regression of (close − the average of the 20-bar midrange and the 20-bar SMA).
+//               Above zero: light blue while rising, dark blue while falling.
+//               Below zero: red while falling, yellow while rising.
+//  · Range box: opens when the squeeze reaches the level you choose and grows to cover every high and low until the
+//               squeeze fires. When it fires the box is coloured by the momentum's direction, labelled, and its
+//               edges can be extended to the right.
+// The histogram and dots are in this pane; the boxes are drawn on the main price chart.
+indicator("Squeeze + Range Box v1.0", shorttitle = "Squeeze Box v1.0", overlay = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpS = "Squeeze"
+len     = input.int(20, "Length", minval = 2, group = grpS)
+bbMult  = input.float(2.0, "Bollinger Bands width (standard deviations)", minval = 0.1, step = 0.1, group = grpS)
+kcHigh  = input.float(1.0, "Keltner width — high compression", minval = 0.1, step = 0.1, group = grpS)
+kcMid   = input.float(1.5, "Keltner width — mid compression (classic)", minval = 0.1, step = 0.1, group = grpS)
+kcLow   = input.float(2.0, "Keltner width — low compression", minval = 0.1, step = 0.1, group = grpS)
+classic = input.bool(false, "Classic mode (one level only: red = squeeze, green = none)", group = grpS)
+
+grpB = "Range box (on the price chart)"
+boxOn    = input.bool(true, "Draw a box around price while the squeeze is on", group = grpB)
+boxLevel = input.string("Low or tighter", "Box starts when the squeeze is", options = ["Low or tighter", "Mid or tighter", "High"], group = grpB,
+     tooltip = "Low or tighter = any black, red or orange dot. Mid or tighter = red or orange (the classic squeeze). High = orange only.")
+minBars  = input.int(3, "Ignore squeezes shorter than (bars)", minval = 1, group = grpB)
+extBars  = input.int(20, "After it fires, extend the box edges (bars, 0 = off)", minval = 0, maxval = 400, group = grpB)
+showMid  = input.bool(true, "Draw the box midline", group = grpB)
+showLbl  = input.bool(true, "Label boxes", group = grpB)
+colOn    = input.color(color.new(color.gray, 0), "Squeeze on", group = grpB, inline = "c")
+colUp    = input.color(color.new(color.lime, 0), "Fired up", group = grpB, inline = "c")
+colDn    = input.color(color.new(color.red, 0), "Fired down", group = grpB, inline = "c")
+fillT    = input.int(85, "Box fill transparency", minval = 0, maxval = 100, group = grpB)
+lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpB)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ───────────────────────────── Squeeze ─────────────────────────────
+basis = ta.sma(close, len)
+dev   = ta.stdev(close, len)
+rng   = ta.sma(ta.tr(true), len)
+bbU   = basis + bbMult * dev
+bbL   = basis - bbMult * dev
+inside(float m) => bbU < basis + m * rng and bbL > basis - m * rng
+bool sqHigh = inside(kcHigh)
+bool sqMid  = inside(kcMid)
+bool sqLow  = inside(kcLow)
+// 0 = none, 1 = low, 2 = mid, 3 = high compression
+int level = classic ? (sqMid ? 2 : 0) : sqHigh ? 3 : sqMid ? 2 : sqLow ? 1 : 0
+
+// ───────────────────────────── Momentum ─────────────────────────────
+mom = ta.linreg(close - math.avg(math.avg(ta.highest(high, len), ta.lowest(low, len)), basis), len, 0)
+color momCol = mom >= 0 ? (mom > nz(mom[1]) ? color.aqua : color.blue) : (mom < nz(mom[1]) ? color.red : color.yellow)
+plot(mom, "Momentum", momCol, 4, plot.style_histogram)
+color dotCol = level == 3 ? color.orange : level == 2 ? color.red : level == 1 ? color.black : color.green
+plot(0, "Squeeze dots", dotCol, 3, plot.style_circles)
+
+// ───────────────────────────── Range box ─────────────────────────────
+int  need  = boxLevel == "High" ? 3 : boxLevel == "Mid or tighter" ? 2 : 1
+bool sqOn  = level >= (classic ? math.min(need, 2) : need)
+var bool  inBox = false
+var float top   = na
+var float bot   = na
+var int   start = na
+var int   peak  = 0          // tightest level reached inside this squeeze
+var box   bx    = na
+var line  midLn = na
+bool started = false
+bool firedUp = false
+bool firedDn = false
+
+if sqOn
+    if not inBox
+        inBox   := true
+        started := true
+        top     := high
+        bot     := low
+        start   := bar_index
+        peak    := level
+        if boxOn
+            bx := box.new(bar_index, top, bar_index, bot, border_color = colOn, bgcolor = color.new(colOn, fillT), force_overlay = true)
+            midLn := showMid ? line.new(bar_index, (top + bot) / 2, bar_index, (top + bot) / 2, color = color.new(colOn, 40), style = line.style_dotted, force_overlay = true) : na
+    else
+        top  := math.max(top, high)
+        bot  := math.min(bot, low)
+        peak := math.max(peak, level)
+        if boxOn and not na(bx)
+            box.set_top(bx, top)
+            box.set_bottom(bx, bot)
+            box.set_right(bx, bar_index)
+            if not na(midLn)
+                line.set_xy1(midLn, start, (top + bot) / 2)
+                line.set_xy2(midLn, bar_index, (top + bot) / 2)
+else if inBox                                              // the squeeze has fired on this bar
+    inBox := false
+    int bars = bar_index - start
+    if bars < minBars
+        if not na(bx)
+            box.delete(bx)
+        if not na(midLn)
+            line.delete(midLn)
+    else
+        firedUp := mom >= 0
+        firedDn := mom < 0
+        color fc = firedUp ? colUp : colDn
+        if boxOn and not na(bx)
+            box.set_right(bx, bar_index)
+            box.set_border_color(bx, fc)
+            box.set_bgcolor(bx, color.new(fc, fillT))
+            if not na(midLn)
+                line.set_x2(midLn, bar_index)
+                line.set_color(midLn, color.new(fc, 40))
+            if showLbl
+                string lv = peak == 3 ? "high" : peak == 2 ? "mid" : "low"
+                label.new(bar_index, firedUp ? top : bot, "Squeeze fired " + (firedUp ? "↑" : "↓") + "\n" + str.tostring(bars) + " bars · " + lv + " compression · range " +
+                     str.tostring((top - bot) / bot * 100.0, "#.##") + "%", style = firedUp ? label.style_label_lower_left : label.style_label_upper_left,
+                     color = color.new(fc, 15), textcolor = color.white, size = lblSize, force_overlay = true)
+            if extBars > 0
+                line.new(bar_index, top, bar_index + extBars, top, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
+                line.new(bar_index, bot, bar_index + extBars, bot, color = color.new(fc, 30), style = line.style_dotted, force_overlay = true)
+    bx    := na
+    midLn := na
+
+// markers in this pane and alerts
+plotshape(firedUp, "Fired up", shape.triangleup, location.bottom, color.lime, size = size.tiny)
+plotshape(firedDn, "Fired down", shape.triangledown, location.top, color.red, size = size.tiny)
+if started
+    alert("Squeeze ON — " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if firedUp or firedDn
+    alert("Squeeze FIRED " + (firedUp ? "UP" : "DOWN") + " — " + syminfo.ticker + " " + timeframe.period + " | box " + str.tostring(bot, format.mintick) + " – " + str.tostring(top, format.mintick),
+         alert.freq_once_per_bar_close)
