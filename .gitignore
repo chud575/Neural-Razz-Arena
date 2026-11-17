@@ -38,3 +38,5 @@ python/results/impulse_legs.csv
 python/results/impulse_levels.csv
 python/results/impulse_fvg.csv
 python/results/bos_second_entry.csv
+python/results/bos_features.csv
+python/results/bos_volume.csv
