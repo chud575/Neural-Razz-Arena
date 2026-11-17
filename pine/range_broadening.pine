@@ -1,6 +1,7 @@
 //@version=6
-// Range Box + Broadening Formation Finder   ·   v1.1
+// Range Box + Broadening Formation Finder   ·   v1.2
 // Changelog
+//  v1.2  Break travel also stops once price has gone 5 × the box height beyond the broken bound (adjustable)
 //  v1.1  Range breaks: measure how far price travels beyond the broken bound before it comes back to the opposite side of the box
 //  v1.0  First version
 //
@@ -14,7 +15,7 @@
 //      every further touch of either bound, until a bar CLOSES outside it.
 //
 //    · Break travel: after a break, the script tracks the furthest price reached beyond the broken bound until price
-//      comes back and touches the OPPOSITE side of the box. That maximum distance is drawn on the chart and
+//      comes back and touches the OPPOSITE side of the box, or has travelled 5 × the box height. That maximum distance is drawn on the chart and
 //      collected in the table (in box heights), separately for up-breaks and down-breaks.
 //
 //  BROADENING FORMATION — a megaphone: the range keeps widening.
@@ -25,7 +26,7 @@
 //
 // A swing is confirmed N bars after it forms, so a pattern appears N bars after its fourth swing. Nothing repaints.
 // Labels sit directly under the pattern they describe.
-indicator("Range Box + Broadening Formation Finder v1.1", shorttitle = "Range + Broadening v1.1", overlay = true,
+indicator("Range Box + Broadening Formation Finder v1.2", shorttitle = "Range + Broadening v1.2", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -50,6 +51,8 @@ rExt     = input.int(30, "After a break, extend the bounds (bars, 0 = off)", min
 rTrackOn = input.bool(true, "Measure break travel (max distance before the opposite side is hit)", group = grpR)
 rTrackLbl = input.bool(true, "Mark the max distance on the chart", group = grpR)
 rTrackEnd = input.bool(true, "Mark where tracking ended (opposite side hit)", group = grpR)
+rTrackCap = input.float(5.0, "Stop tracking once price has travelled (× box height, 0 = no limit)", minval = 0.0, step = 0.5, group = grpR,
+     tooltip = "A break that runs this far is recorded at this distance and no longer followed.")
 rTrackMax = input.int(0, "Stop tracking after (bars, 0 = no limit)", minval = 0, group = grpR)
 rTrackTbl = input.bool(true, "Show break-travel statistics in the table", group = grpR)
 rAlertNew = input.bool(true, "Alert: new range", group = grpR, inline = "ra")
@@ -282,14 +285,19 @@ if array.size(tDir) > 0
             float opp  = array.get(tOpp, i)
             bool  back = d == 1 ? low <= opp : high >= opp
             bool  old  = rTrackMax > 0 and bar_index - array.get(tBar, i) >= rTrackMax
-            if back or old
+            float capPx = edge + d * rTrackCap * array.get(tHt, i)
+            bool  far  = not back and rTrackCap > 0 and (d == 1 ? high >= capPx : low <= capPx)
+            if far
+                array.set(tExt, i, capPx)
+                array.set(tExtB, i, bar_index)
+            if back or old or far
                 float ext  = array.get(tExt, i)
                 float mult = math.abs(ext - edge) / array.get(tHt, i)
                 array.push(d == 1 ? travUp : travDn, mult)
                 color c = d == 1 ? rColUp : rColDn
                 if rTrackLbl
                     line.new(array.get(tExtB, i), edge, array.get(tExtB, i), ext, color = c, width = 2, style = line.style_dashed)
-                    label.new(array.get(tExtB, i), ext, "Max " + str.tostring(mult, "#.##") + " × box\n" + str.tostring(math.abs(ext - edge) / edge * 100.0, "#.##") + "% beyond the " + (d == 1 ? "top" : "bottom"),
+                    label.new(array.get(tExtB, i), ext, (far ? "Reached " : "Max ") + str.tostring(mult, "#.##") + " × box" + (far ? " (limit)" : "") + "\n" + str.tostring(math.abs(ext - edge) / edge * 100.0, "#.##") + "% beyond the " + (d == 1 ? "top" : "bottom"),
                          style = d == 1 ? label.style_label_down : label.style_label_up, color = color.new(c, 15), textcolor = color.white, size = lblSize)
                 if rTrackEnd and back
                     label.new(bar_index, opp, "End", style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
@@ -445,7 +453,7 @@ if tblOn and barstate.isfirst
     for r = 6 to 10
         table.merge_cells(tbl, 1, r, 2, r)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Range + Broadening v1.1 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Range + Broadening v1.2 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "", color.silver)
     cell(1, 1, "Range box", rCol)
     cell(2, 1, "Broadening", bCol)
