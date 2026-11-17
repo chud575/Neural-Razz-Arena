@@ -51,3 +51,20 @@ Other swing lengths, 2R: length 3 +0.07 / +0.05, length 8 +0.18 / +0.10, length 
 
 4h BOS at 2R is not better than random entries there (+0.06 / +0.11), so the 4h rows are not evidence of an edge.
 Trailing-stop exits looked better on paper (up to +0.4 IS) but depend on a few very large winners and fell to +0.02 to +0.18 OOS.
+
+## 3. Second entry at 50% of the way to the stop (python/bos_second_entry.py), 1h BOS, 2R target
+
+Limit order halfway between the entry and the stop, same stop and same target price. R0 = the risk of one unit entered at the close.
+Four coins pooled, IS / OOS, after fees.
+
+| | IS | OOS |
+|---|---|---|
+| First entry only, per signal | +0.153 R0 | +0.133 R0 |
+| Second entry filled on | 74% of signals | 75% |
+| Second entry, per fill | +0.088 R0 | +0.126 R0 |
+| Both entries, per signal | +0.218 R0 | +0.227 R0 |
+| Both entries, per unit of risk actually committed | +0.159 | +0.165 |
+| Second entry reaches the target | 16.4% of fills | 17.4% |
+
+The second entry was positive on all four coins in both periods (BTC IS +0.006, otherwise +0.07 to +0.18 R0 per fill).
+Largest drawdown on one coin: first entry only 31 R0, both entries 54 R0.
