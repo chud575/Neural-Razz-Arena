@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.3
+// Trend Finder – Swing Structure   ·   v1.4
 // Changelog
+//  v1.4  BOS tracker: optional second entry part-way to the stop (limit order, same stop and target); results count both entries
 //  v1.3  BOS strategy tracker: entries on a break of structure, stop at the latest swing, R:R target, results table net of fees, alerts
 //  v1.2  Market structure: BOS / CHoCH marks, structure bias, and a table listing the structure of every timeframe being watched
 //  v1.1  Higher-timeframe overlay: pick any higher timeframe and see its swings and trend lines on this chart (own colours and thickness)
@@ -23,8 +24,10 @@
 //    (a BOS up); stop at the latest swing low; target = a multiple of the risk. Shorts mirror it. One trade at a
 //    time; stop wins if stop and target are touched in the same bar; gaps fill at the open; max 300 bars.
 //    Tested best on the 1h chart with swing length 5 and a 2R target (python/ms_continuation.py).
+//    Optional SECOND ENTRY: a limit order part-way from the entry to the stop (50 % by default), same stop, same
+//    target. Results are in R, where 1R = the risk of the first entry alone, so a trade with both entries can lose 1.5R.
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.3", shorttitle = "Trend Finder v1.3", overlay = true,
+indicator("Trend Finder – Swing Structure v1.4", shorttitle = "Trend Finder v1.4", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
@@ -50,6 +53,9 @@ stratOn   = input.bool(true, "Track the BOS strategy", group = grpT,
      tooltip = "Long on a close above the latest swing high while structure is already bullish (BOS up), stop at the latest swing low, R:R target. Shorts mirror it. Tested best on 1h with swing length 5 and 2R.")
 entryKind = input.string("BOS only", "Entries", options = ["BOS only", "BOS and CHoCH"], group = grpT)
 rrMult    = input.float(2.0, "Target (reward : risk)", minval = 0.1, step = 0.1, group = grpT)
+secondOn  = input.bool(true, "Second entry: limit order part-way to the stop", group = grpT,
+     tooltip = "Adds a second unit if price pulls back. Same stop and same target as the first entry. In the test it filled on about 3 trades in 4, including every trade that went on to stop out, so it adds size rather than avoiding losses. 1R in the table stays the risk of the first entry alone.")
+secondPct = input.float(50, "…at this % of the way from the entry to the stop", minval = 5, maxval = 95, step = 5, group = grpT)
 maxBars   = input.int(300, "Max bars in a trade", minval = 5, group = grpT)
 tradeLongs  = input.bool(true, "Longs", group = grpT, inline = "ls")
 tradeShorts = input.bool(true, "Shorts", group = grpT, inline = "ls")
@@ -313,7 +319,7 @@ if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 6, 0)
     table.merge_cells(tbl, 0, 7, 6, 7)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.3 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Trend Finder v1.4 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Trend", color.silver)
     cell(2, 1, "Structure", color.silver)
@@ -367,16 +373,30 @@ var float trRisk   = na
 var int   trBar    = na
 var int   trTime   = na
 var int   lastExit = -1
+var float tr2Px    = na       // second entry: limit price, and when it filled
+var bool  tr2In    = false
+var int   tr2Time  = na
+var int   n2Fills  = 0
 
 // 1) manage the open trade (from the bar after the entry)
 if stratOn and inTr and bar_index > trBar
     float xPx = na
     bool  atT = false
     string tag = ""
-    if trD == 1 ? low <= trS : high >= trS
+    bool hitStop = trD == 1 ? low <= trS : high >= trS
+    bool hitTgt  = trD == 1 ? high >= trT : low <= trT
+    // second entry: filled when price reaches the limit (not counted if the same bar also reaches the target)
+    if secondOn and not tr2In and (trD == 1 ? low <= tr2Px : high >= tr2Px) and (hitStop or not hitTgt)
+        tr2In   := true
+        tr2Time := time
+        n2Fills += 1
+        if showTrades
+            label.new(bar_index, tr2Px, "2nd entry", style = trD == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.blue, 20), textcolor = color.white, size = lblSize)
+    if hitStop
         xPx := trD == 1 ? math.min(open, trS) : math.max(open, trS)
         tag := "SL"
-    else if trD == 1 ? high >= trT : low <= trT
+    else if hitTgt
         xPx := trD == 1 ? math.max(open, trT) : math.min(open, trT)
         atT := true
         tag := "TP"
@@ -387,9 +407,13 @@ if stratOn and inTr and bar_index > trBar
         float hrs  = (time - trTime) / 3600000.0
         float cf   = feesOn ? (takerPct + (atT ? makerPct : takerPct) + trD * funding8h * hrs / 8.0) / 100.0 : 0.0
         float netR = trD * (xPx - trE) / trRisk - cf * trE / trRisk
+        if tr2In                                             // second unit: maker entry, R measured in the first entry's risk
+            float hrs2 = (time - tr2Time) / 3600000.0
+            float cf2  = feesOn ? (makerPct + (atT ? makerPct : takerPct) + trD * funding8h * hrs2 / 8.0) / 100.0 : 0.0
+            netR += trD * (xPx - tr2Px) / trRisk - cf2 * tr2Px / trRisk
         recordExit(trD, netR)
         if showTrades
-            label.new(bar_index, xPx, tag + " " + (netR >= 0 ? "+" : "") + str.tostring(netR, "#.##") + "R", style = label.style_label_left,
+            label.new(bar_index, xPx, tag + (tr2In ? " ×2 " : " ") + (netR >= 0 ? "+" : "") + str.tostring(netR, "#.##") + "R", style = label.style_label_left,
                  color = netR > 0 ? color.new(color.green, 20) : color.new(color.red, 20), textcolor = color.white, size = lblSize)
         inTr     := false
         lastExit := bar_index
@@ -407,6 +431,9 @@ if stratOn and sigD != 0 and not inTr and bar_index > lastExit and (sigD == 1 ? 
         trT    := close + sigD * rrMult * trRisk
         trBar  := bar_index
         trTime := time
+        tr2Px  := close - sigD * secondPct / 100.0 * trRisk
+        tr2In  := false
+        tr2Time := na
         bool risky = trRisk / close * 100.0 > liqDistPct
         if risky
             liqCount += 1
@@ -415,11 +442,13 @@ if stratOn and sigD != 0 and not inTr and bar_index > lastExit and (sigD == 1 ? 
                  style = sigD == 1 ? label.style_label_up : label.style_label_down,
                  color = sigD == 1 ? color.new(color.teal, 0) : color.new(color.maroon, 0), textcolor = color.white, size = lblSize)
         alert("Trend Finder BOS " + (sigD == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker + " " + timeframe.period + " | entry " + str.tostring(close, format.mintick) +
-             " | stop " + str.tostring(stp, format.mintick) + " (" + str.tostring(trRisk / close * 100.0, "#.##") + "%) | target " + str.tostring(trT, format.mintick),
+             " | stop " + str.tostring(stp, format.mintick) + " (" + str.tostring(trRisk / close * 100.0, "#.##") + "%) | target " + str.tostring(trT, format.mintick) +
+             (secondOn ? " | second entry (limit) " + str.tostring(tr2Px, format.mintick) : ""),
              alert.freq_once_per_bar_close)
 
 plot(stratOn and inTr ? trE : na, "Trade entry", color.blue, 2, plot.style_linebr)
 plot(stratOn and inTr ? trS : na, "Trade stop", color.red, 2, plot.style_linebr)
+plot(stratOn and inTr and secondOn ? tr2Px : na, "Second entry", color.new(color.blue, tr2In ? 0 : 50), 1, plot.style_linebr)
 plot(stratOn and inTr ? trT : na, "Trade target", color.green, 2, plot.style_linebr)
 
 // results table
@@ -448,7 +477,7 @@ if stratOn and barstate.isfirst
     for r = 8 to 10
         table.merge_cells(res, 1, r, 3, r)
 if stratOn and barstate.islast
-    table.cell(res, 0, 0, "BOS strategy — " + entryKind + ", swing " + str.tostring(swingLen) + ", " + str.tostring(rrMult, "#.##") + "R" + (feesOn ? ", net of fees" : ", before fees"),
+    table.cell(res, 0, 0, "BOS strategy — " + entryKind + ", swing " + str.tostring(swingLen) + ", " + str.tostring(rrMult, "#.##") + "R" + (secondOn ? ", 2nd entry at " + str.tostring(secondPct, "#") + "%" : "") + (feesOn ? ", net of fees" : ", before fees"),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     rc(0, 1, "Metric", color.silver)
     rc(1, 1, "Longs", color.silver)
@@ -465,9 +494,9 @@ if stratOn and barstate.islast
     resCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1), array.get(aSumR, 0) + array.get(aSumR, 1),
          array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
     rc(0, 8, "Max drawdown")
-    rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R" + (secondOn ? "   ·   2nd entry filled on " + str.tostring(n2Fills) + " trades" : ""), array.get(eq, 2) > 0 ? color.orange : color.white)
     rc(0, 9, "Current")
-    rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat",
+    rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + (secondOn ? (tr2In ? " + 2nd at " : " (2nd waiting at ") + str.tostring(tr2Px, format.mintick) + (tr2In ? "" : ")") : "") + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat",
          inTr ? (trD == 1 ? color.lime : color.red) : color.white)
     rc(0, 10, "Liquidation risk @ " + str.tostring(leverage) + "x")
     rc(1, 10, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
