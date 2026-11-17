@@ -1,0 +1,295 @@
+//@version=6
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Marks IMPULSE LEGS: fast, one-directional moves that cover far more ground than the chop around them.
+//  · A leg starts when, over the last 1 to N bars, price has moved
+//        BIG    at least X × ATR (ATR measured just before the move), and
+//        CLEAN  the net move is at least E % of the total distance travelled (little back-and-forth).
+//    The window with the largest move wins; the leg is drawn from the lowest low (highest high) of that window.
+//  · The leg keeps extending while price makes new extremes. It ends when price closes back more than R % of the
+//    leg, or makes no new extreme for S bars. While it is still running it is drawn dashed; finished legs are solid.
+//  · The same reading runs on up to two higher timeframes, drawn on this chart in their own colours and thickness.
+//  · Table: for each timeframe the current or last leg (direction, size, length) and the count and average size of
+//    legs up and legs down. Alerts when a leg starts.
+// A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
+// Finished legs never change. Higher timeframes use closed candles unless you turn that off.
+indicator("Impulse Legs (MTF) v1.0", shorttitle = "Impulse Legs v1.0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpD = "What counts as an impulse leg"
+sizeMin = input.float(4.0, "Big: move of at least (× ATR)", minval = 0.5, step = 0.25, group = grpD)
+maxN    = input.int(12, "Fast: within this many bars", minval = 1, maxval = 60, group = grpD)
+effMin  = input.float(70, "Clean: net move is at least this % of the distance travelled", minval = 10, maxval = 100, step = 5, group = grpD) / 100.0
+atrLen  = input.int(50, "ATR length", minval = 5, group = grpD)
+retr    = input.float(38, "Ends when price closes back this % of the leg", minval = 5, maxval = 100, step = 1, group = grpD) / 100.0
+stallN  = input.int(8, "…or after this many bars without a new extreme", minval = 1, maxval = 200, group = grpD)
+
+grpC = "This chart"
+onC   = input.bool(true, "Show legs on this chart's timeframe", group = grpC)
+upC   = input.color(color.new(color.lime, 0), "Leg up", group = grpC, inline = "c")
+dnC   = input.color(color.new(color.red, 0), "Leg down", group = grpC, inline = "c")
+widC  = input.int(2, "Thickness", minval = 1, maxval = 10, group = grpC, inline = "c")
+
+grp1 = "Higher timeframe 1"
+on1   = input.bool(true, "Show", group = grp1, inline = "a")
+tf1   = input.timeframe("60", "", group = grp1, inline = "a")
+up1   = input.color(color.new(color.aqua, 0), "Leg up", group = grp1, inline = "c")
+dn1   = input.color(color.new(color.orange, 0), "Leg down", group = grp1, inline = "c")
+wid1  = input.int(4, "Thickness", minval = 1, maxval = 10, group = grp1, inline = "c")
+
+grp2 = "Higher timeframe 2"
+on2   = input.bool(true, "Show", group = grp2, inline = "a")
+tf2   = input.timeframe("240", "", group = grp2, inline = "a")
+up2   = input.color(color.new(color.blue, 0), "Leg up", group = grp2, inline = "c")
+dn2   = input.color(color.new(color.fuchsia, 0), "Leg down", group = grp2, inline = "c")
+wid2  = input.int(6, "Thickness", minval = 1, maxval = 10, group = grp2, inline = "c")
+closedOnly = input.bool(true, "Higher timeframes: closed candles only (no repainting)", group = grp2,
+     tooltip = "On: a higher-timeframe leg appears and grows only when that timeframe's candle closes.\nOff: uses the candle in progress — earlier, but a leg can appear and vanish before the candle closes.")
+
+grpV = "Visuals"
+showLive = input.bool(true, "Show legs still in progress (dashed)", group = grpV)
+showLbl  = input.bool(true, "Label each leg (size and length)", group = grpV)
+lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+tblOn    = input.bool(true, "Show the table", group = grpV)
+tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal", "Large"], group = grpV)
+alertOn  = input.bool(true, "Alert when a leg starts", group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ───────────────────────────── Detection ─────────────────────────────
+// Runs on whatever timeframe it is called in. Returns
+// [running?, direction, start time, start price, end time, end price, bars, size in ATR,
+//  finished this bar?, its direction, start time, start price, end time, end price, bars, size in ATR]
+leg() =>
+    var int   st   = 0
+    var int   d    = 0
+    var float sP   = na
+    var int   sT   = na
+    var int   sB   = na
+    var float eP   = na
+    var int   eT   = na
+    var int   eB   = na
+    var float a0   = na
+    var int   lastEnd = -1
+    float a = ta.atr(atrLen)
+    bool  fin = false
+    int   fD  = 0
+    float fSP = na
+    int   fST = na
+    float fEP = na
+    int   fET = na
+    int   fBars = 0
+    float fAtr  = na
+    if st == 1
+        if d == 1 ? high > eP : low < eP
+            eP := d == 1 ? high : low
+            eT := time
+            eB := bar_index
+        float sz = math.abs(eP - sP)
+        bool back  = d == 1 ? close < eP - retr * sz : close > eP + retr * sz
+        bool stall = bar_index - eB >= stallN
+        if back or stall
+            fin   := true
+            fD    := d
+            fSP   := sP
+            fST   := sT
+            fEP   := eP
+            fET   := eT
+            fBars := eB - sB
+            fAtr  := sz / a0
+            st    := 0
+            lastEnd := eB
+    if st == 0
+        float best = 0.0
+        int   bestN = 0
+        int   bestD = 0
+        float path = 0.0
+        for n = 1 to maxN
+            if bar_index - n < lastEnd or bar_index - n < 0
+                break
+            path += math.abs(close[n - 1] - close[n])
+            float ar = a[n]
+            if na(ar) or ar <= 0 or path <= 0
+                continue
+            float net = close - close[n]
+            float size = math.abs(net) / ar
+            if size >= sizeMin and math.abs(net) / path >= effMin and size > best
+                best  := size
+                bestN := n
+                bestD := net > 0 ? 1 : -1
+        if bestN > 0
+            // start = the lowest low (highest high) of the window; end = the furthest point after it
+            int ks = 0
+            float ps = bestD == 1 ? low : high
+            for k = 0 to bestN
+                float v = bestD == 1 ? low[k] : high[k]
+                if bestD == 1 ? v <= ps : v >= ps
+                    ps := v
+                    ks := k
+            int ke = 0
+            float pe = bestD == 1 ? high : low
+            if ks > 0
+                for k = 0 to ks - 1
+                    float v = bestD == 1 ? high[k] : low[k]
+                    if bestD == 1 ? v > pe : v < pe
+                        pe := v
+                        ke := k
+            if ks > 0 and (pe - ps) * bestD > 0
+                st := 1
+                d  := bestD
+                sP := ps
+                sT := time[ks]
+                sB := bar_index - ks
+                eP := pe
+                eT := time[ke]
+                eB := bar_index - ke
+                a0 := a[bestN]
+    [st, d, sT, sP, eT, eP, st == 1 ? eB - sB : 0, st == 1 ? math.abs(eP - sP) / a0 : na, fin, fD, fST, fSP, fET, fEP, fBars, fAtr]
+
+legClosed() =>
+    [a1, a2, a3, a4, a5, a6, a7, a8, b1, b2, b3, b4, b5, b6, b7, b8] = leg()
+    [a1[1], a2[1], a3[1], a4[1], a5[1], a6[1], a7[1], a8[1], b1[1], b2[1], b3[1], b4[1], b5[1], b6[1], b7[1], b8[1]]
+
+tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 and s % 604800 == 0 ? str.tostring(s / 604800) + "W" : s >= 86400 and s % 86400 == 0 ? str.tostring(s / 86400) + "D" : s >= 3600 and s % 3600 == 0 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
+legTxt(string name, int d, float p0, float p1, int bars, float atrs) =>
+    name + (d == 1 ? "▲ +" : "▼ −") + str.tostring(math.abs(p1 - p0) / p0 * 100.0, "#.##") + "%\n" + str.tostring(bars) + " bars · " + str.tostring(atrs, "#.#") + " × ATR"
+
+// Draws one timeframe's legs and keeps its statistics.
+// Returns [running?, direction of the current / last leg, its size %, its bars, legs up, legs down, average up %, average down %, started this bar?]
+draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid,
+     int st, int d, int sT, float sP, int eT, float eP, int bars, float atrs,
+     bool fin, int fD, int fST, float fSP, int fET, float fEP, int fBars, float fAtr) =>
+    var line  ln    = na
+    var label lb    = na
+    var int   curId = na
+    var int   lastFin = na
+    var int   nUp   = 0
+    var int   nDn   = 0
+    var float sumUp = 0.0
+    var float sumDn = 0.0
+    var int   lastD = 0
+    var float lastPct = na
+    var int   lastBars = 0
+    bool started = false
+    if fin and newBar and not na(fSP) and (na(lastFin) or lastFin != fST)
+        lastFin := fST
+        if not na(ln)
+            line.delete(ln)
+            label.delete(lb)
+            ln := na
+            lb := na
+        color c = fD == 1 ? upCol : dnCol
+        float pct = math.abs(fEP - fSP) / fSP * 100.0
+        if fD == 1
+            nUp   += 1
+            sumUp += pct
+        else
+            nDn   += 1
+            sumDn += pct
+        lastD := fD
+        lastPct := pct
+        lastBars := fBars
+        if on
+            line.new(fST, fSP, fET, fEP, xloc = xloc.bar_time, color = c, width = wid)
+            if showLbl
+                label.new(fET, fEP, legTxt(name, fD, fSP, fEP, fBars, fAtr), xloc = xloc.bar_time, style = fD == 1 ? label.style_label_down : label.style_label_up,
+                     color = color.new(c, 20), textcolor = color.white, size = lblSize)
+    if st == 1 and not na(sP)
+        if na(curId) or curId != sT
+            curId   := sT
+            started := true
+            if not na(ln)
+                line.delete(ln)
+                label.delete(lb)
+                ln := na
+                lb := na
+        lastD := d
+        lastPct := math.abs(eP - sP) / sP * 100.0
+        lastBars := bars
+        if on and showLive
+            color c = d == 1 ? upCol : dnCol
+            if na(ln)
+                ln := line.new(sT, sP, eT, eP, xloc = xloc.bar_time, color = c, width = wid, style = line.style_dashed)
+                lb := showLbl ? label.new(eT, eP, "", xloc = xloc.bar_time, style = d == 1 ? label.style_label_down : label.style_label_up, color = color.new(c, 50),
+                     textcolor = color.white, size = lblSize) : na
+            line.set_xy1(ln, sT, sP)
+            line.set_xy2(ln, eT, eP)
+            if not na(lb)
+                label.set_xy(lb, eT, eP)
+                label.set_text(lb, legTxt(name, d, sP, eP, bars, atrs) + "\nin progress")
+    else if not na(ln)
+        line.delete(ln)
+        label.delete(lb)
+        ln := na
+        lb := na
+    [st == 1, lastD, lastPct, lastBars, nUp, nDn, nUp > 0 ? sumUp / nUp : na, nDn > 0 ? sumDn / nDn : na, started]
+
+// ───────────────────────────── Run ─────────────────────────────
+[cA, cD, cST, cSP, cET, cEP, cBars, cAtr, cF, cFD, cFST, cFSP, cFET, cFEP, cFB, cFA] = leg()
+[xA, xD, xST, xSP, xET, xEP, xBars, xAtr, xF, xFD, xFST, xFSP, xFET, xFEP, xFB, xFA] = request.security(syminfo.tickerid, tf1, legClosed(), lookahead = barmerge.lookahead_on)
+[lA, lD, lST, lSP, lET, lEP, lBars, lAtr, lF, lFD, lFST, lFSP, lFET, lFEP, lFB, lFA] = request.security(syminfo.tickerid, tf1, leg())
+[yA, yD, yST, ySP, yET, yEP, yBars, yAtr, yF, yFD, yFST, yFSP, yFET, yFEP, yFB, yFA] = request.security(syminfo.tickerid, tf2, legClosed(), lookahead = barmerge.lookahead_on)
+[mA, mD, mST, mSP, mET, mEP, mBars, mAtr, mF, mFD, mFST, mFSP, mFET, mFEP, mFB, mFA] = request.security(syminfo.tickerid, tf2, leg())
+
+[rc0, d0, p0, b0, u0, n0, au0, ad0, s0] = draw(onC, true, "", upC, dnC, widC, cA, cD, cST, cSP, cET, cEP, cBars, cAtr, cF, cFD, cFST, cFSP, cFET, cFEP, cFB, cFA)
+[rc1, d1, p1, b1, u1, n1, au1, ad1, s1] = draw(on1, true, tfLabel(tf1) + " ", up1, dn1, wid1,
+     closedOnly ? xA : lA, closedOnly ? xD : lD, closedOnly ? xST : lST, closedOnly ? xSP : lSP, closedOnly ? xET : lET, closedOnly ? xEP : lEP, closedOnly ? xBars : lBars, closedOnly ? xAtr : lAtr,
+     closedOnly ? xF : lF, closedOnly ? xFD : lFD, closedOnly ? xFST : lFST, closedOnly ? xFSP : lFSP, closedOnly ? xFET : lFET, closedOnly ? xFEP : lFEP, closedOnly ? xFB : lFB, closedOnly ? xFA : lFA)
+[rc2, d2, p2, b2, u2, n2, au2, ad2, s2] = draw(on2, true, tfLabel(tf2) + " ", up2, dn2, wid2,
+     closedOnly ? yA : mA, closedOnly ? yD : mD, closedOnly ? yST : mST, closedOnly ? ySP : mSP, closedOnly ? yET : mET, closedOnly ? yEP : mEP, closedOnly ? yBars : mBars, closedOnly ? yAtr : mAtr,
+     closedOnly ? yF : mF, closedOnly ? yFD : mFD, closedOnly ? yFST : mFST, closedOnly ? yFSP : mFSP, closedOnly ? yFET : mFET, closedOnly ? yFEP : mFEP, closedOnly ? yFB : mFB, closedOnly ? yFA : mFA)
+
+if alertOn
+    if s0 and onC
+        alert("Impulse leg " + (d0 == 1 ? "UP" : "DOWN") + " started on " + syminfo.ticker + " " + timeframe.period + " (" + str.tostring(p0, "#.##") + "% so far)", alert.freq_once_per_bar_close)
+    if s1 and on1
+        alert("Impulse leg " + (d1 == 1 ? "UP" : "DOWN") + " started on " + syminfo.ticker + " " + tfLabel(tf1) + " (" + str.tostring(p1, "#.##") + "% so far)", alert.freq_once_per_bar_close)
+    if s2 and on2
+        alert("Impulse leg " + (d2 == 1 ? "UP" : "DOWN") + " started on " + syminfo.ticker + " " + tfLabel(tf2) + " (" + str.tostring(p2, "#.##") + "% so far)", alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Table ─────────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+var table tbl = table.new(tblPos, 5, 5, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.gray, frame_width = 1)
+cell(int c, int r, string txt, color tc = color.white) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+tfRow(int r, string name, bool running, int d, float pct, int bars, int nU, int nD, float aU, float aD, color cu, color cd) =>
+    cell(0, r, name, color.silver)
+    cell(1, r, d == 0 ? "–" : (running ? "Running " : "Last ") + (d == 1 ? "▲" : "▼"), d == 1 ? cu : d == -1 ? cd : color.white)
+    cell(2, r, d == 0 ? "–" : str.tostring(pct, "#.##") + "% · " + str.tostring(bars) + " bars", running ? color.yellow : color.white)
+    cell(3, r, str.tostring(nU) + (na(aU) ? "" : " · avg " + str.tostring(aU, "#.##") + "%"), cu)
+    cell(4, r, str.tostring(nD) + (na(aD) ? "" : " · avg " + str.tostring(aD, "#.##") + "%"), cd)
+if tblOn and barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 4, 0)
+if tblOn and barstate.islast
+    table.cell(tbl, 0, 0, "Impulse Legs v1.0 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean",
+         text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    cell(0, 1, "Timeframe", color.silver)
+    cell(1, 1, "Leg", color.silver)
+    cell(2, 1, "Size · length", color.silver)
+    cell(3, 1, "Legs up", color.silver)
+    cell(4, 1, "Legs down", color.silver)
+    tfRow(2, tfLabel(timeframe.period) + " (chart)", rc0, d0, p0, b0, u0, n0, au0, ad0, upC, dnC)
+    if on1
+        tfRow(3, tfLabel(tf1), rc1, d1, p1, b1, u1, n1, au1, ad1, up1, dn1)
+    if on2
+        tfRow(4, tfLabel(tf2), rc2, d2, p2, b2, u2, n2, au2, ad2, up2, dn2)
