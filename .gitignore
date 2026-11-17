@@ -34,3 +34,6 @@ python/results/squeeze_trades.csv
 python/results/range_box_ladder_trades.csv
 python/results/range_box_counter_trades.csv
 python/results/range_box_counter_fills.csv
+python/results/impulse_legs.csv
+python/results/impulse_levels.csv
+python/results/impulse_fvg.csv
