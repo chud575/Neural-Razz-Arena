@@ -1,6 +1,7 @@
 //@version=6
-// Range Box + Broadening Formation Finder   ·   v1.0
+// Range Box + Broadening Formation Finder   ·   v1.1
 // Changelog
+//  v1.1  Range breaks: measure how far price travels beyond the broken bound before it comes back to the opposite side of the box
 //  v1.0  First version
 //
 // Two pattern finders built on swing highs and swing lows, each with its own on/off switch.
@@ -12,6 +13,10 @@
 //    · Box top = the higher of the two highs, bottom = the lower of the two lows. The box stays open, counting
 //      every further touch of either bound, until a bar CLOSES outside it.
 //
+//    · Break travel: after a break, the script tracks the furthest price reached beyond the broken bound until price
+//      comes back and touches the OPPOSITE side of the box. That maximum distance is drawn on the chart and
+//      collected in the table (in box heights), separately for up-breaks and down-breaks.
+//
 //  BROADENING FORMATION — a megaphone: the range keeps widening.
 //    · The last four swings alternate, the second high is HIGHER than the first and the second low is LOWER than
 //      the first (each by at least "min widening" × the formation height).
@@ -20,7 +25,7 @@
 //
 // A swing is confirmed N bars after it forms, so a pattern appears N bars after its fourth swing. Nothing repaints.
 // Labels sit directly under the pattern they describe.
-indicator("Range Box + Broadening Formation Finder v1.0", shorttitle = "Range + Broadening v1.0", overlay = true,
+indicator("Range Box + Broadening Formation Finder v1.1", shorttitle = "Range + Broadening v1.1", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -42,6 +47,11 @@ rMidOn   = input.bool(true, "Draw the midline", group = grpR)
 rLblOn   = input.bool(true, "Label the box (under it)", group = grpR)
 rDotsOn  = input.bool(true, "Mark each touch of a bound", group = grpR)
 rExt     = input.int(30, "After a break, extend the bounds (bars, 0 = off)", minval = 0, maxval = 500, group = grpR)
+rTrackOn = input.bool(true, "Measure break travel (max distance before the opposite side is hit)", group = grpR)
+rTrackLbl = input.bool(true, "Mark the max distance on the chart", group = grpR)
+rTrackEnd = input.bool(true, "Mark where tracking ended (opposite side hit)", group = grpR)
+rTrackMax = input.int(0, "Stop tracking after (bars, 0 = no limit)", minval = 0, group = grpR)
+rTrackTbl = input.bool(true, "Show break-travel statistics in the table", group = grpR)
 rAlertNew = input.bool(true, "Alert: new range", group = grpR, inline = "ra")
 rAlertBrk = input.bool(true, "Alert: range broken", group = grpR, inline = "ra")
 rCol     = input.color(color.new(color.blue, 0), "Open", group = grpR, inline = "rc")
@@ -170,6 +180,16 @@ var label rLb    = na
 var int nRange = 0
 var int nRangeUp = 0
 var int nRangeDn = 0
+// break-travel trackers (one per broken range still being followed)
+var array<int>   tDir  = array.new<int>()
+var array<float> tEdge = array.new<float>()     // the bound that broke
+var array<float> tOpp  = array.new<float>()     // the opposite bound: touching it ends the tracking
+var array<float> tHt   = array.new<float>()
+var array<float> tExt  = array.new<float>()     // furthest price so far
+var array<int>   tExtB = array.new<int>()
+var array<int>   tBar  = array.new<int>()       // break bar
+var array<float> travUp = array.new<float>()    // finished: max distance in box heights
+var array<float> travDn = array.new<float>()
 bool rNew = false
 int  rBrk = 0
 
@@ -195,6 +215,14 @@ if rOnIn
                 nRangeUp += 1
             else
                 nRangeDn += 1
+            if rTrackOn
+                array.push(tDir, rBrk)
+                array.push(tEdge, rBrk == 1 ? rTop : rBot)
+                array.push(tOpp, rBrk == 1 ? rBot : rTop)
+                array.push(tHt, rTop - rBot)
+                array.push(tExt, rBrk == 1 ? high : low)
+                array.push(tExtB, bar_index)
+                array.push(tBar, bar_index)
             rOn  := false
             rEnd := bar_index
             rLb  := na
@@ -244,6 +272,37 @@ if rOnIn
                 dot(hBb, hB, rCol, true)
                 dot(lAb, lA, rCol, false)
                 dot(lBb, lB, rCol, false)
+
+// break travel: furthest price beyond the broken bound before the opposite side of the box is touched
+if array.size(tDir) > 0
+    for i = array.size(tDir) - 1 to 0
+        if bar_index > array.get(tBar, i)
+            int   d    = array.get(tDir, i)
+            float edge = array.get(tEdge, i)
+            float opp  = array.get(tOpp, i)
+            bool  back = d == 1 ? low <= opp : high >= opp
+            bool  old  = rTrackMax > 0 and bar_index - array.get(tBar, i) >= rTrackMax
+            if back or old
+                float ext  = array.get(tExt, i)
+                float mult = math.abs(ext - edge) / array.get(tHt, i)
+                array.push(d == 1 ? travUp : travDn, mult)
+                color c = d == 1 ? rColUp : rColDn
+                if rTrackLbl
+                    line.new(array.get(tExtB, i), edge, array.get(tExtB, i), ext, color = c, width = 2, style = line.style_dashed)
+                    label.new(array.get(tExtB, i), ext, "Max " + str.tostring(mult, "#.##") + " × box\n" + str.tostring(math.abs(ext - edge) / edge * 100.0, "#.##") + "% beyond the " + (d == 1 ? "top" : "bottom"),
+                         style = d == 1 ? label.style_label_down : label.style_label_up, color = color.new(c, 15), textcolor = color.white, size = lblSize)
+                if rTrackEnd and back
+                    label.new(bar_index, opp, "End", style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+                array.remove(tDir, i)
+                array.remove(tEdge, i)
+                array.remove(tOpp, i)
+                array.remove(tHt, i)
+                array.remove(tExt, i)
+                array.remove(tExtB, i)
+                array.remove(tBar, i)
+            else if d == 1 ? high > array.get(tExt, i) : low < array.get(tExt, i)
+                array.set(tExt, i, d == 1 ? high : low)
+                array.set(tExtB, i, bar_index)
 
 // ───────────────────────────── Broadening formation ─────────────────────────────
 var bool  bOn    = false
@@ -365,14 +424,28 @@ tblSize = switch tblSizeIn
     "Normal" => size.normal
     "Large"  => size.large
     => size.small
-var table tbl = table.new(tblPos, 3, 5, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 3, 11, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 cell(int c, int r, string txt, color tc = color.white) =>
     table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+travTxt(array<float> a) =>
+    int n = array.size(a)
+    n > 0 ? str.tostring(array.avg(a), "#.##") + " / " + str.tostring(array.median(a), "#.##") + " / " + str.tostring(array.max(a), "#.##") + "  (" + str.tostring(n) + ")" : "–"
+reached(array<float> a, float lvl) =>
+    int n = array.size(a)
+    int k = 0
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(a, i) >= lvl
+                k += 1
+    n > 0 ? str.tostring(k / n * 100.0, "#") + "%" : "–"
 if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 2, 0)
+    table.merge_cells(tbl, 0, 5, 2, 5)
+    for r = 6 to 10
+        table.merge_cells(tbl, 1, r, 2, r)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Range + Broadening v1.0 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Range + Broadening v1.1 — swing " + str.tostring(swingLen), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "", color.silver)
     cell(1, 1, "Range box", rCol)
     cell(2, 1, "Broadening", bCol)
@@ -386,3 +459,21 @@ if tblOn and barstate.islast
     cell(0, 4, "Broke up / down", color.silver)
     cell(1, 4, str.tostring(nRangeUp) + " / " + str.tostring(nRangeDn))
     cell(2, 4, str.tostring(nBroadUp) + " / " + str.tostring(nBroadDn))
+    if rTrackOn and rTrackTbl
+        table.cell(tbl, 0, 5, "Range break travel — max distance beyond the bound, in box heights, before the opposite side is hit", text_color = color.silver, text_size = size.tiny,
+             text_halign = text.align_left)
+        cell(0, 6, "Up-breaks: avg / median / best (n)", rColUp)
+        cell(1, 6, travTxt(travUp))
+        cell(0, 7, "Down-breaks: avg / median / best (n)", rColDn)
+        cell(1, 7, travTxt(travDn))
+        cell(0, 8, "Reached 0.5 × box: up / down", color.silver)
+        cell(1, 8, reached(travUp, 0.5) + " / " + reached(travDn, 0.5))
+        cell(0, 9, "Reached 1 × box: up / down", color.silver)
+        cell(1, 9, reached(travUp, 1.0) + " / " + reached(travDn, 1.0))
+        cell(0, 10, "Being tracked now", color.silver)
+        string live = "none"
+        if array.size(tDir) > 0
+            live := ""
+            for i = 0 to array.size(tDir) - 1
+                live += (i > 0 ? "\n" : "") + (array.get(tDir, i) == 1 ? "↑ " : "↓ ") + str.tostring(math.abs(array.get(tExt, i) - array.get(tEdge, i)) / array.get(tHt, i), "#.##") + " × so far"
+        cell(1, 10, live, array.size(tDir) > 0 ? color.yellow : color.white)
