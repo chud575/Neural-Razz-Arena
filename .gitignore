@@ -32,3 +32,5 @@ python/results/ms_takeout_trades.csv
 python/results/ms_continuation_trades.csv
 python/results/squeeze_trades.csv
 python/results/range_box_ladder_trades.csv
+python/results/range_box_counter_trades.csv
+python/results/range_box_counter_fills.csv
