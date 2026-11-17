@@ -165,9 +165,7 @@ legTxt(string name, int d, float p0, float p1, int bars, float atrs) =>
 
 // Draws one timeframe's legs and keeps its statistics.
 // Returns [running?, direction of the current / last leg, its size %, its bars, legs up, legs down, average up %, average down %, started this bar?]
-draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid,
-     int st, int d, int sT, float sP, int eT, float eP, int bars, float atrs,
-     bool fin, int fD, int fST, float fSP, int fET, float fEP, int fBars, float fAtr) =>
+draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid, int st, int d, int sT, float sP, int eT, float eP, int bars, float atrs, bool fin, int fD, int fST, float fSP, int fET, float fEP, int fBars, float fAtr) =>
     var line  ln    = na
     var label lb    = na
     var int   curId = na
