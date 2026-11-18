@@ -85,3 +85,20 @@ Of 1,107 stopped trades, 54% were wick stops: the candle traded through the stop
 | Base with a close-only stop (exit at the close of a candle that closes through the stop) | +0.161 | +0.106 |
 
 Re-entry A: 88% stopped again, 9.5% reached the target (median reward 13 × the new risk). Re-entry B: 69% stopped, 30% reached 2R.
+
+## 5. Re-entering at the original entry price after a stop-out (python/bos_reentry.py), 1h BOS, 2R target
+
+After a base trade is stopped: a resting stop-order at the original entry price, same direction, same target price, valid
+300 bars, cancelled when a new base trade starts; one trade at a time. Four coins, IS / OOS, after fees. R0 = original risk.
+
+| Version | Base trades | Re-entries | Re-entry result (own R) | Whole strategy, total R0 (IS / OOS) |
+|---|---|---|---|---|
+| No re-entry | 2087 | – | – | 229 / 68 |
+| Stop at the original stop, re-enter once | 1947 | 352 | +0.12 / +0.14 | 235 / 75 |
+| Stop at the original stop, re-enter repeatedly | 1910 | 453 | +0.10 / +0.05 | 250 / 53 |
+| Stop at the low since the stop-out, once | 1869 | 332 | +0.08 / +0.05 | 238 / 61 |
+| Stop at the low since the stop-out, repeatedly | 1837 | 385 | +0.10 / -0.01 | 243 / 37 |
+
+"Original stop, once": 31% of stop-outs were followed by a re-entry; 38% of re-entries reached the target, 59% stopped, 3% timed out.
+By coin (IS / OOS): BTC +0.13 / +0.34, ETH +0.06 / +0.09, AVAX +0.32 / -0.16, XRP 0.00 / +0.05.
+(This sequential simulation orders a few trades differently from section 2, so its base figures differ slightly.)
