@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.4
+// Trend Finder – Swing Structure   ·   v1.5
 // Changelog
+//  v1.5  BOS tracker: minimum stop size filter (skips trades whose stop is closer than 2.9 × ATR by default); skipped signals can be marked
 //  v1.4  BOS tracker: optional second entry part-way to the stop (limit order, same stop and target); results count both entries
 //  v1.3  BOS strategy tracker: entries on a break of structure, stop at the latest swing, R:R target, results table net of fees, alerts
 //  v1.2  Market structure: BOS / CHoCH marks, structure bias, and a table listing the structure of every timeframe being watched
@@ -27,7 +28,7 @@
 //    Optional SECOND ENTRY: a limit order part-way from the entry to the stop (50 % by default), same stop, same
 //    target. Results are in R, where 1R = the risk of the first entry alone, so a trade with both entries can lose 1.5R.
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.4", shorttitle = "Trend Finder v1.4", overlay = true,
+indicator("Trend Finder – Swing Structure v1.5", shorttitle = "Trend Finder v1.5", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
@@ -53,6 +54,10 @@ stratOn   = input.bool(true, "Track the BOS strategy", group = grpT,
      tooltip = "Long on a close above the latest swing high while structure is already bullish (BOS up), stop at the latest swing low, R:R target. Shorts mirror it. Tested best on 1h with swing length 5 and 2R.")
 entryKind = input.string("BOS only", "Entries", options = ["BOS only", "BOS and CHoCH"], group = grpT)
 rrMult    = input.float(2.0, "Target (reward : risk)", minval = 0.1, step = 0.1, group = grpT)
+minStopOn  = input.bool(true, "Skip trades with a tight stop", group = grpT,
+     tooltip = "In the test, the 20% of trades with the tightest stops lost slightly, in both test periods. Skipping them raised the average result from about +0.14R to about +0.19R per trade.")
+minStopAtr = input.float(2.9, "…tight = stop closer than this many ATRs (ATR 14)", minval = 0.0, step = 0.1, group = grpT)
+showSkip   = input.bool(true, "Mark signals skipped for a tight stop", group = grpT)
 secondOn  = input.bool(true, "Second entry: limit order part-way to the stop", group = grpT,
      tooltip = "Adds a second unit if price pulls back. Same stop and same target as the first entry. In the test it filled on about 3 trades in 4, including every trade that went on to stop out, so it adds size rather than avoiding losses. 1R in the table stays the risk of the first entry alone.")
 secondPct = input.float(50, "…at this % of the way from the entry to the stop", minval = 5, maxval = 95, step = 5, group = grpT)
@@ -319,7 +324,7 @@ if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 6, 0)
     table.merge_cells(tbl, 0, 7, 6, 7)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.4 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Trend Finder v1.5 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Trend", color.silver)
     cell(2, 1, "Structure", color.silver)
@@ -377,6 +382,8 @@ var float tr2Px    = na       // second entry: limit price, and when it filled
 var bool  tr2In    = false
 var int   tr2Time  = na
 var int   n2Fills  = 0
+var int   nSkipped = 0
+atr14 = ta.atr(14)
 
 // 1) manage the open trade (from the bar after the entry)
 if stratOn and inTr and bar_index > trBar
@@ -422,7 +429,13 @@ if stratOn and inTr and bar_index > trBar
 int sigD = sEv == 1 or (entryKind == "BOS and CHoCH" and sEv == 2) ? 1 : sEv == -1 or (entryKind == "BOS and CHoCH" and sEv == -2) ? -1 : 0
 if stratOn and sigD != 0 and not inTr and bar_index > lastExit and (sigD == 1 ? tradeLongs : tradeShorts)
     float stp = sigD == 1 ? lastL : lastH
-    if not na(stp) and (close - stp) * sigD > 0
+    bool tight = minStopOn and not na(stp) and not na(atr14) and math.abs(close - stp) < minStopAtr * atr14
+    if tight and (close - stp) * sigD > 0
+        nSkipped += 1
+        if showSkip
+            label.new(bar_index, sigD == 1 ? low : high, "skip\nstop " + str.tostring(math.abs(close - stp) / atr14, "#.#") + " ATR", style = sigD == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.gray, 40), textcolor = color.white, size = size.small)
+    if not tight and not na(stp) and (close - stp) * sigD > 0
         inTr   := true
         trD    := sigD
         trE    := close
@@ -477,7 +490,7 @@ if stratOn and barstate.isfirst
     for r = 8 to 10
         table.merge_cells(res, 1, r, 3, r)
 if stratOn and barstate.islast
-    table.cell(res, 0, 0, "BOS strategy — " + entryKind + ", swing " + str.tostring(swingLen) + ", " + str.tostring(rrMult, "#.##") + "R" + (secondOn ? ", 2nd entry at " + str.tostring(secondPct, "#") + "%" : "") + (feesOn ? ", net of fees" : ", before fees"),
+    table.cell(res, 0, 0, "BOS strategy — " + entryKind + ", swing " + str.tostring(swingLen) + ", " + str.tostring(rrMult, "#.##") + "R" + (minStopOn ? ", stop ≥ " + str.tostring(minStopAtr, "#.#") + " ATR" : "") + (secondOn ? ", 2nd entry at " + str.tostring(secondPct, "#") + "%" : "") + (feesOn ? ", net of fees" : ", before fees"),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     rc(0, 1, "Metric", color.silver)
     rc(1, 1, "Longs", color.silver)
@@ -494,7 +507,7 @@ if stratOn and barstate.islast
     resCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1), array.get(aSumR, 0) + array.get(aSumR, 1),
          array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
     rc(0, 8, "Max drawdown")
-    rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R" + (secondOn ? "   ·   2nd entry filled on " + str.tostring(n2Fills) + " trades" : ""), array.get(eq, 2) > 0 ? color.orange : color.white)
+    rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R" + (secondOn ? "   ·   2nd entry filled on " + str.tostring(n2Fills) + " trades" : "") + (minStopOn ? "   ·   " + str.tostring(nSkipped) + " signals skipped (tight stop)" : ""), array.get(eq, 2) > 0 ? color.orange : color.white)
     rc(0, 9, "Current")
     rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + (secondOn ? (tr2In ? " + 2nd at " : " (2nd waiting at ") + str.tostring(tr2Px, format.mintick) + (tr2In ? "" : ")") : "") + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat",
          inTr ? (trD == 1 ? color.lime : color.red) : color.white)
