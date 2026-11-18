@@ -68,3 +68,20 @@ Four coins pooled, IS / OOS, after fees.
 
 The second entry was positive on all four coins in both periods (BTC IS +0.006, otherwise +0.07 to +0.18 R0 per fill).
 Largest drawdown on one coin: first entry only 31 R0, both entries 54 R0.
+
+## 4. Stops hit by a wick, and re-entering at that candle's close (python/bos_wick_stops.py), 1h BOS, 2R target
+
+Of 1,107 stopped trades, 54% were wick stops: the candle traded through the stop but closed back on the right side of it
+(IS 54%, OOS 56%). The wick went a median 0.07 R0 past the stop. Re-entry at that candle's close with the stop at its low
+(high for shorts): the new stop is a median 0.22 R0 away (0.83% of price). Four coins, IS / OOS (trades), after fees.
+
+| | IS | OOS |
+|---|---|---|
+| Re-entry A: target = the original target price, per re-entry, in its own R | +0.26 (420) | -0.50 (180) |
+| Re-entry B: target = 2 × the new risk, per re-entry, in its own R | -0.19 (420) | -0.31 (180) |
+| Base strategy, per signal (R0) | +0.153 | +0.133 |
+| Base + re-entry A, per signal (R0) | +0.160 | +0.109 |
+| Base + re-entry B, per signal (R0) | +0.133 | +0.129 |
+| Base with a close-only stop (exit at the close of a candle that closes through the stop) | +0.161 | +0.106 |
+
+Re-entry A: 88% stopped again, 9.5% reached the target (median reward 13 × the new risk). Re-entry B: 69% stopped, 30% reached 2R.
