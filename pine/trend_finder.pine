@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.5
+// Trend Finder – Swing Structure   ·   v1.6
 // Changelog
+//  v1.6  Forecast: while no trade is open, shows the level a 1h close must break to start the next trade, with its stop, target and second entry
 //  v1.5  BOS tracker: minimum stop size filter (skips trades whose stop is closer than 2.9 × ATR by default); skipped signals can be marked
 //  v1.4  BOS tracker: optional second entry part-way to the stop (limit order, same stop and target); results count both entries
 //  v1.3  BOS strategy tracker: entries on a break of structure, stop at the latest swing, R:R target, results table net of fees, alerts
@@ -28,7 +29,7 @@
 //    Optional SECOND ENTRY: a limit order part-way from the entry to the stop (50 % by default), same stop, same
 //    target. Results are in R, where 1R = the risk of the first entry alone, so a trade with both entries can lose 1.5R.
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.5", shorttitle = "Trend Finder v1.5", overlay = true,
+indicator("Trend Finder – Swing Structure v1.6", shorttitle = "Trend Finder v1.6", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
@@ -72,6 +73,9 @@ funding8h = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpT)
 leverage  = input.float(10, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpT)
 mmrPct    = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpT)
 showTrades = input.bool(true, "Label entries & exits", group = grpT)
+fcOn      = input.bool(true, "Forecast: show where the next trade would start (when flat)", group = grpT,
+     tooltip = "While no trade is open, draws the swing level a candle must CLOSE beyond to trigger the next entry, with the stop, the estimated target and the second-entry price. The real entry is that candle's close, so the actual prices will be a little further out than the estimate.")
+fcBars    = input.int(25, "Forecast lines extend this many bars to the right", minval = 5, maxval = 200, group = grpT)
 resPosIn  = input.string("Bottom right", "Results table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpT)
 
 grpH = "Other timeframes (table)"
@@ -212,19 +216,19 @@ structure(int L) =>
         lastEv := sEv
     int hiUp = na(prevH) or na(lastH) ? 0 : lastH > prevH ? 1 : -1
     int loUp = na(prevL) or na(lastL) ? 0 : lastL > prevL ? 1 : -1
-    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp]
+    [trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp, hBrk, lBrk]
 
 // another timeframe, last closed candle only (no repainting): [trend, structure bias, last break, high vs previous, low vs previous, swing high, swing low]
 tfClosed() =>
-    [t, a1, a2, a3, a4, lH, lL, a5, a6, a7, m, a8, a9, a10, a11, lE, hU, lU] = structure(swingLen)
+    [t, a1, a2, a3, a4, lH, lL, a5, a6, a7, m, a8, a9, a10, a11, lE, hU, lU, a12, a13] = structure(swingLen)
     [t[1], m[1], lE[1], hU[1], lU[1], lH[1], lL[1]]
 
 // overlay timeframe: everything from its last closed candle
 overlayClosed() =>
-    [t, eT, eP, eB, eUp, lH, lL, sn, lg, eTm, m, sE, sLv, sBr, sT, lE, hU, lU] = structure(htfLen)
+    [t, eT, eP, eB, eUp, lH, lL, sn, lg, eTm, m, sE, sLv, sBr, sT, lE, hU, lU, hBk, lBk] = structure(htfLen)
     [t[1], eT[1], eP[1], eTm[1], eUp[1], lH[1], lL[1], m[1], sE[1], sLv[1], sT[1], lE[1], hU[1], lU[1]]
 
-[trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp] = structure(swingLen)
+[trend, evT, evP, evB, evUp, lastH, lastL, since, legs, evTm, ms, sEv, sLvl, sB, sTm, lastEv, hiUp, loUp, hBroken, lBroken] = structure(swingLen)
 [hTrend, hEvT, hEvP, hEvTm, hEvUp, hLastH, hLastL, hMs, hSEv, hSLvl, hSTm, hLastEv, hHiUp, hLoUp] = request.security(syminfo.tickerid, htfTF, overlayClosed(), lookahead = barmerge.lookahead_on)
 [trA, msA, evA, hiA, loA, shA, slA] = request.security(syminfo.tickerid, tfA, tfClosed(), lookahead = barmerge.lookahead_on)
 [trB, msB, evB2, hiB, loB, shB, slB] = request.security(syminfo.tickerid, tfB, tfClosed(), lookahead = barmerge.lookahead_on)
@@ -324,7 +328,7 @@ if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 6, 0)
     table.merge_cells(tbl, 0, 7, 6, 7)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.5 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Trend Finder v1.6 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Trend", color.silver)
     cell(2, 1, "Structure", color.silver)
@@ -464,6 +468,50 @@ plot(stratOn and inTr ? trS : na, "Trade stop", color.red, 2, plot.style_linebr)
 plot(stratOn and inTr and secondOn ? tr2Px : na, "Second entry", color.new(color.blue, tr2In ? 0 : 50), 1, plot.style_linebr)
 plot(stratOn and inTr ? trT : na, "Trade target", color.green, 2, plot.style_linebr)
 
+// forecast: the next entry if a candle closes beyond the current swing level (only while flat)
+var array<line>  fcLines  = array.new<line>()
+var array<label> fcLabels = array.new<label>()
+string fcTxtTable = ""
+fcDraw(int d, float lvl, float stp) =>
+    float rk   = math.abs(lvl - stp)
+    float tg   = lvl + d * rrMult * rk
+    float e2   = lvl - d * secondPct / 100.0 * rk
+    bool  skip = minStopOn and not na(atr14) and rk < minStopAtr * atr14
+    color c    = d == 1 ? color.teal : color.maroon
+    int   x2   = bar_index + fcBars
+    array.push(fcLines, line.new(bar_index, lvl, x2, lvl, color = skip ? color.gray : color.blue, width = 2, style = line.style_dashed))
+    if not skip
+        array.push(fcLines, line.new(bar_index, stp, x2, stp, color = color.new(color.red, 30), style = line.style_dashed))
+        array.push(fcLines, line.new(bar_index, tg, x2, tg, color = color.new(color.green, 30), style = line.style_dashed))
+        if secondOn
+            array.push(fcLines, line.new(bar_index, e2, x2, e2, color = color.new(color.blue, 60), style = line.style_dotted))
+    string txt = (d == 1 ? "▲ LONG if a candle closes above " : "▼ SHORT if a candle closes below ") + str.tostring(lvl, format.mintick) +
+         (skip ? "\nwould be SKIPPED: stop only " + str.tostring(rk / atr14, "#.#") + " ATR away" :
+         "\nstop " + str.tostring(stp, format.mintick) + " (about " + str.tostring(rk / lvl * 100.0, "#.##") + "%)  ·  target ≈ " + str.tostring(tg, format.mintick) +
+         (secondOn ? "\n2nd entry ≈ " + str.tostring(e2, format.mintick) : ""))
+    array.push(fcLabels, label.new(x2, lvl, txt, style = label.style_label_left, color = color.new(skip ? color.gray : c, 15), textcolor = color.white, size = lblSize,
+         textalign = text.align_left))
+    (d == 1 ? "long above " : "short below ") + str.tostring(lvl, format.mintick) + (skip ? " (would be skipped)" : "")
+
+if barstate.islast
+    for ln in fcLines
+        line.delete(ln)
+    for lb in fcLabels
+        label.delete(lb)
+    array.clear(fcLines)
+    array.clear(fcLabels)
+    if stratOn and fcOn and not inTr
+        bool both = entryKind == "BOS and CHoCH"
+        // a break UP is a BOS when structure is not bearish; a break DOWN when it is not bullish
+        bool upOk = tradeLongs and not na(lastH) and not hBroken and not na(lastL) and lastL < lastH and (ms != -1 or both)
+        bool dnOk = tradeShorts and not na(lastL) and not lBroken and not na(lastH) and lastH > lastL and (ms != 1 or both)
+        if upOk
+            fcTxtTable := fcDraw(1, lastH, lastL)
+        if dnOk
+            fcTxtTable := (fcTxtTable == "" ? "" : fcTxtTable + "  ·  ") + fcDraw(-1, lastL, lastH)
+        if fcTxtTable == ""
+            fcTxtTable := "waiting for a new swing " + (ms == 1 ? "high" : ms == -1 ? "low" : "point")
+
 // results table
 resPos = switch resPosIn
     "Top left"     => position.top_left
@@ -509,7 +557,7 @@ if stratOn and barstate.islast
     rc(0, 8, "Max drawdown")
     rc(1, 8, "-" + str.tostring(array.get(eq, 2), "#.##") + "R" + (secondOn ? "   ·   2nd entry filled on " + str.tostring(n2Fills) + " trades" : "") + (minStopOn ? "   ·   " + str.tostring(nSkipped) + " signals skipped (tight stop)" : ""), array.get(eq, 2) > 0 ? color.orange : color.white)
     rc(0, 9, "Current")
-    rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + (secondOn ? (tr2In ? " + 2nd at " : " (2nd waiting at ") + str.tostring(tr2Px, format.mintick) + (tr2In ? "" : ")") : "") + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat",
+    rc(1, 9, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + (secondOn ? (tr2In ? " + 2nd at " : " (2nd waiting at ") + str.tostring(tr2Px, format.mintick) + (tr2In ? "" : ")") : "") + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) : "Flat" + (fcOn ? " — next: " + fcTxtTable : ""),
          inTr ? (trD == 1 ? color.lime : color.red) : color.white)
     rc(0, 10, "Liquidation risk @ " + str.tostring(leverage) + "x")
     rc(1, 10, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
