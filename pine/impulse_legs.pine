@@ -1,6 +1,8 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.4
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.5
 // Changelog
+//  v1.5  Zone tracking: every leg's box stays until price leaves it; pullback then breakout = win, pullback then through the leg's start = loss,
+//        breakout with no pullback = neither; results in the table
 //  v1.4  Premium / discount zone of a leg UP: the upper half is now the discount half and the lower half the premium half (setting to switch back)
 //  v1.3  A star above the candle where price enters the discount / premium half of a leg's zone, in the leg's colour
 //  v1.2  Premium / discount zone after each finished leg (box with a midline, extends until price enters the discount half or a new leg appears);
@@ -26,12 +28,17 @@
 //    middle (equilibrium). For a leg down the upper half is premium and the lower half discount; for a leg up the
 //    halves are swapped (upper = discount, lower = premium) unless you turn that off. The box extends to the right
 //    until price pulls back through the midline (down after a leg up, up after a leg down), or a new leg appears.
+//    With "Keep every box until price leaves it" on, each leg's box stays (several can be open at once) and is scored:
+//      WIN         price pulled back through the midline, then broke out beyond the leg's extreme
+//      LOSS        price pulled back through the midline, then went beyond the leg's start
+//      NO PULLBACK price broke out beyond the extreme without pulling back to the midline first (not counted either way)
+//    If one candle does two of these, the less favourable reading is used.
 //  · Trend filter (optional): only legs that go WITH the trend are shown and counted. The trend can be read on the
 //    leg's own timeframe or on one timeframe you choose, from two moving averages, price against one moving average,
 //    or swing structure.
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.4", shorttitle = "Impulse Legs v1.4", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.5", shorttitle = "Impulse Legs v1.5", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -78,6 +85,9 @@ trendSwing = input.int(5, "Swing length (for swing structure)", minval = 1, maxv
 
 grpZ = "Premium / discount zone (this chart's legs)"
 pdOn      = input.bool(true, "Draw a premium / discount zone after each finished leg", group = grpZ)
+pdTrack   = input.bool(true, "Keep every box until price leaves it, and score it (win / loss / no pullback)", group = grpZ,
+     tooltip = "Win: price pulls back through the midline, then breaks out beyond the leg's extreme.\nLoss: price pulls back through the midline, then goes beyond the leg's start.\nNo pullback: price breaks out beyond the extreme first. Not counted as a win or a loss.\nOff: one box at a time, which stops at the midline or when a new leg appears.")
+pdMaxOpen = input.int(25, "Max boxes open at once (oldest dropped unscored)", minval = 1, maxval = 100, group = grpZ)
 pdSwapUp  = input.bool(true, "Legs up: upper half is discount, lower half is premium", group = grpZ,
      tooltip = "On: after a leg up the upper half is drawn as discount and the lower half as premium. Off: upper = premium, lower = discount for every leg.")
 pdPremCol = input.color(color.new(color.red, 0), "Premium half", group = grpZ, inline = "z")
@@ -481,7 +491,7 @@ bool zEntered = false
 zoneLabel(string state) =>
     "Midline " + str.tostring(zEq, format.mintick) + state
 // the open zone: extend it, and end it when price enters the half that matters or a new leg appears
-if zOn
+if zOn and not pdTrack
     box.set_right(zPrem, time)
     box.set_right(zDisc, time)
     line.set_x2(zMid, time)
@@ -498,7 +508,7 @@ if zOn
             label.set_text(zLb, zoneLabel(inHalf ? (zDir == 1 ? "\nprice pulled back below it" : "\nprice pulled back above it") : "\nended by a new leg"))
             label.set_color(zLb, color.new(color.gray, 30))
 // a leg on this chart has just finished: open its zone
-if pdOn and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
+if pdOn and not pdTrack and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
     zId  := cFST
     float hi = math.max(cFSP, cFEP)
     float lo = math.min(cFSP, cFEP)
@@ -523,6 +533,125 @@ if pdOn and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
     zOn   := not already and not s0
     zLb   := pdLbl ? label.new(int((zT0 + time) / 2), lo, zoneLabel(already ? "\nalready reached" : ""), xloc = xloc.bar_time,
          style = label.style_label_up, color = color.new(already ? color.gray : (zDir == 1 ? upC : dnC), 25), textcolor = color.white, size = lblSize) : na
+// ── tracking mode: every leg's box stays until price leaves it ──
+var array<int>   tzDir = array.new<int>()
+var array<float> tzHi  = array.new<float>()
+var array<float> tzLo  = array.new<float>()
+var array<int>   tzT0  = array.new<int>()
+var array<bool>  tzBack = array.new<bool>()        // has pulled back through the midline
+var array<box>   tzTop = array.new<box>()
+var array<box>   tzBot = array.new<box>()
+var array<line>  tzMid = array.new<line>()
+var array<label> tzLab = array.new<label>()
+var array<int> zWin  = array.new<int>(2, 0)        // 0 = legs up, 1 = legs down
+var array<int> zLoss = array.new<int>(2, 0)
+var array<int> zNone = array.new<int>(2, 0)
+var int tzId = na
+// one candle's effect on a zone: 0 nothing, 1 pulled back, 2 win, 3 loss, 4 breakout with no pullback
+zoneStep(int d, float hi, float lo, bool wasBack, float h, float l) =>
+    float eq  = (hi + lo) / 2
+    bool out  = d == 1 ? h > hi : l < lo             // beyond the leg's extreme
+    bool fail = d == 1 ? l < lo : h > hi             // beyond the leg's start
+    bool mid  = d == 1 ? l <= eq : h >= eq
+    wasBack ? (fail ? 3 : out ? 2 : 0) : (fail ? 3 : out ? 4 : mid ? 1 : 0)
+zoneClose(int i, int res) =>
+    int   d   = array.get(tzDir, i)
+    int   k   = d == 1 ? 0 : 1
+    color c   = res == 2 ? color.lime : res == 3 ? color.red : color.gray
+    if res == 2
+        array.set(zWin, k, array.get(zWin, k) + 1)
+    else if res == 3
+        array.set(zLoss, k, array.get(zLoss, k) + 1)
+    else
+        array.set(zNone, k, array.get(zNone, k) + 1)
+    box.set_border_color(array.get(tzTop, i), c)
+    box.set_border_color(array.get(tzBot, i), c)
+    box.set_border_width(array.get(tzTop, i), 2)
+    box.set_border_width(array.get(tzBot, i), 2)
+    label lb = array.get(tzLab, i)
+    if not na(lb)
+        label.set_text(lb, res == 2 ? "WIN\npullback, then breakout" : res == 3 ? "LOSS\npullback, then through the start" : "no pullback")
+        label.set_color(lb, color.new(c, 20))
+zoneDrop(int i) =>
+    array.remove(tzDir, i)
+    array.remove(tzHi, i)
+    array.remove(tzLo, i)
+    array.remove(tzT0, i)
+    array.remove(tzBack, i)
+    array.remove(tzTop, i)
+    array.remove(tzBot, i)
+    array.remove(tzMid, i)
+    array.remove(tzLab, i)
+bool tzWinNow  = false
+bool tzLossNow = false
+if pdTrack and array.size(tzDir) > 0
+    for i = array.size(tzDir) - 1 to 0
+        int d = array.get(tzDir, i)
+        box.set_right(array.get(tzTop, i), time)
+        box.set_right(array.get(tzBot, i), time)
+        line.set_x2(array.get(tzMid, i), time)
+        if not na(array.get(tzLab, i))
+            label.set_x(array.get(tzLab, i), int((array.get(tzT0, i) + time) / 2))
+        int res = zoneStep(d, array.get(tzHi, i), array.get(tzLo, i), array.get(tzBack, i), high, low)
+        if res == 1
+            array.set(tzBack, i, true)
+            zEntered := true
+            zDir := d
+            zEq  := (array.get(tzHi, i) + array.get(tzLo, i)) / 2
+            if pdStar
+                label.new(time, high, "✱", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_none, textcolor = d == 1 ? upC : dnC,
+                     size = pdStarSize == "Small" ? size.small : pdStarSize == "Normal" ? size.normal : pdStarSize == "Huge" ? size.huge : size.large)
+            if not na(array.get(tzLab, i))
+                label.set_text(array.get(tzLab, i), "pulled back · waiting for a breakout")
+        else if res >= 2
+            tzWinNow  := tzWinNow or res == 2
+            tzLossNow := tzLossNow or res == 3
+            zoneClose(i, res)
+            zoneDrop(i)
+if pdOn and pdTrack and onC and cFM and not na(cFSP) and (na(tzId) or tzId != cFST)
+    tzId := cFST
+    float hi = math.max(cFSP, cFEP)
+    float lo = math.min(cFSP, cFEP)
+    float eq = (hi + lo) / 2
+    bool  flip   = cFD == 1 and pdSwapUp
+    color topCol = flip ? pdDiscCol : pdPremCol
+    color botCol = flip ? pdPremCol : pdDiscCol
+    array.push(tzDir, cFD)
+    array.push(tzHi, hi)
+    array.push(tzLo, lo)
+    array.push(tzT0, cFST)
+    array.push(tzBack, false)
+    array.push(tzTop, box.new(cFST, hi, time, eq, xloc = xloc.bar_time, border_color = color.new(topCol, 60), bgcolor = color.new(topCol, pdFillT)))
+    array.push(tzBot, box.new(cFST, eq, time, lo, xloc = xloc.bar_time, border_color = color.new(botCol, 60), bgcolor = color.new(botCol, pdFillT)))
+    array.push(tzMid, line.new(cFST, eq, time, eq, xloc = xloc.bar_time, color = pdEqCol, width = 1))
+    array.push(tzLab, pdLbl ? label.new(int((cFST + time) / 2), lo, "waiting for a pullback to " + str.tostring(eq, format.mintick), xloc = xloc.bar_time, style = label.style_label_up,
+         color = color.new(cFD == 1 ? upC : dnC, 25), textcolor = color.white, size = lblSize) : na)
+    // replay the candles since the leg's extreme (the leg is only declared finished a few candles later)
+    int n    = array.size(tzDir) - 1
+    int back = math.min(int((time - cFET) / math.max(time - time[1], 1)), 400)
+    int res  = 0
+    if back > 0
+        for k = back - 1 to 0
+            int r = zoneStep(cFD, hi, lo, array.get(tzBack, n), high[k], low[k])
+            if r == 1
+                array.set(tzBack, n, true)
+                if not na(array.get(tzLab, n))
+                    label.set_text(array.get(tzLab, n), "pulled back · waiting for a breakout")
+            else if r >= 2
+                res := r
+                break
+    if res >= 2
+        zoneClose(n, res)
+        zoneDrop(n)
+    while array.size(tzDir) > pdMaxOpen                    // too many open: drop the oldest, unscored
+        box.delete(array.get(tzTop, 0))
+        box.delete(array.get(tzBot, 0))
+        line.delete(array.get(tzMid, 0))
+        label.delete(array.get(tzLab, 0))
+        zoneDrop(0)
+if pdAlert and (tzWinNow or tzLossNow)
+    alert("Impulse leg zone " + (tzWinNow ? "WIN (pullback, then breakout)" : "LOSS (pullback, then through the leg's start)") + " — " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+
 if pdAlert and zEntered
     alert("Price pulled back through the midline of the last impulse leg " + (zDir == 1 ? "(leg up)" : "(leg down)") + " — " + syminfo.ticker + " " + timeframe.period + " (equilibrium " +
          str.tostring(zEq, format.mintick) + ")", alert.freq_once_per_bar_close)
@@ -547,7 +676,7 @@ tblSize = switch tblSizeIn
     "Normal" => size.normal
     "Large"  => size.large
     => size.small
-var table tbl = table.new(tblPos, 5, 6, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 5, 8, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 cell(int c, int r, string txt, color tc = color.white) =>
     table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
@@ -560,8 +689,10 @@ tfRow(int r, string name, bool running, int d, float pct, int bars, int nU, int 
 if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
     table.merge_cells(tbl, 0, 5, 4, 5)
+    table.merge_cells(tbl, 0, 6, 4, 6)
+    table.merge_cells(tbl, 0, 7, 4, 7)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.4 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
+    table.cell(tbl, 0, 0, "Impulse Legs v1.5 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
@@ -584,3 +715,11 @@ if tblOn and barstate.islast
                     openDn += 1
         table.cell(tbl, 0, 5, "Fair value gaps in this chart's legs: " + str.tostring(nGaps) + " found · " + str.tostring(nFilled) + " filled · open now " + str.tostring(openUp) + " below price side (legs up), " +
              str.tostring(openDn) + " above (legs down)", text_color = color.silver, text_size = tblSize, text_halign = text.align_left)
+    if pdOn and pdTrack
+        for k = 0 to 1
+            int w = array.get(zWin, k)
+            int l = array.get(zLoss, k)
+            int z = array.get(zNone, k)
+            table.cell(tbl, 0, 6 + k, "Zones after legs " + (k == 0 ? "up" : "down") + ":  " + str.tostring(w) + " wins · " + str.tostring(l) + " losses" +
+                 (w + l > 0 ? " · win rate " + str.tostring(w / (w + l) * 100.0, "#") + "%" : "") + " · " + str.tostring(z) + " no pullback",
+                 text_color = k == 0 ? upC : dnC, text_size = tblSize, text_halign = text.align_left)
