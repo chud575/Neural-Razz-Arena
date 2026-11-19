@@ -1,6 +1,7 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.2
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.3
 // Changelog
+//  v1.3  A star above the candle where price enters the discount / premium half of a leg's zone, in the leg's colour
 //  v1.2  Premium / discount zone after each finished leg (box with a midline, extends until price enters the discount half or a new leg appears);
 //        optional filter to show only legs that go with the trend (on the leg's own timeframe or one chosen timeframe)
 //  v1.1  Fair value gaps inside this chart's impulse legs: boxes that extend until the gap is filled, with touched / filled states
@@ -28,7 +29,7 @@
 //    or swing structure.
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.2", shorttitle = "Impulse Legs v1.2", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.3", shorttitle = "Impulse Legs v1.3", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -80,6 +81,8 @@ pdDiscCol = input.color(color.new(color.teal, 0), "Discount half", group = grpZ,
 pdEqCol   = input.color(color.new(color.white, 0), "Midline", group = grpZ, inline = "z")
 pdFillT   = input.int(88, "Fill transparency", minval = 0, maxval = 100, group = grpZ)
 pdLbl     = input.bool(true, "Label the zone (under the box)", group = grpZ)
+pdStar    = input.bool(true, "Mark the candle where price enters the half with a star (in the leg's colour)", group = grpZ)
+pdStarSize = input.string("Large", "Star size", options = ["Small", "Normal", "Large", "Huge"], group = grpZ)
 pdAlert   = input.bool(false, "Alert when price enters the discount / premium half", group = grpZ)
 
 grpF = "Fair value gaps (this chart's legs)"
@@ -484,6 +487,9 @@ if zOn
     if inHalf or s0
         zOn := false
         zEntered := inHalf
+        if inHalf and pdStar
+            label.new(time, high, "✱", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_none, textcolor = zDir == 1 ? upC : dnC,
+                 size = pdStarSize == "Small" ? size.small : pdStarSize == "Normal" ? size.normal : pdStarSize == "Huge" ? size.huge : size.large)
         if not na(zLb)
             label.set_text(zLb, zoneLabel(inHalf ? (zDir == 1 ? "\nprice entered discount" : "\nprice entered premium") : "\nended by a new leg"))
             label.set_color(zLb, color.new(color.gray, 30))
@@ -548,7 +554,7 @@ if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
     table.merge_cells(tbl, 0, 5, 4, 5)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.2 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
+    table.cell(tbl, 0, 0, "Impulse Legs v1.3 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
