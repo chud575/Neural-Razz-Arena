@@ -1,6 +1,7 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.3
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.4
 // Changelog
+//  v1.4  Premium / discount zone of a leg UP: the upper half is now the discount half and the lower half the premium half (setting to switch back)
 //  v1.3  A star above the candle where price enters the discount / premium half of a leg's zone, in the leg's colour
 //  v1.2  Premium / discount zone after each finished leg (box with a midline, extends until price enters the discount half or a new leg appears);
 //        optional filter to show only legs that go with the trend (on the leg's own timeframe or one chosen timeframe)
@@ -22,14 +23,15 @@
 //    to the right until price trades all the way through the gap ("filled"); it fades once price has traded back
 //    into it ("touched").
 //  · Premium / discount zone: when a leg on this chart finishes, a box covers the whole leg with a line through its
-//    middle (equilibrium). For a leg up the lower half is the DISCOUNT half; for a leg down the upper half is the
-//    PREMIUM half. The box extends to the right until price trades into that half, or a new impulse leg appears.
+//    middle (equilibrium). For a leg down the upper half is premium and the lower half discount; for a leg up the
+//    halves are swapped (upper = discount, lower = premium) unless you turn that off. The box extends to the right
+//    until price pulls back through the midline (down after a leg up, up after a leg down), or a new leg appears.
 //  · Trend filter (optional): only legs that go WITH the trend are shown and counted. The trend can be read on the
 //    leg's own timeframe or on one timeframe you choose, from two moving averages, price against one moving average,
 //    or swing structure.
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.3", shorttitle = "Impulse Legs v1.3", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.4", shorttitle = "Impulse Legs v1.4", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -76,14 +78,16 @@ trendSwing = input.int(5, "Swing length (for swing structure)", minval = 1, maxv
 
 grpZ = "Premium / discount zone (this chart's legs)"
 pdOn      = input.bool(true, "Draw a premium / discount zone after each finished leg", group = grpZ)
+pdSwapUp  = input.bool(true, "Legs up: upper half is discount, lower half is premium", group = grpZ,
+     tooltip = "On: after a leg up the upper half is drawn as discount and the lower half as premium. Off: upper = premium, lower = discount for every leg.")
 pdPremCol = input.color(color.new(color.red, 0), "Premium half", group = grpZ, inline = "z")
 pdDiscCol = input.color(color.new(color.teal, 0), "Discount half", group = grpZ, inline = "z")
 pdEqCol   = input.color(color.new(color.white, 0), "Midline", group = grpZ, inline = "z")
 pdFillT   = input.int(88, "Fill transparency", minval = 0, maxval = 100, group = grpZ)
 pdLbl     = input.bool(true, "Label the zone (under the box)", group = grpZ)
-pdStar    = input.bool(true, "Mark the candle where price enters the half with a star (in the leg's colour)", group = grpZ)
+pdStar    = input.bool(true, "Mark the candle where price pulls back through the midline with a star (in the leg's colour)", group = grpZ)
 pdStarSize = input.string("Large", "Star size", options = ["Small", "Normal", "Large", "Huge"], group = grpZ)
-pdAlert   = input.bool(false, "Alert when price enters the discount / premium half", group = grpZ)
+pdAlert   = input.bool(false, "Alert when price pulls back through the midline", group = grpZ)
 
 grpF = "Fair value gaps (this chart's legs)"
 fvgOn     = input.bool(true, "Show fair value gaps inside impulse legs", group = grpF)
@@ -475,7 +479,7 @@ var line  zMid  = na
 var label zLb   = na
 bool zEntered = false
 zoneLabel(string state) =>
-    (zDir == 1 ? "Discount below " : "Premium above ") + str.tostring(zEq, format.mintick) + state
+    "Midline " + str.tostring(zEq, format.mintick) + state
 // the open zone: extend it, and end it when price enters the half that matters or a new leg appears
 if zOn
     box.set_right(zPrem, time)
@@ -491,7 +495,7 @@ if zOn
             label.new(time, high, "✱", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_none, textcolor = zDir == 1 ? upC : dnC,
                  size = pdStarSize == "Small" ? size.small : pdStarSize == "Normal" ? size.normal : pdStarSize == "Huge" ? size.huge : size.large)
         if not na(zLb)
-            label.set_text(zLb, zoneLabel(inHalf ? (zDir == 1 ? "\nprice entered discount" : "\nprice entered premium") : "\nended by a new leg"))
+            label.set_text(zLb, zoneLabel(inHalf ? (zDir == 1 ? "\nprice pulled back below it" : "\nprice pulled back above it") : "\nended by a new leg"))
             label.set_color(zLb, color.new(color.gray, 30))
 // a leg on this chart has just finished: open its zone
 if pdOn and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
@@ -510,14 +514,17 @@ if pdOn and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
             if zDir == 1 ? low[k] <= zEq : high[k] >= zEq
                 already := true
                 break
-    zPrem := box.new(cFST, hi, time, zEq, xloc = xloc.bar_time, border_color = color.new(pdPremCol, 60), bgcolor = color.new(pdPremCol, pdFillT))
-    zDisc := box.new(cFST, zEq, time, lo, xloc = xloc.bar_time, border_color = color.new(pdDiscCol, 60), bgcolor = color.new(pdDiscCol, pdFillT))
+    bool  flip   = zDir == 1 and pdSwapUp                  // leg up: discount on top, premium below
+    color topCol = flip ? pdDiscCol : pdPremCol
+    color botCol = flip ? pdPremCol : pdDiscCol
+    zPrem := box.new(cFST, hi, time, zEq, xloc = xloc.bar_time, border_color = color.new(topCol, 60), bgcolor = color.new(topCol, pdFillT))
+    zDisc := box.new(cFST, zEq, time, lo, xloc = xloc.bar_time, border_color = color.new(botCol, 60), bgcolor = color.new(botCol, pdFillT))
     zMid  := line.new(cFST, zEq, time, zEq, xloc = xloc.bar_time, color = pdEqCol, width = 1)
     zOn   := not already and not s0
     zLb   := pdLbl ? label.new(int((zT0 + time) / 2), lo, zoneLabel(already ? "\nalready reached" : ""), xloc = xloc.bar_time,
-         style = label.style_label_up, color = color.new(already ? color.gray : (zDir == 1 ? pdDiscCol : pdPremCol), 25), textcolor = color.white, size = lblSize) : na
+         style = label.style_label_up, color = color.new(already ? color.gray : (zDir == 1 ? upC : dnC), 25), textcolor = color.white, size = lblSize) : na
 if pdAlert and zEntered
-    alert("Price entered the " + (zDir == 1 ? "discount" : "premium") + " half of the last impulse leg — " + syminfo.ticker + " " + timeframe.period + " (equilibrium " +
+    alert("Price pulled back through the midline of the last impulse leg " + (zDir == 1 ? "(leg up)" : "(leg down)") + " — " + syminfo.ticker + " " + timeframe.period + " (equilibrium " +
          str.tostring(zEq, format.mintick) + ")", alert.freq_once_per_bar_close)
 
 if alertOn
@@ -554,7 +561,7 @@ if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
     table.merge_cells(tbl, 0, 5, 4, 5)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.3 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
+    table.cell(tbl, 0, 0, "Impulse Legs v1.4 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
