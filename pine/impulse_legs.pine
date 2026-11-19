@@ -1,6 +1,8 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.1
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.2
 // Changelog
+//  v1.2  Premium / discount zone after each finished leg (box with a midline, extends until price enters the discount half or a new leg appears);
+//        optional filter to show only legs that go with the trend (on the leg's own timeframe or one chosen timeframe)
 //  v1.1  Fair value gaps inside this chart's impulse legs: boxes that extend until the gap is filled, with touched / filled states
 //  v1.0  First version
 //
@@ -18,9 +20,15 @@
 //    legs down). Gaps that form INSIDE an impulse leg on this chart, in the leg's direction, are boxed. A box extends
 //    to the right until price trades all the way through the gap ("filled"); it fades once price has traded back
 //    into it ("touched").
+//  · Premium / discount zone: when a leg on this chart finishes, a box covers the whole leg with a line through its
+//    middle (equilibrium). For a leg up the lower half is the DISCOUNT half; for a leg down the upper half is the
+//    PREMIUM half. The box extends to the right until price trades into that half, or a new impulse leg appears.
+//  · Trend filter (optional): only legs that go WITH the trend are shown and counted. The trend can be read on the
+//    leg's own timeframe or on one timeframe you choose, from two moving averages, price against one moving average,
+//    or swing structure.
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.1", shorttitle = "Impulse Legs v1.1", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.2", shorttitle = "Impulse Legs v1.2", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -52,6 +60,27 @@ dn2   = input.color(color.new(color.fuchsia, 0), "Leg down", group = grp2, inlin
 wid2  = input.int(6, "Thickness", minval = 1, maxval = 10, group = grp2, inline = "c")
 closedOnly = input.bool(true, "Higher timeframes: closed candles only (no repainting)", group = grp2,
      tooltip = "On: a higher-timeframe leg appears and grows only when that timeframe's candle closes.\nOff: uses the candle in progress — earlier, but a leg can appear and vanish before the candle closes.")
+
+grpT = "Trend filter"
+trendOn   = input.bool(false, "Only show legs that go with the trend", group = grpT,
+     tooltip = "Legs up are kept only in an uptrend, legs down only in a downtrend. Hidden legs are not drawn, not counted in the table, and get no gaps or zones.")
+trendSrc  = input.string("The leg's own timeframe", "Trend measured on", options = ["The leg's own timeframe", "One chosen timeframe"], group = grpT,
+     tooltip = "The leg's own timeframe: a 15m leg is checked against the 15m trend, a 4h leg against the 4h trend.\nOne chosen timeframe: every leg is checked against the trend of the timeframe below.")
+trendTF   = input.timeframe("D", "Chosen timeframe", group = grpT)
+trendMethod = input.string("Fast EMA above slow EMA", "Trend is up when", options = ["Fast EMA above slow EMA", "Price above slow EMA", "Swing structure (last break was up)"], group = grpT,
+     tooltip = "The two EMA methods change slowly, so one impulse leg cannot flip them. Swing structure flips as soon as a candle closes beyond the latest swing high or low, which a strong leg usually does by itself.")
+emaFast   = input.int(50, "Fast EMA", minval = 2, group = grpT, inline = "e")
+emaSlow   = input.int(200, "Slow EMA", minval = 3, group = grpT, inline = "e")
+trendSwing = input.int(5, "Swing length (for swing structure)", minval = 1, maxval = 50, group = grpT)
+
+grpZ = "Premium / discount zone (this chart's legs)"
+pdOn      = input.bool(true, "Draw a premium / discount zone after each finished leg", group = grpZ)
+pdPremCol = input.color(color.new(color.red, 0), "Premium half", group = grpZ, inline = "z")
+pdDiscCol = input.color(color.new(color.teal, 0), "Discount half", group = grpZ, inline = "z")
+pdEqCol   = input.color(color.new(color.white, 0), "Midline", group = grpZ, inline = "z")
+pdFillT   = input.int(88, "Fill transparency", minval = 0, maxval = 100, group = grpZ)
+pdLbl     = input.bool(true, "Label the zone (under the box)", group = grpZ)
+pdAlert   = input.bool(false, "Alert when price enters the discount / premium half", group = grpZ)
 
 grpF = "Fair value gaps (this chart's legs)"
 fvgOn     = input.bool(true, "Show fair value gaps inside impulse legs", group = grpF)
@@ -247,6 +276,36 @@ draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid, int s
         lb := na
     [st == 1, lastD, lastPct, lastBars, nUp, nDn, nUp > 0 ? sumUp / nUp : na, nDn > 0 ? sumDn / nDn : na, started]
 
+// ───────────────────────────── Trend ─────────────────────────────
+trendDir() =>
+    float f  = ta.ema(close, emaFast)
+    float sl = ta.ema(close, emaSlow)
+    var int   ms = 0
+    var float sh = na
+    var float sw = na
+    float ph = ta.pivothigh(high, trendSwing, trendSwing)
+    float pl = ta.pivotlow(low, trendSwing, trendSwing)
+    if not na(ph)
+        sh := ph
+    if not na(pl)
+        sw := pl
+    if not na(sh) and close > sh
+        ms := 1
+    else if not na(sw) and close < sw
+        ms := -1
+    trendMethod == "Fast EMA above slow EMA" ? (f > sl ? 1 : f < sl ? -1 : 0) : trendMethod == "Price above slow EMA" ? (close > sl ? 1 : close < sl ? -1 : 0) : ms
+trendClosed() =>
+    int t = trendDir()
+    t[1]
+int trC  = trendDir()
+int trH1 = request.security(syminfo.tickerid, tf1, trendClosed(), lookahead = barmerge.lookahead_on)
+int trH2 = request.security(syminfo.tickerid, tf2, trendClosed(), lookahead = barmerge.lookahead_on)
+int trX  = request.security(syminfo.tickerid, trendTF, trendClosed(), lookahead = barmerge.lookahead_on)
+bool ownTF = trendSrc == "The leg's own timeframe"
+int trendC = ownTF ? trC : nz(trX)
+int trend1 = ownTF ? nz(trH1) : nz(trX)
+int trend2 = ownTF ? nz(trH2) : nz(trX)
+
 // ───────────────────────────── Run ─────────────────────────────
 [cA, cD, cST, cSP, cET, cEP, cBars, cAtr, cF, cFD, cFST, cFSP, cFET, cFEP, cFB, cFA] = leg()
 [xA, xD, xST, xSP, xET, xEP, xBars, xAtr, xF, xFD, xFST, xFSP, xFET, xFEP, xFB, xFA] = request.security(syminfo.tickerid, tf1, legClosed(), lookahead = barmerge.lookahead_on)
@@ -254,13 +313,23 @@ draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid, int s
 [yA, yD, yST, ySP, yET, yEP, yBars, yAtr, yF, yFD, yFST, yFSP, yFET, yFEP, yFB, yFA] = request.security(syminfo.tickerid, tf2, legClosed(), lookahead = barmerge.lookahead_on)
 [mA, mD, mST, mSP, mET, mEP, mBars, mAtr, mF, mFD, mFST, mFSP, mFET, mFEP, mFB, mFA] = request.security(syminfo.tickerid, tf2, leg())
 
-[rc0, d0, p0, b0, u0, n0, au0, ad0, s0] = draw(onC, true, "", upC, dnC, widC, cA, cD, cST, cSP, cET, cEP, cBars, cAtr, cF, cFD, cFST, cFSP, cFET, cFEP, cFB, cFA)
+// trend filter: a leg against the trend is treated as if it were not there
+int  cAM = trendOn and cD != trendC ? 0 : cA
+bool cFM = cF and (not trendOn or cFD == trendC)
+int  h1d = closedOnly ? xD : lD
+int  h1A = trendOn and h1d != trend1 ? 0 : (closedOnly ? xA : lA)
+bool h1F = (closedOnly ? xF : lF) and (not trendOn or (closedOnly ? xFD : lFD) == trend1)
+int  h2d = closedOnly ? yD : mD
+int  h2A = trendOn and h2d != trend2 ? 0 : (closedOnly ? yA : mA)
+bool h2F = (closedOnly ? yF : mF) and (not trendOn or (closedOnly ? yFD : mFD) == trend2)
+
+[rc0, d0, p0, b0, u0, n0, au0, ad0, s0] = draw(onC, true, "", upC, dnC, widC, cAM, cD, cST, cSP, cET, cEP, cBars, cAtr, cFM, cFD, cFST, cFSP, cFET, cFEP, cFB, cFA)
 [rc1, d1, p1, b1, u1, n1, au1, ad1, s1] = draw(on1, true, tfLabel(tf1) + " ", up1, dn1, wid1,
-     closedOnly ? xA : lA, closedOnly ? xD : lD, closedOnly ? xST : lST, closedOnly ? xSP : lSP, closedOnly ? xET : lET, closedOnly ? xEP : lEP, closedOnly ? xBars : lBars, closedOnly ? xAtr : lAtr,
-     closedOnly ? xF : lF, closedOnly ? xFD : lFD, closedOnly ? xFST : lFST, closedOnly ? xFSP : lFSP, closedOnly ? xFET : lFET, closedOnly ? xFEP : lFEP, closedOnly ? xFB : lFB, closedOnly ? xFA : lFA)
+     h1A, closedOnly ? xD : lD, closedOnly ? xST : lST, closedOnly ? xSP : lSP, closedOnly ? xET : lET, closedOnly ? xEP : lEP, closedOnly ? xBars : lBars, closedOnly ? xAtr : lAtr,
+     h1F, closedOnly ? xFD : lFD, closedOnly ? xFST : lFST, closedOnly ? xFSP : lFSP, closedOnly ? xFET : lFET, closedOnly ? xFEP : lFEP, closedOnly ? xFB : lFB, closedOnly ? xFA : lFA)
 [rc2, d2, p2, b2, u2, n2, au2, ad2, s2] = draw(on2, true, tfLabel(tf2) + " ", up2, dn2, wid2,
-     closedOnly ? yA : mA, closedOnly ? yD : mD, closedOnly ? yST : mST, closedOnly ? ySP : mSP, closedOnly ? yET : mET, closedOnly ? yEP : mEP, closedOnly ? yBars : mBars, closedOnly ? yAtr : mAtr,
-     closedOnly ? yF : mF, closedOnly ? yFD : mFD, closedOnly ? yFST : mFST, closedOnly ? yFSP : mFSP, closedOnly ? yFET : mFET, closedOnly ? yFEP : mFEP, closedOnly ? yFB : mFB, closedOnly ? yFA : mFA)
+     h2A, closedOnly ? yD : mD, closedOnly ? yST : mST, closedOnly ? ySP : mSP, closedOnly ? yET : mET, closedOnly ? yEP : mEP, closedOnly ? yBars : mBars, closedOnly ? yAtr : mAtr,
+     h2F, closedOnly ? yFD : mFD, closedOnly ? yFST : mFST, closedOnly ? yFSP : mFSP, closedOnly ? yFET : mFET, closedOnly ? yFEP : mFEP, closedOnly ? yFB : mFB, closedOnly ? yFA : mFA)
 
 // ───────────────────────────── Fair value gaps ─────────────────────────────
 atrF = ta.atr(atrLen)
@@ -374,9 +443,9 @@ addGaps(int d, int t0, int t1) =>
     added
 
 if fvgOn and onC
-    if cF and not na(cFST)
+    if cFM and not na(cFST)
         nGaps += addGaps(cFD, cFST, cFET)
-    if cA == 1 and not na(cST)
+    if cAM == 1 and not na(cST)
         nGaps += addGaps(cD, cST, cET)
     while array.size(fBox) > fvgMax
         dropGap(0)
@@ -389,6 +458,61 @@ if fvgOn and onC
         array.shift(fTouched)
 if fvgAlert and gapTouchNow
     alert("Price traded back into a fair value gap of an impulse leg — " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Premium / discount zone ─────────────────────────────
+var bool  zOn  = false
+var int   zDir = 0
+var float zEq  = na
+var float zLo  = na
+var int   zT0  = na
+var int   zId  = na
+var box   zPrem = na
+var box   zDisc = na
+var line  zMid  = na
+var label zLb   = na
+bool zEntered = false
+zoneLabel(string state) =>
+    (zDir == 1 ? "Discount below " : "Premium above ") + str.tostring(zEq, format.mintick) + state
+// the open zone: extend it, and end it when price enters the half that matters or a new leg appears
+if zOn
+    box.set_right(zPrem, time)
+    box.set_right(zDisc, time)
+    line.set_x2(zMid, time)
+    if not na(zLb)
+        label.set_x(zLb, int((zT0 + time) / 2))
+    bool inHalf = zDir == 1 ? low <= zEq : high >= zEq
+    if inHalf or s0
+        zOn := false
+        zEntered := inHalf
+        if not na(zLb)
+            label.set_text(zLb, zoneLabel(inHalf ? (zDir == 1 ? "\nprice entered discount" : "\nprice entered premium") : "\nended by a new leg"))
+            label.set_color(zLb, color.new(color.gray, 30))
+// a leg on this chart has just finished: open its zone
+if pdOn and onC and cFM and not na(cFSP) and (na(zId) or zId != cFST)
+    zId  := cFST
+    float hi = math.max(cFSP, cFEP)
+    float lo = math.min(cFSP, cFEP)
+    zDir := cFD
+    zEq  := (hi + lo) / 2
+    zLo  := lo
+    zT0  := cFST
+    // has price already been in that half since the leg's extreme?
+    bool already = false
+    int  back = math.min(int((time - cFET) / math.max(time - time[1], 1)), 400)
+    if back > 0
+        for k = 0 to back - 1
+            if zDir == 1 ? low[k] <= zEq : high[k] >= zEq
+                already := true
+                break
+    zPrem := box.new(cFST, hi, time, zEq, xloc = xloc.bar_time, border_color = color.new(pdPremCol, 60), bgcolor = color.new(pdPremCol, pdFillT))
+    zDisc := box.new(cFST, zEq, time, lo, xloc = xloc.bar_time, border_color = color.new(pdDiscCol, 60), bgcolor = color.new(pdDiscCol, pdFillT))
+    zMid  := line.new(cFST, zEq, time, zEq, xloc = xloc.bar_time, color = pdEqCol, width = 1)
+    zOn   := not already and not s0
+    zLb   := pdLbl ? label.new(int((zT0 + time) / 2), lo, zoneLabel(already ? "\nalready reached" : ""), xloc = xloc.bar_time,
+         style = label.style_label_up, color = color.new(already ? color.gray : (zDir == 1 ? pdDiscCol : pdPremCol), 25), textcolor = color.white, size = lblSize) : na
+if pdAlert and zEntered
+    alert("Price entered the " + (zDir == 1 ? "discount" : "premium") + " half of the last impulse leg — " + syminfo.ticker + " " + timeframe.period + " (equilibrium " +
+         str.tostring(zEq, format.mintick) + ")", alert.freq_once_per_bar_close)
 
 if alertOn
     if s0 and onC
@@ -424,7 +548,7 @@ if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
     table.merge_cells(tbl, 0, 5, 4, 5)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.1 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean",
+    table.cell(tbl, 0, 0, "Impulse Legs v1.2 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
