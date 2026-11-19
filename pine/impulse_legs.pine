@@ -1,6 +1,7 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.0
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.1
 // Changelog
+//  v1.1  Fair value gaps inside this chart's impulse legs: boxes that extend until the gap is filled, with touched / filled states
 //  v1.0  First version
 //
 // Marks IMPULSE LEGS: fast, one-directional moves that cover far more ground than the chop around them.
@@ -13,9 +14,13 @@
 //  · The same reading runs on up to two higher timeframes, drawn on this chart in their own colours and thickness.
 //  · Table: for each timeframe the current or last leg (direction, size, length) and the count and average size of
 //    legs up and legs down. Alerts when a leg starts.
+//  · Fair value gaps (FVG): three candles where the third candle's low is above the first candle's high (mirrored for
+//    legs down). Gaps that form INSIDE an impulse leg on this chart, in the leg's direction, are boxed. A box extends
+//    to the right until price trades all the way through the gap ("filled"); it fades once price has traded back
+//    into it ("touched").
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.0", shorttitle = "Impulse Legs v1.0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.1", shorttitle = "Impulse Legs v1.1", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -47,6 +52,17 @@ dn2   = input.color(color.new(color.fuchsia, 0), "Leg down", group = grp2, inlin
 wid2  = input.int(6, "Thickness", minval = 1, maxval = 10, group = grp2, inline = "c")
 closedOnly = input.bool(true, "Higher timeframes: closed candles only (no repainting)", group = grp2,
      tooltip = "On: a higher-timeframe leg appears and grows only when that timeframe's candle closes.\nOff: uses the candle in progress — earlier, but a leg can appear and vanish before the candle closes.")
+
+grpF = "Fair value gaps (this chart's legs)"
+fvgOn     = input.bool(true, "Show fair value gaps inside impulse legs", group = grpF)
+fvgMinAtr = input.float(0.0, "Ignore gaps smaller than (× ATR)", minval = 0.0, step = 0.05, group = grpF)
+fvgFilled = input.string("Stop extending, keep faded", "When a gap is filled", options = ["Stop extending, keep faded", "Delete"], group = grpF)
+fvgMid    = input.bool(true, "Draw the midline of each gap", group = grpF)
+fvgLbl    = input.bool(false, "Label each gap", group = grpF)
+fvgMax    = input.int(30, "Max open gaps shown", minval = 1, maxval = 200, group = grpF)
+fvgUpCol  = input.color(color.new(color.lime, 0), "Gap in a leg up", group = grpF, inline = "f")
+fvgDnCol  = input.color(color.new(color.red, 0), "Gap in a leg down", group = grpF, inline = "f")
+fvgAlert  = input.bool(false, "Alert when price first trades back into a gap", group = grpF)
 
 grpV = "Visuals"
 showLive = input.bool(true, "Show legs still in progress (dashed)", group = grpV)
@@ -246,6 +262,134 @@ draw(bool on, bool newBar, string name, color upCol, color dnCol, int wid, int s
      closedOnly ? yA : mA, closedOnly ? yD : mD, closedOnly ? yST : mST, closedOnly ? ySP : mSP, closedOnly ? yET : mET, closedOnly ? yEP : mEP, closedOnly ? yBars : mBars, closedOnly ? yAtr : mAtr,
      closedOnly ? yF : mF, closedOnly ? yFD : mFD, closedOnly ? yFST : mFST, closedOnly ? yFSP : mFSP, closedOnly ? yFET : mFET, closedOnly ? yFEP : mFEP, closedOnly ? yFB : mFB, closedOnly ? yFA : mFA)
 
+// ───────────────────────────── Fair value gaps ─────────────────────────────
+atrF = ta.atr(atrLen)
+// every gap as it forms (kept for a while, because a leg is only recognised a few bars in)
+var array<int>   gT   = array.new<int>()        // time of the middle candle
+var array<float> gTop = array.new<float>()
+var array<float> gBot = array.new<float>()
+var array<int>   gDir = array.new<int>()
+var array<bool>  gUsed = array.new<bool>()
+var array<int>   gBar = array.new<int>()       // bar on which the gap was complete (its third candle)
+bool upGap = bar_index > 2 and low > high[2] and (na(atrF) or low - high[2] >= fvgMinAtr * atrF)
+bool dnGap = bar_index > 2 and high < low[2] and (na(atrF) or low[2] - high >= fvgMinAtr * atrF)
+if upGap or dnGap
+    array.push(gT, time[1])
+    array.push(gTop, upGap ? low : low[2])
+    array.push(gBot, upGap ? high[2] : high)
+    array.push(gDir, upGap ? 1 : -1)
+    array.push(gUsed, false)
+    array.push(gBar, bar_index)
+    if array.size(gT) > 120
+        array.shift(gBar)
+        array.shift(gT)
+        array.shift(gTop)
+        array.shift(gBot)
+        array.shift(gDir)
+        array.shift(gUsed)
+
+// gaps being shown
+var array<box>   fBox  = array.new<box>()
+var array<line>  fMid  = array.new<line>()
+var array<label> fLab  = array.new<label>()
+var array<float> fTop  = array.new<float>()
+var array<float> fBot  = array.new<float>()
+var array<int>   fDir  = array.new<int>()
+var array<bool>  fTouched = array.new<bool>()
+var int nFilled = 0
+var int nGaps   = 0
+bool gapTouchNow = false
+
+dropGap(int i) =>
+    box.delete(array.get(fBox, i))
+    line.delete(array.get(fMid, i))
+    label.delete(array.get(fLab, i))
+
+// 1) follow the gaps on the chart: touched? filled?
+if array.size(fBox) > 0
+    for i = array.size(fBox) - 1 to 0
+        int   d   = array.get(fDir, i)
+        float top = array.get(fTop, i)
+        float bot = array.get(fBot, i)
+        box   b   = array.get(fBox, i)
+        color c   = d == 1 ? fvgUpCol : fvgDnCol
+        box.set_right(b, time)
+        if not na(array.get(fMid, i))
+            line.set_x2(array.get(fMid, i), time)
+        bool filled = d == 1 ? low <= bot : high >= top
+        bool touch  = d == 1 ? low <= top : high >= bot
+        if touch and not array.get(fTouched, i)
+            array.set(fTouched, i, true)
+            gapTouchNow := true
+            box.set_bgcolor(b, color.new(c, 90))
+            box.set_border_style(b, line.style_dashed)
+        if filled
+            nFilled += 1
+            if fvgFilled == "Delete"
+                dropGap(i)
+            else
+                box.set_bgcolor(b, color.new(color.gray, 92))
+                box.set_border_color(b, color.new(color.gray, 60))
+                label.delete(array.get(fLab, i))
+            array.remove(fBox, i)
+            array.remove(fMid, i)
+            array.remove(fLab, i)
+            array.remove(fTop, i)
+            array.remove(fBot, i)
+            array.remove(fDir, i)
+            array.remove(fTouched, i)
+
+// 2) gaps that fall inside the leg that is running, or the leg that just finished
+addGaps(int d, int t0, int t1) =>
+    int added = 0
+    if array.size(gT) > 0
+        for i = 0 to array.size(gT) - 1
+            if not array.get(gUsed, i) and array.get(gDir, i) == d and array.get(gT, i) >= t0 and array.get(gT, i) <= t1
+                array.set(gUsed, i, true)
+                float top = array.get(gTop, i)
+                float bot = array.get(gBot, i)
+                // skip a gap that price has already traded through since it formed; note one already traded into
+                bool gone = false
+                bool wasTouched = false
+                int  back = bar_index - array.get(gBar, i)
+                if back > 0
+                    for k = 0 to back - 1
+                        if d == 1 ? low[k] <= bot : high[k] >= top
+                            gone := true
+                            break
+                        if d == 1 ? low[k] <= top : high[k] >= bot
+                            wasTouched := true
+                if not gone
+                    color c = d == 1 ? fvgUpCol : fvgDnCol
+                    array.push(fBox, box.new(array.get(gT, i), top, time, bot, xloc = xloc.bar_time, border_color = color.new(c, 40), bgcolor = color.new(c, wasTouched ? 90 : 80),
+                         border_style = wasTouched ? line.style_dashed : line.style_solid))
+                    array.push(fMid, fvgMid ? line.new(array.get(gT, i), (top + bot) / 2, time, (top + bot) / 2, xloc = xloc.bar_time, color = color.new(c, 50), style = line.style_dotted) : na)
+                    array.push(fLab, fvgLbl ? label.new(array.get(gT, i), d == 1 ? bot : top, "FVG", xloc = xloc.bar_time, style = d == 1 ? label.style_label_up : label.style_label_down,
+                         color = color.new(c, 100), textcolor = c, size = size.small) : na)
+                    array.push(fTop, top)
+                    array.push(fBot, bot)
+                    array.push(fDir, d)
+                    array.push(fTouched, wasTouched)
+                    added += 1
+    added
+
+if fvgOn and onC
+    if cF and not na(cFST)
+        nGaps += addGaps(cFD, cFST, cFET)
+    if cA == 1 and not na(cST)
+        nGaps += addGaps(cD, cST, cET)
+    while array.size(fBox) > fvgMax
+        dropGap(0)
+        array.shift(fBox)
+        array.shift(fMid)
+        array.shift(fLab)
+        array.shift(fTop)
+        array.shift(fBot)
+        array.shift(fDir)
+        array.shift(fTouched)
+if fvgAlert and gapTouchNow
+    alert("Price traded back into a fair value gap of an impulse leg — " + syminfo.ticker + " " + timeframe.period + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
 if alertOn
     if s0 and onC
         alert("Impulse leg " + (d0 == 1 ? "UP" : "DOWN") + " started on " + syminfo.ticker + " " + timeframe.period + " (" + str.tostring(p0, "#.##") + "% so far)", alert.freq_once_per_bar_close)
@@ -266,7 +410,7 @@ tblSize = switch tblSizeIn
     "Normal" => size.normal
     "Large"  => size.large
     => size.small
-var table tbl = table.new(tblPos, 5, 5, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+var table tbl = table.new(tblPos, 5, 6, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.gray, frame_width = 1)
 cell(int c, int r, string txt, color tc = color.white) =>
     table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
@@ -278,8 +422,9 @@ tfRow(int r, string name, bool running, int d, float pct, int bars, int nU, int 
     cell(4, r, str.tostring(nD) + (na(aD) ? "" : " · avg " + str.tostring(aD, "#.##") + "%"), cd)
 if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 0, 4, 0)
+    table.merge_cells(tbl, 0, 5, 4, 5)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.0 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean",
+    table.cell(tbl, 0, 0, "Impulse Legs v1.1 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean",
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
@@ -291,3 +436,14 @@ if tblOn and barstate.islast
         tfRow(3, tfLabel(tf1), rc1, d1, p1, b1, u1, n1, au1, ad1, up1, dn1)
     if on2
         tfRow(4, tfLabel(tf2), rc2, d2, p2, b2, u2, n2, au2, ad2, up2, dn2)
+    if fvgOn
+        int openUp = 0
+        int openDn = 0
+        if array.size(fDir) > 0
+            for i = 0 to array.size(fDir) - 1
+                if array.get(fDir, i) == 1
+                    openUp += 1
+                else
+                    openDn += 1
+        table.cell(tbl, 0, 5, "Fair value gaps in this chart's legs: " + str.tostring(nGaps) + " found · " + str.tostring(nFilled) + " filled · open now " + str.tostring(openUp) + " below price side (legs up), " +
+             str.tostring(openDn) + " above (legs down)", text_color = color.silver, text_size = tblSize, text_halign = text.align_left)
