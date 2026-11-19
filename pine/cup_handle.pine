@@ -1,0 +1,358 @@
+//@version=6
+// Cup & Handle (and Inverted)   ·   v1.0
+// Changelog
+//  v1.0  First version
+//
+// Finds CUP & HANDLE patterns (traded long) and INVERTED cup & handle patterns (traded short), with a built-in
+// performance tracker. Python twin: python/cup_handle_backtest.py (same rules, so the numbers should match).
+//
+//  1. Pattern: the last four alternating swings are  A high (left rim) – B low (cup bottom) – C high (right rim) –
+//              D low (handle). With depth = C − B:
+//                · depth is at least X × ATR
+//                · the two rims are level (within "rim tolerance" × depth)
+//                · the handle is shallow: it gives back between "min" and "max" of the depth
+//                · the cup is not lopsided, and the handle is short compared with the cup
+//                · optional prior advance into the left rim
+//              The pattern is known when the handle low D is confirmed ("swing length" bars after it).
+//  2. Entry:   the first close above the rim C. The pattern dies on a close below the handle low, or when the wait
+//              runs out.
+//  3. Stop:    the handle low, or half-way down the cup.
+//  4. Target:  measured move (rim + cup depth) or an R:R multiple.
+//  The inverted pattern is the mirror image.
+// Simulation (conservative): stop wins if stop and target are touched in the same bar; gaps fill at the open;
+// one trade at a time. Labels sit directly under (above, for inverted) the pattern they describe.
+indicator("Cup & Handle v1.0", shorttitle = "Cup & Handle v1.0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 100,
+     max_bars_back = 2000)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpP = "Pattern"
+pivLen     = input.int(10, "Swing length (bars each side)", minval = 2, maxval = 50, group = grpP,
+     tooltip = "Bigger = larger, slower cups. The handle low is confirmed this many bars after it forms.")
+minDepthAtr = input.float(3.0, "Min cup depth (× ATR 14)", minval = 0.0, step = 0.5, group = grpP)
+rimTol     = input.float(0.3, "Rims level within (× depth)", minval = 0.01, maxval = 1.0, step = 0.05, group = grpP)
+handleMin  = input.float(0.1, "Handle gives back at least (× depth)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+handleMax  = input.float(0.5, "Handle gives back at most (× depth)", minval = 0.05, maxval = 1.0, step = 0.05, group = grpP)
+symF       = input.float(3.0, "Cup symmetry (max ratio of the two halves)", minval = 1.0, step = 0.5, group = grpP)
+handleLen  = input.float(0.5, "Handle no longer than (× cup width)", minval = 0.05, step = 0.05, group = grpP)
+priorMin   = input.float(0.0, "Prior advance: price came from at least (× depth) below the rim, 0 = off", minval = 0.0, step = 0.25, group = grpP)
+showBull   = input.bool(true, "Cup & handle (longs)", group = grpP, inline = "s")
+showBear   = input.bool(true, "Inverted cup & handle (shorts)", group = grpP, inline = "s")
+
+grpE = "Trade (tracker)"
+stratOn   = input.bool(true, "Track the breakout trade", group = grpE)
+waitMult  = input.float(0.5, "Wait for the breakout up to (× cup width)", minval = 0.1, step = 0.1, group = grpE)
+stopMode  = input.string("Handle low", "Stop", options = ["Handle low", "Half-way down the cup"], group = grpE)
+tgtMode   = input.string("Measured move", "Target", options = ["Measured move", "R:R"], group = grpE)
+rrMult    = input.float(2.0, "R:R multiple (for Target = R:R)", minval = 0.1, step = 0.1, group = grpE)
+maxBars   = input.int(300, "Max bars in a trade", minval = 5, group = grpE)
+feesOn    = input.bool(true, "Include trading fees & funding", group = grpE,
+     tooltip = "Entry = taker fee. Exit at the target = maker fee, at the stop = taker fee. Funding per 8 hours held. Defaults: Bybit VIP 3.")
+takerPct  = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpE)
+makerPct  = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpE)
+funding8h = input.float(0.01,  "Funding per 8h (%)", step = 0.005, group = grpE)
+leverage  = input.float(10, "Leverage (for the liquidation check)", minval = 1, step = 1, group = grpE)
+mmrPct    = input.float(0.5, "Maintenance margin rate (%)", minval = 0.0, step = 0.1, group = grpE)
+showTrades = input.bool(true, "Label entries & exits", group = grpE)
+fcOn      = input.bool(true, "Forecast: show the breakout level while a pattern is waiting", group = grpE)
+alertPat  = input.bool(true, "Alert: pattern found", group = grpE, inline = "al")
+alertTrd  = input.bool(true, "Alert: breakout entry", group = grpE, inline = "al")
+
+grpV = "Visuals"
+showPat  = input.bool(true, "Draw the cup, handle and rim", group = grpV)
+curved   = input.bool(true, "Draw the cup as a curve", group = grpV)
+showLbl  = input.bool(true, "Label patterns", group = grpV)
+colBull  = input.color(color.new(color.teal, 0), "Cup & handle", group = grpV, inline = "c")
+colBear  = input.color(color.new(color.red, 0), "Inverted", group = grpV, inline = "c")
+lblSizeIn = input.string("Normal", "Label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpV)
+tblOn    = input.bool(true, "Show the results table", group = grpV)
+tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpV)
+tblSizeIn = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+lblSize = switch lblSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ───────────────────────────── Swings ─────────────────────────────
+atrV = ta.atr(14)
+ph   = ta.pivothigh(high, pivLen, pivLen)
+pl   = ta.pivotlow(low, pivLen, pivLen)
+var array<int>   pvT = array.new<int>()
+var array<float> pvP = array.new<float>()
+var array<int>   pvB = array.new<int>()
+pushPivot(int tp, float price, int bar) =>
+    bool ch = false
+    int  sz = array.size(pvT)
+    if sz > 0 and array.get(pvT, sz - 1) == tp
+        float lastP = array.get(pvP, sz - 1)
+        if (tp == 1 and price > lastP) or (tp == -1 and price < lastP)
+            array.set(pvP, sz - 1, price)
+            array.set(pvB, sz - 1, bar)
+            ch := true
+    else
+        array.push(pvT, tp)
+        array.push(pvP, price)
+        array.push(pvB, bar)
+        if array.size(pvT) > 8
+            array.shift(pvT)
+            array.shift(pvP)
+            array.shift(pvB)
+        ch := true
+    ch
+bool changed = false
+if not na(ph)
+    changed := pushPivot(1, ph, bar_index - pivLen) or changed
+if not na(pl)
+    changed := pushPivot(-1, pl, bar_index - pivLen) or changed
+
+// ───────────────────────────── State ─────────────────────────────
+var bool  patOn   = false
+var int   patD    = 0
+var float patRim  = na
+var float patDep  = na
+var float patHL   = na        // handle low (high for inverted)
+var int   patExp  = na
+var int   patA    = na        // left-rim bar (for the label position)
+var float patBot  = na
+var int   lastC   = -1
+var int   nPat    = 0
+var line  rimLn   = na
+var label patLb   = na
+
+var bool  inTr   = false
+var int   trD    = 0
+var float trE    = na
+var float trS    = na
+var float trT    = na
+var float trRisk = na
+var int   trBar  = na
+var int   trTime = na
+var array<float> aWins = array.new<float>(2, 0.0)
+var array<float> aLoss = array.new<float>(2, 0.0)
+var array<float> aSumR = array.new<float>(2, 0.0)
+var array<float> aGW   = array.new<float>(2, 0.0)
+var array<float> aGL   = array.new<float>(2, 0.0)
+var array<float> eq    = array.new<float>(3, 0.0)
+var int liqCount = 0
+liqDistPct = 100.0 / leverage - mmrPct
+recordExit(int dir, float r) =>
+    int idx = dir == 1 ? 0 : 1
+    if r > 0
+        array.set(aWins, idx, array.get(aWins, idx) + 1)
+        array.set(aGW,   idx, array.get(aGW, idx) + r)
+    else
+        array.set(aLoss, idx, array.get(aLoss, idx) + 1)
+        array.set(aGL,   idx, array.get(aGL, idx) + math.abs(r))
+    array.set(aSumR, idx, array.get(aSumR, idx) + r)
+    float cum = array.get(eq, 0) + r
+    array.set(eq, 0, cum)
+    array.set(eq, 1, math.max(array.get(eq, 1), cum))
+    array.set(eq, 2, math.max(array.get(eq, 2), array.get(eq, 1) - cum))
+    r
+
+// 1) manage the open trade
+if stratOn and inTr and bar_index > trBar
+    float xPx = na
+    bool  atT = false
+    string tag = ""
+    if trD == 1 ? low <= trS : high >= trS
+        xPx := trD == 1 ? math.min(open, trS) : math.max(open, trS)
+        tag := "SL"
+    else if trD == 1 ? high >= trT : low <= trT
+        xPx := trD == 1 ? math.max(open, trT) : math.min(open, trT)
+        atT := true
+        tag := "TP"
+    else if bar_index - trBar >= maxBars
+        xPx := close
+        tag := "Time"
+    if not na(xPx)
+        float hrs  = (time - trTime) / 3600000.0
+        float cf   = feesOn ? (takerPct + (atT ? makerPct : takerPct) + trD * funding8h * hrs / 8.0) / 100.0 : 0.0
+        float netR = trD * (xPx - trE) / trRisk - cf * trE / trRisk
+        recordExit(trD, netR)
+        if showTrades
+            label.new(bar_index, xPx, tag + " " + (netR >= 0 ? "+" : "") + str.tostring(netR, "#.##") + "R", style = label.style_label_left,
+                 color = netR > 0 ? color.new(color.green, 20) : color.new(color.red, 20), textcolor = color.white, size = lblSize)
+        inTr := false
+
+// 2) swings → pattern
+bool newPat = false
+if changed and array.size(pvT) >= 4 and not na(atrV)
+    int   sz = array.size(pvT)
+    int   s  = array.get(pvT, sz - 4)            // +1: A is a high → cup & handle; -1: inverted
+    float A  = array.get(pvP, sz - 4)
+    int   Ab = array.get(pvB, sz - 4)
+    float B  = array.get(pvP, sz - 3)
+    int   Bb = array.get(pvB, sz - 3)
+    float C  = array.get(pvP, sz - 2)
+    int   Cb = array.get(pvB, sz - 2)
+    float Dp = array.get(pvP, sz - 1)
+    int   Db = array.get(pvB, sz - 1)
+    if array.get(pvT, sz - 1) == -s and Cb != lastC and (s == 1 ? showBull : showBear)
+        float depth = s * (C - B)
+        bool ok = depth > 0 and depth >= minDepthAtr * atrV
+        ok := ok and math.abs(A - C) <= rimTol * depth
+        float hd = depth > 0 ? s * (C - Dp) / depth : 9.0
+        ok := ok and hd >= handleMin and hd <= handleMax
+        int w1 = Bb - Ab
+        int w2 = Cb - Bb
+        int W  = Cb - Ab
+        ok := ok and w1 <= symF * w2 and w2 <= symF * w1 and (Db - Cb) <= handleLen * W
+        if ok and priorMin > 0
+            int lo = math.max(0, Ab - W)
+            float ext = A
+            if lo < Ab
+                ext := s == 1 ? low[bar_index - lo] : high[bar_index - lo]
+                for b = lo to Ab - 1
+                    float v = s == 1 ? low[bar_index - b] : high[bar_index - b]
+                    ext := s == 1 ? math.min(ext, v) : math.max(ext, v)
+            ok := s * (C - ext) >= priorMin * depth
+        if ok                                         // already closed through the rim since C?
+            for b = Cb + 1 to bar_index
+                if s == 1 ? close[bar_index - b] > C : close[bar_index - b] < C
+                    ok := false
+                    break
+        if ok
+            nPat   += 1
+            lastC  := Cb
+            newPat := true
+            patOn  := true
+            patD   := s
+            patRim := C
+            patDep := depth
+            patHL  := Dp
+            patBot := B
+            patA   := Ab
+            patExp := bar_index + math.max(5, int(math.round(waitMult * W)))
+            if showPat
+                color pc = s == 1 ? colBull : colBear
+                array<chart.point> pts = array.new<chart.point>()
+                array.push(pts, chart.point.from_index(Ab, A))
+                array.push(pts, chart.point.from_index(Bb, B))
+                array.push(pts, chart.point.from_index(Cb, C))
+                array.push(pts, chart.point.from_index(Db, Dp))
+                polyline.new(pts, curved = curved, line_color = pc, line_width = 2)
+                rimLn := line.new(Ab, C, bar_index, C, color = color.new(pc, 20), style = line.style_dashed, width = 1)
+            if showLbl
+                patLb := label.new(math.round((Ab + bar_index) / 2), B, (s == 1 ? "Cup & handle" : "Inverted cup & handle") + "\nwaiting for a close " + (s == 1 ? "above " : "below ") + str.tostring(C, format.mintick),
+                     style = s == 1 ? label.style_label_up : label.style_label_down, color = color.new(s == 1 ? colBull : colBear, 20), textcolor = color.white, size = lblSize)
+            if alertPat
+                alert((s == 1 ? "Cup & handle" : "Inverted cup & handle") + " on " + syminfo.ticker + " " + timeframe.period + " | breakout level " + str.tostring(C, format.mintick), alert.freq_once_per_bar_close)
+
+// 3) act on the pattern
+if patOn
+    int d = patD
+    if showPat and not na(rimLn)
+        line.set_x2(rimLn, bar_index)
+    if (close - patHL) * d < 0 or bar_index > patExp
+        patOn := false
+        if not na(patLb)
+            label.set_text(patLb, (d == 1 ? "Cup & handle" : "Inverted cup & handle") + "\nfailed (no breakout)")
+            label.set_color(patLb, color.new(color.gray, 30))
+    else if (close - patRim) * d > 0
+        patOn := false
+        float stp = stopMode == "Handle low" ? patHL : patRim - d * 0.5 * patDep
+        float rk  = math.abs(close - stp)
+        float tg  = tgtMode == "Measured move" ? patRim + d * patDep : close + d * rrMult * rk
+        bool  ok  = stratOn and not inTr and rk > 0 and (close - stp) * d > 0 and (tg - close) * d > 0
+        if not na(patLb)
+            label.set_text(patLb, (d == 1 ? "Cup & handle" : "Inverted cup & handle") + "\nbroke out at " + str.tostring(close, format.mintick))
+        if ok
+            inTr   := true
+            trD    := d
+            trE    := close
+            trS    := stp
+            trT    := tg
+            trRisk := rk
+            trBar  := bar_index
+            trTime := time
+            bool risky = rk / close * 100.0 > liqDistPct
+            if risky
+                liqCount += 1
+            if showTrades
+                label.new(bar_index, d == 1 ? low : high, (d == 1 ? "Long" : "Short") + (risky ? "\n⚠ stop beyond " + str.tostring(leverage) + "x liq." : ""),
+                     style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.teal, 0) : color.new(color.maroon, 0),
+                     textcolor = color.white, size = lblSize)
+            if alertTrd
+                alert("Cup & handle " + (d == 1 ? "LONG" : "SHORT") + " on " + syminfo.ticker + " " + timeframe.period + " | entry " + str.tostring(close, format.mintick) +
+                     " | stop " + str.tostring(stp, format.mintick) + " | target " + str.tostring(tg, format.mintick), alert.freq_once_per_bar_close)
+
+plot(stratOn and inTr ? trE : na, "Trade entry", color.blue, 2, plot.style_linebr)
+plot(stratOn and inTr ? trS : na, "Trade stop", color.red, 2, plot.style_linebr)
+plot(stratOn and inTr ? trT : na, "Trade target", color.green, 2, plot.style_linebr)
+
+// forecast while a pattern is waiting
+var array<line>  fcLines = array.new<line>()
+var label fcLb = na
+if barstate.islast
+    for ln in fcLines
+        line.delete(ln)
+    array.clear(fcLines)
+    if not na(fcLb)
+        label.delete(fcLb)
+        fcLb := na
+    if fcOn and stratOn and patOn and not inTr
+        float stp = stopMode == "Handle low" ? patHL : patRim - patD * 0.5 * patDep
+        float tg  = tgtMode == "Measured move" ? patRim + patD * patDep : patRim + patD * rrMult * math.abs(patRim - stp)
+        int   x2  = bar_index + 20
+        array.push(fcLines, line.new(bar_index, patRim, x2, patRim, color = color.blue, width = 2, style = line.style_dashed))
+        array.push(fcLines, line.new(bar_index, stp, x2, stp, color = color.new(color.red, 30), style = line.style_dashed))
+        array.push(fcLines, line.new(bar_index, tg, x2, tg, color = color.new(color.green, 30), style = line.style_dashed))
+        fcLb := label.new(x2, patRim, (patD == 1 ? "▲ LONG if a candle closes above " : "▼ SHORT if a candle closes below ") + str.tostring(patRim, format.mintick) +
+             "\nstop " + str.tostring(stp, format.mintick) + "  ·  target ≈ " + str.tostring(tg, format.mintick), style = label.style_label_left,
+             color = color.new(patD == 1 ? color.teal : color.maroon, 15), textcolor = color.white, size = lblSize, textalign = text.align_left)
+
+// ───────────────────────────── Table ─────────────────────────────
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+tblSize = tblSizeIn == "Tiny" ? size.tiny : tblSizeIn == "Normal" ? size.normal : size.small
+var table tbl = table.new(tblPos, 4, 12, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.gray, frame_width = 1)
+rc(int c, int r, string txt, color tc = color.white) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+fmtR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+colR(float v) => v > 0 ? color.lime : v < 0 ? color.red : color.white
+resCol(int col, float w, float l, float r, float gw, float gl) =>
+    float n = w + l
+    rc(col, 2, str.tostring(n, "#"))
+    rc(col, 3, str.tostring(w, "#") + " / " + str.tostring(l, "#"))
+    rc(col, 4, n > 0 ? str.tostring(w / n * 100.0, "#.#") + "%" : "–")
+    rc(col, 5, fmtR(r), colR(r))
+    rc(col, 6, n > 0 ? fmtR(r / n) : "–", colR(r))
+    rc(col, 7, gl > 0 ? str.tostring(gw / gl, "#.##") : gw > 0 ? "∞" : "–")
+if tblOn and barstate.isfirst
+    table.merge_cells(tbl, 0, 0, 3, 0)
+    for r = 8 to 11
+        table.merge_cells(tbl, 1, r, 3, r)
+if tblOn and barstate.islast
+    table.cell(tbl, 0, 0, "Cup & Handle v1.0 — swing " + str.tostring(pivLen) + ", stop: " + stopMode + ", target: " + (tgtMode == "R:R" ? str.tostring(rrMult, "#.##") + "R" : "measured") +
+         (feesOn ? ", net of fees" : ", before fees"), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    rc(0, 1, "Metric", color.silver)
+    rc(1, 1, "Longs", color.silver)
+    rc(2, 1, "Shorts", color.silver)
+    rc(3, 1, "Total", color.silver)
+    rc(0, 2, "Trades")
+    rc(0, 3, "Wins / Losses")
+    rc(0, 4, "Win rate")
+    rc(0, 5, "Net R")
+    rc(0, 6, "Avg R / trade")
+    rc(0, 7, "Profit factor")
+    resCol(1, array.get(aWins, 0), array.get(aLoss, 0), array.get(aSumR, 0), array.get(aGW, 0), array.get(aGL, 0))
+    resCol(2, array.get(aWins, 1), array.get(aLoss, 1), array.get(aSumR, 1), array.get(aGW, 1), array.get(aGL, 1))
+    resCol(3, array.get(aWins, 0) + array.get(aWins, 1), array.get(aLoss, 0) + array.get(aLoss, 1), array.get(aSumR, 0) + array.get(aSumR, 1),
+         array.get(aGW, 0) + array.get(aGW, 1), array.get(aGL, 0) + array.get(aGL, 1))
+    rc(0, 8, "Patterns found")
+    rc(1, 8, str.tostring(nPat))
+    rc(0, 9, "Max drawdown")
+    rc(1, 9, "-" + str.tostring(array.get(eq, 2), "#.##") + "R", array.get(eq, 2) > 0 ? color.orange : color.white)
+    rc(0, 10, "Current")
+    rc(1, 10, inTr ? (trD == 1 ? "LONG" : "SHORT") + " from " + str.tostring(trE, format.mintick) + " | stop " + str.tostring(trS, format.mintick) + " | target " + str.tostring(trT, format.mintick) :
+         patOn ? (patD == 1 ? "Cup & handle" : "Inverted") + " waiting for a close " + (patD == 1 ? "above " : "below ") + str.tostring(patRim, format.mintick) : "Flat",
+         inTr ? (trD == 1 ? color.lime : color.red) : patOn ? color.yellow : color.white)
+    rc(0, 11, "Liquidation risk @ " + str.tostring(leverage) + "x")
+    rc(1, 11, str.tostring(liqCount) + " trades had a stop beyond ~" + str.tostring(liqDistPct, "#.##") + "%", liqCount > 0 ? color.orange : color.white)
