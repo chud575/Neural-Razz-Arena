@@ -1,6 +1,7 @@
 //@version=6
-// Trend Finder – Swing Structure   ·   v1.6
+// Trend Finder – Swing Structure   ·   v1.7
 // Changelog
+//  v1.7  The 'x' that marks the end of a trend takes the colour of the trend that ended (uptrend colour or downtrend colour)
 //  v1.6  Forecast: while no trade is open, shows the level a 1h close must break to start the next trade, with its stop, target and second entry
 //  v1.5  BOS tracker: minimum stop size filter (skips trades whose stop is closer than 2.9 × ATR by default); skipped signals can be marked
 //  v1.4  BOS tracker: optional second entry part-way to the stop (limit order, same stop and target); results count both entries
@@ -29,7 +30,7 @@
 //    Optional SECOND ENTRY: a limit order part-way from the entry to the stop (50 % by default), same stop, same
 //    target. Results are in R, where 1R = the risk of the first entry alone, so a trade with both entries can lose 1.5R.
 // A swing is only known N bars after it forms, so labels and trend changes appear N bars late — nothing repaints.
-indicator("Trend Finder – Swing Structure v1.6", shorttitle = "Trend Finder v1.6", overlay = true,
+indicator("Trend Finder – Swing Structure v1.7", shorttitle = "Trend Finder v1.7", overlay = true,
      max_lines_count = 500, max_labels_count = 500)
 
 grpS = "Swings"
@@ -286,7 +287,8 @@ plot(showLvl ? lastH : na, "Latest swing high", color.new(dnCol, 30), 1, plot.st
 plot(showLvl ? lastL : na, "Latest swing low", color.new(upCol, 30), 1, plot.style_stepline)
 plotshape(trend == 1 and trend[1] != 1, "Uptrend starts", shape.triangleup, location.belowbar, upCol, size = size.small, text = "Up")
 plotshape(trend == -1 and trend[1] != -1, "Downtrend starts", shape.triangledown, location.abovebar, dnCol, size = size.small, text = "Down")
-plotshape(trend == 0 and trend[1] != 0, "Trend ends", shape.xcross, location.abovebar, color.gray, size = size.tiny)
+plotshape(trend == 0 and trend[1] == 1, "Uptrend ends", shape.xcross, location.abovebar, upCol, size = size.small)
+plotshape(trend == 0 and trend[1] == -1, "Downtrend ends", shape.xcross, location.belowbar, dnCol, size = size.small)
 
 if trend != trend[1]
     alert("Trend Finder " + syminfo.ticker + " " + timeframe.period + ": " + (trend == 1 ? "UPTREND started" : trend == -1 ? "DOWNTREND started" : "trend ended (structure break)") +
@@ -328,7 +330,7 @@ if barstate.isfirst
     table.merge_cells(tbl, 0, 0, 6, 0)
     table.merge_cells(tbl, 0, 7, 6, 7)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Trend Finder v1.6 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    table.cell(tbl, 0, 0, "Trend Finder v1.7 — market structure", text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Trend", color.silver)
     cell(2, 1, "Structure", color.silver)
