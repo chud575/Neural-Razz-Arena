@@ -52,3 +52,23 @@ Bars between the previous leg's extreme and the next leg's start.
 | 1h | 47% | 48% | 52% |
 | 4h | 48% | 52% | 52% |
 | 1d | 43% | 43% | 52% |
+
+## Before a second leg the same way: how far did the first leg pull back?
+
+For every streak of two or more legs in the same direction: the deepest pullback of the FIRST leg (from its extreme) before the SECOND leg started, as a share of the first leg. Four coins.
+
+| TF | Streaks | Pulled back 50% or more | Median pullback | under 25% | 25–38% | 38–50% | 50–62% | 62–79% | 79–100% | beyond the leg's start | BTC only: 50% or more |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 15m | 3388 | 66% | 61% | 3% | 13% | 18% | 17% | 20% | 16% | 12% | 66% (980) |
+| 1h | 1183 | 66% | 62% | 3% | 14% | 17% | 16% | 21% | 17% | 11% | 64% (425) |
+| 4h | 309 | 67% | 60% | 3% | 14% | 17% | 19% | 19% | 19% | 9% | 64% (107) |
+| 1d | 53 | 66% | 60% | 0% | 19% | 15% | 17% | 34% | 11% | 4% | 67% (18) |
+
+Same measure for streaks of exactly two, and for legs up and legs down separately (share pulling back 50% or more):
+
+| TF | Exactly two in a row | Three or more | Legs up | Legs down | Every same-way pair (not just the first of a streak) |
+|---|---|---|---|---|---|
+| 15m | 66% (1743) | 66% (1645) | 64% | 68% | 69% (6606) |
+| 1h | 66% (599) | 66% (584) | 66% | 67% | 67% (2331) |
+| 4h | 64% (152) | 69% (157) | 64% | 69% | 66% (603) |
+| 1d | 70% (33) | 60% (20) | 64% | 70% | 75% (83) |
