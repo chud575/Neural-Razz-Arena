@@ -1,6 +1,7 @@
 //@version=6
-// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.5
+// Impulse Legs (leg up / leg down) – multi-timeframe   ·   v1.6
 // Changelog
+//  v1.6  Leg strategy tracker: limit entry at a chosen depth of the pullback half, units, stop at the leg's start, up to three R:R targets; return table
 //  v1.5  Zone tracking: every leg's box stays until price leaves it; pullback then breakout = win, pullback then through the leg's start = loss,
 //        breakout with no pullback = neither; results in the table
 //  v1.4  Premium / discount zone of a leg UP: the upper half is now the discount half and the lower half the premium half (setting to switch back)
@@ -33,12 +34,18 @@
 //      LOSS        price pulled back through the midline, then went beyond the leg's start
 //      NO PULLBACK price broke out beyond the extreme without pulling back to the midline first (not counted either way)
 //    If one candle does two of these, the less favourable reading is used.
+//  · Leg strategy (tracker): after a leg on this chart finishes, a limit order waits in the pullback half of its box.
+//      Entry depth 0 % = the midline, 100 % = the leg's start (the outer edge, which is also the stop).
+//      Stop = the leg's start. Up to three targets, each a multiple of the risk (entry to stop); the units are split
+//      between the targets you enable. The order is cancelled if price breaks out beyond the leg's extreme first.
+//      Stop wins if stop and target are touched in the same candle; a gap fills at the open. Several trades can be
+//      open at once (one per leg). The return table shows the result in the chart's quote currency and in R.
 //  · Trend filter (optional): only legs that go WITH the trend are shown and counted. The trend can be read on the
 //    leg's own timeframe or on one timeframe you choose, from two moving averages, price against one moving average,
 //    or swing structure.
 // A leg can only be recognised once it is under way, so it is flagged a few bars in — never on its first tick.
 // Finished legs never change. Higher timeframes use closed candles unless you turn that off.
-indicator("Impulse Legs (MTF) v1.5", shorttitle = "Impulse Legs v1.5", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+indicator("Impulse Legs (MTF) v1.6", shorttitle = "Impulse Legs v1.6", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
 
 // ───────────────────────────── Inputs ─────────────────────────────
 grpD = "What counts as an impulse leg"
@@ -109,6 +116,27 @@ fvgMax    = input.int(30, "Max open gaps shown", minval = 1, maxval = 200, group
 fvgUpCol  = input.color(color.new(color.lime, 0), "Gap in a leg up", group = grpF, inline = "f")
 fvgDnCol  = input.color(color.new(color.red, 0), "Gap in a leg down", group = grpF, inline = "f")
 fvgAlert  = input.bool(false, "Alert when price first trades back into a gap", group = grpF)
+
+grpS = "Leg strategy (tracker)"
+stOn      = input.bool(true, "Track the leg strategy", group = grpS)
+stEntry   = input.float(0.0, "Entry depth (% of the pullback half: 0 = midline, 100 = the leg's start / stop)", minval = 0.0, maxval = 95.0, step = 5.0, group = grpS,
+     tooltip = "0 % enters exactly at the midline. 50 % enters half-way between the midline and the leg's start. The stop is always the leg's start, so a deeper entry means a smaller risk per unit but fewer fills.")
+stUnits   = input.float(1.0, "Units per trade", minval = 0.0, step = 0.1, group = grpS,
+     tooltip = "How many units (for BTCUSDT: BTC) are bought or sold on each trade. The return is shown in the quote currency (USDT).")
+stRR1     = input.float(1.0, "Target 1 (× risk, 0 = off)", minval = 0.0, step = 0.25, group = grpS, inline = "t1")
+stSh1     = input.float(34, "% of units", minval = 0, maxval = 100, step = 1, group = grpS, inline = "t1")
+stRR2     = input.float(2.0, "Target 2 (× risk, 0 = off)", minval = 0.0, step = 0.25, group = grpS, inline = "t2")
+stSh2     = input.float(33, "% of units", minval = 0, maxval = 100, step = 1, group = grpS, inline = "t2")
+stRR3     = input.float(3.0, "Target 3 (× risk, 0 = off)", minval = 0.0, step = 0.25, group = grpS, inline = "t3")
+stSh3     = input.float(33, "% of units", minval = 0, maxval = 100, step = 1, group = grpS, inline = "t3")
+stWait    = input.int(0, "Cancel an unfilled order after (bars, 0 = never)", minval = 0, group = grpS)
+stFees    = input.bool(true, "Include trading fees & funding", group = grpS,
+     tooltip = "Limit entry and targets = maker fee, stop = taker fee, funding per 8 hours held (longs pay, shorts receive). Defaults: Bybit VIP 3.")
+stTaker   = input.float(0.035, "Taker fee (%)", minval = 0.0, step = 0.005, group = grpS, inline = "fee")
+stMaker   = input.float(0.014, "Maker fee (%)", minval = 0.0, step = 0.005, group = grpS, inline = "fee")
+stFund    = input.float(0.01, "Funding per 8h (%)", step = 0.005, group = grpS)
+stShow    = input.bool(true, "Draw orders, entries, targets and exits", group = grpS)
+stTblPos  = input.string("Bottom right", "Return table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right", "Middle left"], group = grpS)
 
 grpV = "Visuals"
 showLive = input.bool(true, "Show legs still in progress (dashed)", group = grpV)
@@ -692,7 +720,7 @@ if tblOn and barstate.isfirst
     table.merge_cells(tbl, 0, 6, 4, 6)
     table.merge_cells(tbl, 0, 7, 4, 7)
 if tblOn and barstate.islast
-    table.cell(tbl, 0, 0, "Impulse Legs v1.5 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
+    table.cell(tbl, 0, 0, "Impulse Legs v1.6 — ≥ " + str.tostring(sizeMin, "#.##") + " × ATR within " + str.tostring(maxN) + " bars, ≥ " + str.tostring(effMin * 100, "#") + "% clean" + (trendOn ? " · with-trend legs only" : ""),
          text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Timeframe", color.silver)
     cell(1, 1, "Leg", color.silver)
@@ -723,3 +751,267 @@ if tblOn and barstate.islast
             table.cell(tbl, 0, 6 + k, "Zones after legs " + (k == 0 ? "up" : "down") + ":  " + str.tostring(w) + " wins · " + str.tostring(l) + " losses" +
                  (w + l > 0 ? " · win rate " + str.tostring(w / (w + l) * 100.0, "#") + "%" : "") + " · " + str.tostring(z) + " no pullback",
                  text_color = k == 0 ? upC : dnC, text_size = tblSize, text_halign = text.align_left)
+
+// ───────────────────────────── Leg strategy tracker ─────────────────────────────
+// shares of the units for the enabled targets (normalised to 100 %)
+float shA  = stRR1 > 0 ? stSh1 : 0.0
+float shB  = stRR2 > 0 ? stSh2 : 0.0
+float shC  = stRR3 > 0 ? stSh3 : 0.0
+float shSum = shA + shB + shC
+float sh1 = shSum > 0 ? shA / shSum : 0.0
+float sh2 = shSum > 0 ? shB / shSum : 0.0
+float sh3 = shSum > 0 ? shC / shSum : 0.0
+string ccy = syminfo.currency
+
+// resting orders (one per finished leg)
+var array<int>   oDir  = array.new<int>()
+var array<float> oPx   = array.new<float>()
+var array<float> oStop = array.new<float>()
+var array<float> oExt  = array.new<float>()       // the leg's extreme: a break beyond it cancels the order
+var array<int>   oBar  = array.new<int>()
+var array<line>  oLn   = array.new<line>()
+// open trades
+var array<int>   tD    = array.new<int>()
+var array<float> tE    = array.new<float>()
+var array<float> tS    = array.new<float>()
+var array<float> tRem  = array.new<float>()       // share of the units still open
+var array<int>   tNext = array.new<int>()         // next target to hit (1..3, 4 = none left)
+var array<float> tPnl  = array.new<float>()       // result so far, quote currency, before fees
+var array<float> tFee  = array.new<float>()
+var array<int>   tTime = array.new<int>()
+var array<int>   tBar  = array.new<int>()
+var array<int>   tHits = array.new<int>()
+var array<line>  tLn   = array.new<line>()
+// results: 0 = legs up (longs), 1 = legs down (shorts)
+var array<int>   rN    = array.new<int>(2, 0)
+var array<int>   rWin  = array.new<int>(2, 0)
+var array<int>   rT1   = array.new<int>(2, 0)
+var array<int>   rT2   = array.new<int>(2, 0)
+var array<int>   rT3   = array.new<int>(2, 0)
+var array<int>   rStop0 = array.new<int>(2, 0)    // stopped before any target
+var array<float> rPnl  = array.new<float>(2, 0.0)
+var array<float> rR    = array.new<float>(2, 0.0)
+var array<float> rFees = array.new<float>(2, 0.0)
+var int nCancelled = 0
+var int stLegId = na
+var array<float> stEq = array.new<float>(3, 0.0)  // cumulative, peak, max drawdown (quote currency)
+
+tgtRR(int k) => k == 1 ? stRR1 : k == 2 ? stRR2 : stRR3
+tgtSh(int k) => k == 1 ? sh1 : k == 2 ? sh2 : sh3
+nextTgt(int from) =>
+    int k = from
+    while k <= 3 and (tgtRR(k) <= 0 or tgtSh(k) <= 0)
+        k += 1
+    k
+feePart(int d, float e, float share, bool maker, int t0) =>
+    stFees ? stUnits * share * e * ((maker ? stMaker : stTaker) + d * stFund * ((time - t0) / 3600000.0) / 8.0) / 100.0 : 0.0
+openTrade(int d, float e, float stp, bool makerEntry) =>
+    array.push(tD, d)
+    array.push(tE, e)
+    array.push(tS, stp)
+    array.push(tRem, 1.0)
+    array.push(tNext, nextTgt(1))
+    array.push(tPnl, 0.0)
+    array.push(tFee, stFees ? stUnits * e * (makerEntry ? stMaker : stTaker) / 100.0 : 0.0)
+    array.push(tTime, time)
+    array.push(tBar, bar_index)
+    array.push(tHits, 0)
+    array.push(tLn, stShow ? line.new(bar_index, e, bar_index + 1, e, color = color.blue, width = 2) : na)
+    if stShow
+        label.new(bar_index, d == 1 ? low : high, (d == 1 ? "Long " : "Short ") + str.tostring(stUnits) + " @ " + str.tostring(e, format.mintick), style = d == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(d == 1 ? upC : dnC, 10), textcolor = color.black, size = lblSize)
+closeTrade(int i) =>
+    int   d   = array.get(tD, i)
+    int   k   = d == 1 ? 0 : 1
+    float net = array.get(tPnl, i) - array.get(tFee, i)
+    float riskQ = stUnits * math.abs(array.get(tE, i) - array.get(tS, i))
+    array.set(rN, k, array.get(rN, k) + 1)
+    array.set(rPnl, k, array.get(rPnl, k) + net)
+    array.set(rFees, k, array.get(rFees, k) + array.get(tFee, i))
+    array.set(rR, k, array.get(rR, k) + (riskQ > 0 ? net / riskQ : 0.0))
+    if net > 0
+        array.set(rWin, k, array.get(rWin, k) + 1)
+    int hits = array.get(tHits, i)
+    if hits == 0
+        array.set(rStop0, k, array.get(rStop0, k) + 1)
+    float cum = array.get(stEq, 0) + net
+    array.set(stEq, 0, cum)
+    array.set(stEq, 1, math.max(array.get(stEq, 1), cum))
+    array.set(stEq, 2, math.max(array.get(stEq, 2), array.get(stEq, 1) - cum))
+    if stShow
+        label.new(bar_index, close, (net >= 0 ? "+" : "") + str.tostring(net, "#.##") + " " + ccy + (riskQ > 0 ? "  (" + (net >= 0 ? "+" : "") + str.tostring(net / riskQ, "#.##") + "R)" : ""),
+             style = label.style_label_left, color = net > 0 ? color.new(color.green, 20) : color.new(color.red, 20), textcolor = color.white, size = lblSize)
+        if not na(array.get(tLn, i))
+            line.set_x2(array.get(tLn, i), bar_index)
+    array.remove(tD, i)
+    array.remove(tE, i)
+    array.remove(tS, i)
+    array.remove(tRem, i)
+    array.remove(tNext, i)
+    array.remove(tPnl, i)
+    array.remove(tFee, i)
+    array.remove(tTime, i)
+    array.remove(tBar, i)
+    array.remove(tHits, i)
+    array.remove(tLn, i)
+
+// 1) open trades: stop first, then targets in order (from the candle after the fill)
+if stOn and array.size(tD) > 0
+    for i = array.size(tD) - 1 to 0
+        if bar_index > array.get(tBar, i)
+            int   d   = array.get(tD, i)
+            float e   = array.get(tE, i)
+            float stp = array.get(tS, i)
+            float rk  = math.abs(e - stp)
+            if not na(array.get(tLn, i))
+                line.set_x2(array.get(tLn, i), bar_index)
+            if d == 1 ? low <= stp : high >= stp
+                float px  = d == 1 ? math.min(open, stp) : math.max(open, stp)
+                float rem = array.get(tRem, i)
+                array.set(tPnl, i, array.get(tPnl, i) + stUnits * rem * d * (px - e))
+                array.set(tFee, i, array.get(tFee, i) + feePart(d, e, rem, false, array.get(tTime, i)))
+                closeTrade(i)
+            else
+                bool done = false
+                int  k    = array.get(tNext, i)
+                while k <= 3 and not done
+                    float tp = e + d * tgtRR(k) * rk
+                    if d == 1 ? high >= tp : low <= tp
+                        float px = d == 1 ? math.max(open, tp) : math.min(open, tp)
+                        float sh = math.min(tgtSh(k), array.get(tRem, i))
+                        array.set(tPnl, i, array.get(tPnl, i) + stUnits * sh * d * (px - e))
+                        array.set(tFee, i, array.get(tFee, i) + feePart(d, e, sh, true, array.get(tTime, i)))
+                        array.set(tRem, i, array.get(tRem, i) - sh)
+                        array.set(tHits, i, array.get(tHits, i) + 1)
+                        int kk = d == 1 ? 0 : 1
+                        if k == 1
+                            array.set(rT1, kk, array.get(rT1, kk) + 1)
+                        else if k == 2
+                            array.set(rT2, kk, array.get(rT2, kk) + 1)
+                        else
+                            array.set(rT3, kk, array.get(rT3, kk) + 1)
+                        if stShow
+                            label.new(bar_index, tp, "T" + str.tostring(k), style = d == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.green, 30), textcolor = color.white, size = size.small)
+                        k := nextTgt(k + 1)
+                        array.set(tNext, i, k)
+                    else
+                        done := true
+                if array.get(tRem, i) <= 0.0000001 or array.get(tNext, i) > 3
+                    if array.get(tRem, i) > 0.0000001                 // no target left for the remainder: close it here
+                        float rem = array.get(tRem, i)
+                        array.set(tPnl, i, array.get(tPnl, i) + stUnits * rem * d * (close - e))
+                        array.set(tFee, i, array.get(tFee, i) + feePart(d, e, rem, false, array.get(tTime, i)))
+                    closeTrade(i)
+
+// 2) resting orders: filled, or cancelled by a breakout / the wait limit
+if stOn and array.size(oDir) > 0
+    for i = array.size(oDir) - 1 to 0
+        if bar_index > array.get(oBar, i)
+            int   d   = array.get(oDir, i)
+            float px  = array.get(oPx, i)
+            float stp = array.get(oStop, i)
+            bool fill   = d == 1 ? low <= px : high >= px
+            bool broke  = d == 1 ? high > array.get(oExt, i) : low < array.get(oExt, i)
+            bool tooOld = stWait > 0 and bar_index - array.get(oBar, i) > stWait
+            if not na(array.get(oLn, i))
+                line.set_x2(array.get(oLn, i), bar_index)
+            if fill or broke or tooOld
+                if fill
+                    float e = d == 1 ? math.min(open, px) : math.max(open, px)      // a gap through the limit fills at the open
+                    if (e - stp) * d > 0
+                        openTrade(d, e, stp, true)
+                        if d == 1 ? low <= stp : high >= stp                         // filled and stopped in the same candle
+                            int n = array.size(tD) - 1
+                            array.set(tPnl, n, stUnits * d * (stp - e))
+                            array.set(tFee, n, array.get(tFee, n) + feePart(d, e, 1.0, false, time))
+                            array.set(tRem, n, 0.0)
+                            closeTrade(n)
+                else
+                    nCancelled += 1
+                    if not na(array.get(oLn, i))
+                        line.set_color(array.get(oLn, i), color.new(color.gray, 50))
+                array.remove(oDir, i)
+                array.remove(oPx, i)
+                array.remove(oStop, i)
+                array.remove(oExt, i)
+                array.remove(oBar, i)
+                array.remove(oLn, i)
+
+// 3) a leg on this chart has just finished: place its order
+if stOn and onC and cFM and not na(cFSP) and (na(stLegId) or stLegId != cFST) and shSum > 0 and stUnits > 0
+    stLegId := cFST
+    int   d   = cFD
+    float hi  = math.max(cFSP, cFEP)
+    float lo  = math.min(cFSP, cFEP)
+    float eq  = (hi + lo) / 2
+    float stp = cFSP                                              // the leg's start = outer edge of the pullback half
+    float px  = eq + (stp - eq) * stEntry / 100.0
+    // candles since the leg's extreme: stopped already? broken out already?
+    bool dead = false
+    int  back = math.min(int((time - cFET) / math.max(time - time[1], 1)), 400)
+    if back > 0
+        for k = 0 to back - 1
+            if d == 1 ? low[k] <= stp : high[k] >= stp
+                dead := true
+                break
+    if not dead
+        if d == 1 ? close <= px : close >= px                      // price is already at or beyond the entry: taken at this close
+            openTrade(d, close, stp, false)
+        else
+            array.push(oDir, d)
+            array.push(oPx, px)
+            array.push(oStop, stp)
+            array.push(oExt, cFEP)
+            array.push(oBar, bar_index)
+            array.push(oLn, stShow ? line.new(bar_index, px, bar_index + 1, px, color = color.new(color.blue, 30), width = 1, style = line.style_dashed) : na)
+
+// return table
+stPos = switch stTblPos
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    "Middle left"  => position.middle_left
+    => position.bottom_right
+var table rt = table.new(stPos, 4, 13, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+rcell(int c, int r, string txt, color tc = color.white) =>
+    table.cell(rt, c, r, txt, text_color = tc, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_center)
+money(float v) => (v >= 0 ? "+" : "−") + str.tostring(math.abs(v), "#,###.##")
+pct(int a, int n) => n > 0 ? str.tostring(a) + "  (" + str.tostring(a / n * 100.0, "#") + "%)" : "–"
+rcol(int col, int n, int w, int s0n, int a1, int a2, int a3, float pnl, float rr, float fees) =>
+    rcell(col, 2, str.tostring(n))
+    rcell(col, 3, pct(w, n))
+    rcell(col, 4, pct(s0n, n))
+    rcell(col, 5, stRR1 > 0 ? pct(a1, n) : "off")
+    rcell(col, 6, stRR2 > 0 ? pct(a2, n) : "off")
+    rcell(col, 7, stRR3 > 0 ? pct(a3, n) : "off")
+    rcell(col, 8, money(pnl) + " " + ccy, pnl > 0 ? color.lime : pnl < 0 ? color.red : color.white)
+    rcell(col, 9, (rr >= 0 ? "+" : "") + str.tostring(rr, "#.##") + "R", rr > 0 ? color.lime : rr < 0 ? color.red : color.white)
+    rcell(col, 10, n > 0 ? (rr / n >= 0 ? "+" : "") + str.tostring(rr / n, "#.##") + "R" : "–", rr > 0 ? color.lime : rr < 0 ? color.red : color.white)
+    rcell(col, 11, str.tostring(fees, "#,###.##") + " " + ccy, color.silver)
+if stOn and barstate.isfirst
+    table.merge_cells(rt, 0, 0, 3, 0)
+    table.merge_cells(rt, 0, 12, 3, 12)
+if stOn and barstate.islast
+    table.cell(rt, 0, 0, "Leg strategy — entry " + str.tostring(stEntry, "#.#") + "% into the pullback half · " + str.tostring(stUnits) + " units · targets " +
+         (stRR1 > 0 ? str.tostring(stRR1, "#.##") + "R " : "") + (stRR2 > 0 ? str.tostring(stRR2, "#.##") + "R " : "") + (stRR3 > 0 ? str.tostring(stRR3, "#.##") + "R " : "") +
+         (stFees ? "· net of fees" : "· before fees"), text_color = color.white, text_size = tblSize, bgcolor = color.new(color.purple, 40))
+    rcell(0, 1, "", color.silver)
+    rcell(1, 1, "Legs up (longs)", upC)
+    rcell(2, 1, "Legs down (shorts)", dnC)
+    rcell(3, 1, "Total", color.silver)
+    rcell(0, 2, "Trades filled")
+    rcell(0, 3, "Profitable trades")
+    rcell(0, 4, "Stopped before any target")
+    rcell(0, 5, "Reached target 1")
+    rcell(0, 6, "Reached target 2")
+    rcell(0, 7, "Reached target 3")
+    rcell(0, 8, "Net return")
+    rcell(0, 9, "Net return in R")
+    rcell(0, 10, "Average per trade")
+    rcell(0, 11, "Fees & funding paid")
+    for k = 0 to 1
+        rcol(k + 1, array.get(rN, k), array.get(rWin, k), array.get(rStop0, k), array.get(rT1, k), array.get(rT2, k), array.get(rT3, k), array.get(rPnl, k), array.get(rR, k), array.get(rFees, k))
+    rcol(3, array.sum(rN), array.sum(rWin), array.sum(rStop0), array.sum(rT1), array.sum(rT2), array.sum(rT3), array.sum(rPnl), array.sum(rR), array.sum(rFees))
+    table.cell(rt, 0, 12, "Open trades " + str.tostring(array.size(tD)) + " · orders waiting " + str.tostring(array.size(oDir)) + " · orders cancelled " + str.tostring(nCancelled) +
+         " · largest drawdown " + str.tostring(array.get(stEq, 2), "#,###.##") + " " + ccy + " · 1R = units × (entry − stop)", text_color = color.silver, text_size = tblSize, text_halign = text.align_left)
