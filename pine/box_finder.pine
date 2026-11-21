@@ -1,6 +1,7 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.4
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.5
 // Changelog
+//  v1.5  Second way to detect a box: "Squeeze Play" (Bollinger Bands inside the Keltner Channel); a "Squeeze Fired" panel when it ends
 //  v1.4  Labels sit directly under the box they describe
 //  v1.3  Table: how many head fakes still reached the ORIGINAL target (before the opposite one)
 //  v1.2  Narrower table (the long footnote moved into a hover tooltip)
@@ -27,12 +28,26 @@
 //  6. Head fake: a break that comes back to the far side of the box before reaching its target. From there the
 //               script tracks the opposite target (one box-height beyond the far edge) and counts how often price
 //               reaches it before returning to the edge it first broke.
+//  7. Squeeze Play (the other detection method): a box opens when the Bollinger Bands move inside the Keltner
+//               Channel and grows to cover every candle while they stay inside. When the bands move back outside,
+//               the squeeze has FIRED: the box is closed and named, and a "Squeeze Fired" panel is shown under it.
+//               The direction is the side of the box the firing candle closed beyond (or the half it closed in).
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.4", shorttitle = "Box Finder v1.4", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.5", shorttitle = "Box Finder v1.5", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
-grpB = "Box"
+grpM = "Detection method"
+method   = input.string("Tight range", "Find boxes by", options = ["Tight range", "Squeeze Play"], group = grpM,
+     tooltip = "Tight range: the last N bars fit inside a range no taller than X × ATR (settings in the Box group).\nSqueeze Play: the Bollinger Bands are inside the Keltner Channel; the box covers every candle while that lasts.")
+sqLen    = input.int(20, "Squeeze Play: length", minval = 2, group = grpM)
+sqBB     = input.float(2.0, "Squeeze Play: Bollinger Bands width (standard deviations)", minval = 0.1, step = 0.1, group = grpM)
+sqKC     = input.float(1.5, "Squeeze Play: Keltner Channel width (× average true range)", minval = 0.1, step = 0.1, group = grpM,
+     tooltip = "1.5 is the classic squeeze. 2.0 catches looser squeezes, 1.0 only the tightest.")
+sqMin    = input.int(3, "Squeeze Play: ignore squeezes shorter than (bars)", minval = 1, group = grpM)
+sqAlert  = input.bool(true, "Squeeze Play: alert when a squeeze fires", group = grpM)
+
+grpB = "Box (Tight range)"
 minLen   = input.int(20, "Min box length (bars)", minval = 5, maxval = 300, group = grpB,
      tooltip = "A box needs at least this many bars inside the height limit.")
 maxH     = input.float(4.0, "Max box height (× ATR)", minval = 0.5, step = 0.25, group = grpB,
@@ -77,6 +92,13 @@ lblSize = switch lblSizeIn
 atrV = ta.atr(atrLen)
 hh   = ta.highest(high, minLen)
 ll   = ta.lowest(low, minLen)
+
+// Squeeze Play: Bollinger Bands inside the Keltner Channel
+sqBasis = ta.sma(close, sqLen)
+sqDev   = sqBB * ta.stdev(close, sqLen)
+sqRng   = ta.sma(ta.tr(true), sqLen)
+bool sqOn  = sqBasis + sqDev < sqBasis + sqKC * sqRng and sqBasis - sqDev > sqBasis - sqKC * sqRng
+bool isSq  = method == "Squeeze Play"
 
 var bool  inBox    = false
 var float top      = na
@@ -177,9 +199,19 @@ bool newBox   = false
 bool brokeUp  = false
 bool brokeDn  = false
 int  brokeCat = na
+bool sqFired = false
+if inBox and isSq and not sqOn and bar_index - startBar < sqMin        // too short to count: drop it
+    box.delete(bx)
+    line.delete(midLn)
+    label.delete(lb)
+    lb      := na
+    inBox   := false
+    lastEnd := bar_index
+    nBoxes  -= 1
 if inBox
-    if close > top or close < bot
-        int d = close > top ? 1 : -1
+    if isSq ? not sqOn : (close > top or close < bot)
+        int d = close > top ? 1 : close < bot ? -1 : close >= (top + bot) / 2 ? 1 : -1
+        sqFired := isSq
         int c = d == 1 ? (prior == 1 ? 1 : 0) : (prior == -1 ? 3 : 2)
         float ht = top - bot
         brokeUp  := d == 1
@@ -203,7 +235,7 @@ if inBox
         if not na(lb)
             label.delete(lb)
         if showLbl
-            label.new(math.round((startBar + bar_index) / 2), bot, catName(c) + (d == 1 ? " ↑" : " ↓") + "\n" + str.tostring(bar_index - startBar) + " bars · buying " + str.tostring(leanPct(), "#") + "%",
+            label.new(math.round((startBar + bar_index) / 2), bot, (isSq ? "SQUEEZE FIRED " + (d == 1 ? "↑" : "↓") + "\n" + catName(c) + " · range " + str.tostring((top - bot) / bot * 100.0, "#.##") + "%" : catName(c) + (d == 1 ? " ↑" : " ↓")) + "\n" + str.tostring(bar_index - startBar) + " bars · buying " + str.tostring(leanPct(), "#") + "%",
                  style = label.style_label_up, color = color.new(cc, 15), textcolor = color.white, size = lblSize)
         if extBars > 0
             line.new(bar_index, top, bar_index + extBars, top, color = color.new(cc, 30), style = line.style_dotted)
@@ -219,10 +251,10 @@ if inBox
         inBox   := false
         lastEnd := bar_index
     else
-        if stretch
+        if stretch or isSq
             float nt = math.max(top, high)
             float nb = math.min(bot, low)
-            if nt - nb <= maxH * atr0
+            if isSq or nt - nb <= maxH * atr0
                 top := nt
                 bot := nb
                 box.set_top(bx, top)
@@ -239,7 +271,22 @@ if inBox
             line.set_x2(midLn, bar_index)
 
 // 3) look for a new box
-if not inBox and not brokeUp and not brokeDn
+if isSq and not inBox and sqOn and bar_index > lastEnd and bar_index > lookback and not na(atrV)
+    inBox    := true
+    newBox   := true
+    top      := high
+    bot      := low
+    atr0     := atrV
+    startBar := bar_index
+    nBoxes   += 1
+    float mdp0 = (high + low) / 2
+    prior := mdp0 - close[lookback] >= priorMin * atrV ? 1 : close[lookback] - mdp0 >= priorMin * atrV ? -1 : 0
+    upVol := close >= open ? nz(volume) : 0.0
+    dnVol := close >= open ? 0.0 : nz(volume)
+    bx := box.new(bar_index, top, bar_index, bot, border_color = colForm, bgcolor = color.new(colForm, fillT), border_width = 1)
+    midLn := showMid ? line.new(bar_index, mdp0, bar_index, mdp0, color = color.new(colForm, 40), style = line.style_dotted) : na
+    lb := na
+if not isSq and not inBox and not brokeUp and not brokeDn
     float a0 = atrV[minLen]
     int   st = bar_index - minLen + 1
     if not na(a0) and a0 > 0 and st > lastEnd and bar_index >= minLen + lookback and hh - ll <= maxH * a0 and close <= hh and close >= ll
@@ -267,7 +314,7 @@ if not inBox and not brokeUp and not brokeDn
 // label of the open box (kept up to date)
 if inBox and showLbl
     string lean = prior == -1 ? "possible accumulation" : prior == 1 ? "possible distribution" : "direction open"
-    string txt  = "Consolidation · " + priorTxt(prior) + "\n" + lean + " · buying " + str.tostring(leanPct(), "#") + "%"
+    string txt  = (isSq ? "Squeeze on · " + str.tostring(bar_index - startBar + 1) + " bars · " : "Consolidation · ") + priorTxt(prior) + "\n" + lean + " · buying " + str.tostring(leanPct(), "#") + "%"
     if na(lb)
         lb := label.new(math.round((startBar + bar_index) / 2), bot, txt, style = label.style_label_up, color = color.new(colForm, 30), textcolor = color.white, size = lblSize)
     else
@@ -280,6 +327,9 @@ if newBox
          " (" + priorTxt(prior) + ")", alert.freq_once_per_bar_close)
 if brokeUp or brokeDn
     alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": " + catName(brokeCat) + (brokeUp ? " — broke UP through " + str.tostring(top, format.mintick) : " — broke DOWN through " + str.tostring(bot, format.mintick)),
+         alert.freq_once_per_bar_close)
+if sqFired and sqAlert
+    alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": SQUEEZE FIRED " + (brokeUp ? "UP" : "DOWN") + " — box " + str.tostring(bot, format.mintick) + " – " + str.tostring(top, format.mintick),
          alert.freq_once_per_bar_close)
 if fakeNow
     alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": HEAD FAKE — the break failed, now watching the " + (fakeDir == 1 ? "upside" : "downside") + " target", alert.freq_once_per_bar_close)
@@ -309,10 +359,10 @@ if showTbl and barstate.isfirst
         table.merge_cells(tbl, 1, r, 5, r)
     table.merge_cells(tbl, 0, 11, 5, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.4 — " + str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR", text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.5 — " + (isSq ? "Squeeze Play (BB " + str.tostring(sqBB, "#.#") + " inside KC " + str.tostring(sqKC, "#.#") + ")" : str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR"), text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
-    cell(1, 1, inBox ? "In a box · " + priorTxt(prior) : "No box", inBox ? color.yellow : color.white)
+    cell(1, 1, inBox ? (isSq ? "Squeeze on · " : "In a box · ") + priorTxt(prior) : (isSq ? "No squeeze" : "No box"), inBox ? color.yellow : color.white)
     cell(0, 2, "Top / bottom", color.silver)
     cell(1, 2, inBox ? str.tostring(top, format.mintick) + " / " + str.tostring(bot, format.mintick) : "–")
     cell(0, 3, "Height · length", color.silver)
