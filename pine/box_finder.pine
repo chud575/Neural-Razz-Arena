@@ -1,6 +1,7 @@
 //@version=6
-// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.5
+// Box Finder – Accumulation / Distribution / Consolidation   ·   v1.6
 // Changelog
+//  v1.6  Squeeze Play on a higher timeframe too: its box on the chart, and a table of how often the chart's squeeze fires before the big one
 //  v1.5  Second way to detect a box: "Squeeze Play" (Bollinger Bands inside the Keltner Channel); a "Squeeze Fired" panel when it ends
 //  v1.4  Labels sit directly under the box they describe
 //  v1.3  Table: how many head fakes still reached the ORIGINAL target (before the opposite one)
@@ -32,8 +33,11 @@
 //               Channel and grows to cover every candle while they stay inside. When the bands move back outside,
 //               the squeeze has FIRED: the box is closed and named, and a "Squeeze Fired" panel is shown under it.
 //               The direction is the side of the box the firing candle closed beyond (or the half it closed in).
+//  8. Squeeze Play, higher timeframe: the same squeeze is read on one higher timeframe (closed candles only). While
+//               it is on, a larger box is drawn on this chart. When it fires, the script records whether this
+//               chart's own squeeze fired first during it, and whether that smaller fire pointed the same way.
 // Nothing repaints: a box is drawn when its Nth bar closes, and named when the breakout bar closes.
-indicator("Box Finder – Accumulation / Distribution v1.5", shorttitle = "Box Finder v1.5", overlay = true,
+indicator("Box Finder – Accumulation / Distribution v1.6", shorttitle = "Box Finder v1.6", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ───────────────────────────── Inputs ─────────────────────────────
@@ -46,6 +50,15 @@ sqKC     = input.float(1.5, "Squeeze Play: Keltner Channel width (× average tru
      tooltip = "1.5 is the classic squeeze. 2.0 catches looser squeezes, 1.0 only the tightest.")
 sqMin    = input.int(3, "Squeeze Play: ignore squeezes shorter than (bars)", minval = 1, group = grpM)
 sqAlert  = input.bool(true, "Squeeze Play: alert when a squeeze fires", group = grpM)
+
+grpH = "Squeeze Play: higher timeframe"
+mtfOn    = input.bool(true, "Track a higher-timeframe squeeze (needs 'Find boxes by' = Squeeze Play)", group = grpH)
+mtfTF    = input.timeframe("240", "Higher timeframe", group = grpH)
+mtfBox   = input.bool(true, "Draw the higher-timeframe squeeze box on this chart", group = grpH)
+mtfCol   = input.color(color.new(color.fuchsia, 0), "Its colour", group = grpH)
+mtfTbl   = input.bool(true, "Show the 'little fires before big' table", group = grpH)
+mtfPosIn = input.string("Bottom left", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right", "Middle left"], group = grpH)
+mtfAlert = input.bool(true, "Alert when the higher-timeframe squeeze fires", group = grpH)
 
 grpB = "Box (Tight range)"
 minLen   = input.int(20, "Min box length (bars)", minval = 5, maxval = 300, group = grpB,
@@ -321,6 +334,152 @@ if inBox and showLbl
         label.set_text(lb, txt)
         label.set_xy(lb, math.round((startBar + bar_index) / 2), bot)
 
+// ───────────────────────────── Squeeze Play: higher timeframe ─────────────────────────────
+// squeeze state on whatever timeframe this runs in: [on, fired this candle, direction of the fire]
+sqHtf() =>
+    float b  = ta.sma(close, sqLen)
+    float dv = sqBB * ta.stdev(close, sqLen)
+    float r  = ta.sma(ta.tr(true), sqLen)
+    bool  on = b + dv < b + sqKC * r and b - dv > b - sqKC * r
+    var float t  = na
+    var float bo = na
+    var int   n  = 0
+    bool fired = false
+    int  dir   = 0
+    if on
+        t  := n == 0 ? high : math.max(t, high)
+        bo := n == 0 ? low : math.min(bo, low)
+        n  += 1
+    else
+        if n >= sqMin
+            fired := true
+            dir   := close > t ? 1 : close < bo ? -1 : close >= (t + bo) / 2 ? 1 : -1
+        n := 0
+    [on, fired, dir]
+sqHtfClosed() =>
+    [a, f, d] = sqHtf()
+    [a[1], f[1], d[1]]
+[hOn, hFired, hDir] = request.security(syminfo.tickerid, mtfTF, sqHtfClosed(), lookahead = barmerge.lookahead_on)
+tfLabel(string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    sec >= 604800 and sec % 604800 == 0 ? str.tostring(sec / 604800) + "W" : sec >= 86400 and sec % 86400 == 0 ? str.tostring(sec / 86400) + "D" : sec >= 3600 and sec % 3600 == 0 ? str.tostring(sec / 3600) + "h" : str.tostring(sec / 60) + "m"
+
+var bool  wOn       = false       // a higher-timeframe squeeze is in progress
+var int   wStart    = na
+var float wTop      = na
+var float wBot      = na
+var int   wFires    = 0           // this chart's squeeze fires inside it
+var int   wFirstDir = 0
+var int   wLastDir  = 0
+var int   wLastBar  = na
+var box   wBox      = na
+var label wLb       = na
+var int hTot       = 0            // higher-timeframe squeezes that fired
+var int hWithLittle = 0           // …with at least one fire on this chart first
+var int hFirstSame = 0            // …whose FIRST small fire pointed the same way as the big one
+var int hLastSame  = 0            // …whose LAST small fire pointed the same way
+var int hFiresSum  = 0
+var int hLeadSum   = 0            // bars between the last small fire and the big fire
+bool bigFired = false
+bool mtfLive  = mtfOn and isSq
+bool hNew     = timeframe.change(mtfTF)
+
+if mtfLive
+    // 1) the big squeeze has fired (known on the first chart bar after its candle closed)
+    if wOn and hNew and hFired
+        bigFired := true
+        hTot += 1
+        if wFires > 0
+            hWithLittle += 1
+            hFiresSum   += wFires
+            hLeadSum    += bar_index - wLastBar
+            if wFirstDir == hDir
+                hFirstSame += 1
+            if wLastDir == hDir
+                hLastSame += 1
+        color fc = hDir == 1 ? color.lime : color.red
+        if not na(wBox)
+            box.set_right(wBox, bar_index)
+            box.set_border_color(wBox, fc)
+        if not na(wLb)
+            label.set_xy(wLb, math.round((wStart + bar_index) / 2), wBot)
+            label.set_text(wLb, tfLabel(mtfTF) + " SQUEEZE FIRED " + (hDir == 1 ? "↑" : "↓") + "\n" + (wFires > 0 ? tfLabel(timeframe.period) + " fired first: " + str.tostring(wFires) + "×, last " +
+                 (wLastDir == 1 ? "↑" : "↓") + " " + str.tostring(bar_index - wLastBar) + " bars earlier" + (wLastDir == hDir ? " (same way)" : " (other way)") : tfLabel(timeframe.period) + " did not fire first"))
+            label.set_color(wLb, color.new(fc, 15))
+        wOn  := false
+        wBox := na
+        wLb  := na
+    else if wOn and not hOn                                  // ended without counting (too short)
+        box.delete(wBox)
+        label.delete(wLb)
+        wOn  := false
+        wBox := na
+        wLb  := na
+    // 2) a big squeeze starts
+    if not wOn and hOn and not (hNew and hFired)
+        wOn       := true
+        wStart    := bar_index
+        wTop      := high
+        wBot      := low
+        wFires    := 0
+        wFirstDir := 0
+        wLastDir  := 0
+        wLastBar  := na
+        if mtfBox
+            wBox := box.new(bar_index, wTop, bar_index, wBot, border_color = mtfCol, border_width = 2, bgcolor = color.new(mtfCol, 94))
+            wLb  := showLbl ? label.new(bar_index, wBot, tfLabel(mtfTF) + " squeeze on", style = label.style_label_up, color = color.new(mtfCol, 30), textcolor = color.white, size = lblSize) : na
+    // 3) while it lasts: grow the box, and note this chart's own fires
+    if wOn
+        wTop := math.max(wTop, high)
+        wBot := math.min(wBot, low)
+        if not na(wBox)
+            box.set_top(wBox, wTop)
+            box.set_bottom(wBox, wBot)
+            box.set_right(wBox, bar_index)
+        if sqFired
+            wFires += 1
+            wLastDir := brokeUp ? 1 : -1
+            wLastBar := bar_index
+            if wFirstDir == 0
+                wFirstDir := wLastDir
+        if not na(wLb)
+            label.set_xy(wLb, math.round((wStart + bar_index) / 2), wBot)
+            label.set_text(wLb, tfLabel(mtfTF) + " squeeze on · " + tfLabel(timeframe.period) + " fired " + str.tostring(wFires) + "× so far" + (wFires > 0 ? ", last " + (wLastDir == 1 ? "↑" : "↓") : ""))
+if bigFired and mtfAlert
+    alert("Box Finder " + syminfo.ticker + ": " + tfLabel(mtfTF) + " SQUEEZE FIRED " + (hDir == 1 ? "UP" : "DOWN") + (wFires > 0 ? " — the " + tfLabel(timeframe.period) + " squeeze fired first (" +
+         (wLastDir == hDir ? "same way" : "other way") + ")" : ""), alert.freq_once_per_bar_close)
+
+mtfPos = switch mtfPosIn
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    "Bottom right" => position.bottom_right
+    "Middle right" => position.middle_right
+    "Middle left"  => position.middle_left
+    => position.bottom_left
+var table mt = table.new(mtfPos, 2, 8, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.gray, frame_width = 1)
+mrow(int r, string a, string b, color bc = color.white) =>
+    table.cell(mt, 0, r, a, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(mt, 1, r, b, text_color = bc, text_size = size.small, text_halign = text.align_right)
+share(int a, int n) => n > 0 ? str.tostring(a) + " of " + str.tostring(n) + "  (" + str.tostring(a / n * 100.0, "#") + "%)" : "–"
+if mtfTbl and barstate.isfirst
+    table.merge_cells(mt, 0, 0, 1, 0)
+    table.merge_cells(mt, 0, 7, 1, 7)
+if mtfTbl and barstate.islast
+    string little = tfLabel(timeframe.period)
+    string big    = tfLabel(mtfTF)
+    table.cell(mt, 0, 0, "Squeeze Play — does " + little + " fire before " + big + "?", text_color = color.white, text_size = size.small, bgcolor = color.new(color.purple, 40))
+    if not isSq
+        table.cell(mt, 0, 7, "Set 'Find boxes by' to Squeeze Play to use this.", text_color = color.orange, text_size = size.small, text_halign = text.align_left)
+    else
+        mrow(1, big + " squeezes that fired", str.tostring(hTot))
+        mrow(2, little + " fired first, during the " + big + " squeeze", share(hWithLittle, hTot))
+        mrow(3, "…average number of " + little + " fires", hWithLittle > 0 ? str.tostring(hFiresSum / hWithLittle, "#.#") : "–")
+        mrow(4, "…first " + little + " fire pointed the same way as " + big, share(hFirstSame, hWithLittle), hWithLittle > 0 and hFirstSame / hWithLittle > 0.55 ? color.lime : color.white)
+        mrow(5, "…last " + little + " fire pointed the same way as " + big, share(hLastSame, hWithLittle), hWithLittle > 0 and hLastSame / hWithLittle > 0.55 ? color.lime : color.white)
+        mrow(6, "…last " + little + " fire came, on average", hWithLittle > 0 ? str.tostring(hLeadSum / hWithLittle, "#") + " bars before" : "–")
+        table.cell(mt, 0, 7, "Now: " + big + (wOn ? " squeeze ON · " + little + " has fired " + str.tostring(wFires) + "× in it" + (wFires > 0 ? ", last " + (wLastDir == 1 ? "↑" : "↓") : "") : " not in a squeeze") +
+             "  ·  50% same-way = no information", text_color = wOn ? color.yellow : color.silver, text_size = size.small, text_halign = text.align_left)
+
 // ───────────────────────────── Alerts ─────────────────────────────
 if newBox
     alert("Box Finder " + syminfo.ticker + " " + timeframe.period + ": new consolidation box " + str.tostring(bot, format.mintick) + " – " + str.tostring(top, format.mintick) +
@@ -359,7 +518,7 @@ if showTbl and barstate.isfirst
         table.merge_cells(tbl, 1, r, 5, r)
     table.merge_cells(tbl, 0, 11, 5, 11)
 if showTbl and barstate.islast
-    table.cell(tbl, 0, 0, "Box Finder v1.5 — " + (isSq ? "Squeeze Play (BB " + str.tostring(sqBB, "#.#") + " inside KC " + str.tostring(sqKC, "#.#") + ")" : str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR"), text_color = color.white, text_size = tblSize,
+    table.cell(tbl, 0, 0, "Box Finder v1.6 — " + (isSq ? "Squeeze Play (BB " + str.tostring(sqBB, "#.#") + " inside KC " + str.tostring(sqKC, "#.#") + ")" : str.tostring(minLen) + "+ bars within " + str.tostring(maxH, "#.##") + " × ATR"), text_color = color.white, text_size = tblSize,
          bgcolor = color.new(color.purple, 40))
     cell(0, 1, "Now", color.silver)
     cell(1, 1, inBox ? (isSq ? "Squeeze on · " : "In a box · ") + priorTxt(prior) : (isSq ? "No squeeze" : "No box"), inBox ? color.yellow : color.white)
