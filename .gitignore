@@ -50,3 +50,5 @@ python/results/leg_pullback_counts.csv
 python/results/leg_sequence.csv
 python/results/leg_streak_pullback.csv
 python/results/leg_pullback_extreme.csv
+python/results/big_day_features.csv
+python/results/big_day_harmonics.csv
