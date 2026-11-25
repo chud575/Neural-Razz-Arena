@@ -90,7 +90,7 @@ days = np.sort(T.day.unique())
 cut = pd.Timestamp(days[int(len(days) * 0.7)])
 si = lambda S: SS.index(S)
 ti = lambda t: TS.index(t)
-nm = lambda v: "none" if v is None else f"{v}%"
+nm = lambda v: "none" if v is None or v != v else f"{v}%"
 
 
 def st(mask, S, Tg, arr=pes):
@@ -115,7 +115,7 @@ for x in XS:
 G = pd.DataFrame(G)
 G["mt"] = G[["is_t", "oos_t"]].min(axis=1)
 for _, r in G.sort_values("mt", ascending=False).head(15).iterrows():
-    L.append(f"| {r.x}% | {nm(r.S)} | {nm(r['T']) if r['T'] is not None else 'close'} | {r.n} | {r.win:.0f}% | {r.avg:+.3f}% | {r.is_avg:+.3f}% | {r.oos_avg:+.3f}% | {r.is_t:+.1f} | {r.oos_t:+.1f} | {r.total:+.0f}% |")
+    L.append(f"| {r.x}% | {nm(r.S)} | {nm(r['T']).replace('none', 'close')} | {int(r.n)} | {r.win:.0f}% | {r.avg:+.3f}% | {r.is_avg:+.3f}% | {r.oos_avg:+.3f}% | {r.is_t:+.1f} | {r.oos_t:+.1f} | {r.total:+.0f}% |")
 L.append(f"\n{len(G)} combinations: {((G.is_avg > 0) & (G.oos_avg > 0)).sum()} positive in both halves, {((G.is_t > 2) & (G.oos_t > 2)).sum()} with t > 2 in both, {((G.is_avg < 0) & (G.oos_avg < 0)).sum()} negative in both.\n")
 L.append("Average P&L (all alert-day trades) by stop and target, trigger 1 %:\n\n| Stop \\ Target | " + " | ".join(nm(t) if t else "close" for t in TS) + " |\n|" + "---|" * (len(TS) + 1))
 for S in SS:
