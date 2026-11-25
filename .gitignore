@@ -54,3 +54,4 @@ python/results/big_day_features.csv
 python/results/big_day_harmonics.csv
 python/results/before_big_day.csv
 python/results/first_move_trade.csv
+python/results/first_move_grid.csv
