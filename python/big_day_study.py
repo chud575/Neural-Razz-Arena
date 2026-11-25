@@ -166,6 +166,43 @@ def main():
             row["bos_with"] = int(((np.sign(ev) == d) & (np.abs(ev) == 1)).sum())
             row["bos_against"] = int(((np.sign(ev) == -d) & (np.abs(ev) == 1)).sum())
             row["choch"] = int((np.abs(ev) == 2).sum())
+            # internal (swing length 3) and external (swing length 12) structure, in the day's direction
+            si, se = structure(h, l, c, 3), structure(h, l, c, 12)
+            mi, me = si["ms"][s:], se["ms"][s:]
+            evi, eve = si["ev"][s:], se["ev"][s:]
+            row["int_with_share"] = (mi == d).mean() * 100
+            row["ext_with_share"] = (me == d).mean() * 100
+            row["both_with_share"] = ((mi == d) & (me == d)).mean() * 100
+            row["both_against_share"] = ((mi == -d) & (me == -d)).mean() * 100
+            x0 = int(row["start_ext_hour"] * 12)                       # from the extreme the move started from
+            if len(mi) - x0 >= 12:
+                row["int_with_share_after"] = (mi[x0:] == d).mean() * 100
+                row["ext_with_share_after"] = (me[x0:] == d).mean() * 100
+                row["both_with_share_after"] = ((mi[x0:] == d) & (me[x0:] == d)).mean() * 100
+            ia = np.flatnonzero(np.sign(evi) == -d)                    # internal breaks against the day
+            ea = np.flatnonzero(np.sign(eve) == -d)                    # external breaks against the day
+            iw = np.flatnonzero(np.sign(evi) == d)
+            row["int_breaks_against"] = len(ia)
+            row["ext_breaks_against"] = len(ea)
+            # pullbacks: an internal break against, until internal structure breaks back with the day
+            shallow = deep = shallow_a = deep_a = 0
+            k = 0
+            while k < len(ia):
+                i0 = ia[k]
+                nxt = iw[iw > i0]
+                j0 = int(nxt[0]) if len(nxt) else len(evi) - 1
+                is_deep = bool(((ea >= i0) & (ea <= j0)).any())
+                deep += is_deep
+                shallow += not is_deep
+                if i0 >= x0:
+                    deep_a += is_deep
+                    shallow_a += not is_deep
+                while k < len(ia) and ia[k] <= j0:
+                    k += 1
+            row["pullbacks_internal_only"] = shallow
+            row["pullbacks_broke_external"] = deep
+            row["pullbacks_internal_only_after"] = shallow_a
+            row["pullbacks_broke_external_after"] = deep_a
             up_gap = (l[2:] > h[:-2])[s - 2:]
             dn_gap = (h[2:] < l[:-2])[s - 2:]
             row["fvg_with"] = int((up_gap if d == 1 else dn_gap).sum())
